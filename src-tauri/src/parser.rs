@@ -67,47 +67,154 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
-pub fn build_dashboard() -> Dashboard {
-    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+// ── period navigation + trend helpers ───────────────────────────────
+#[derive(Clone, Copy)]
+enum Period {
+    Day,
+    Week,
+    Month,
+}
 
-    // 1. Ingest incrementally (full scan only on first run; afterwards just the
-    //    appended lines), prune events older than the heatmap window, and persist
-    //    only when something actually changed — so an idle tick doesn't rewrite
-    //    the entire events.json every 30s.
-    let mut store = Store::load();
-    let mut dirty = store.ingest();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
-    if store.prune_before(cutoff) {
-        dirty = true;
+fn parse_period(s: &str) -> Period {
+    match s {
+        "Day" => Period::Day,
+        "Month" => Period::Month,
+        _ => Period::Week,
     }
-    if dirty {
-        store.save();
+}
+
+fn r2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Total (M tokens, USD cost) over events whose calendar day is in [start, end).
+fn sum_range(events: &[Event], start: chrono::NaiveDate, end: chrono::NaiveDate) -> (f64, f64) {
+    let mut tok = 0.0;
+    let mut cost = 0.0;
+    for e in events {
+        let d = e.ts.date_naive();
+        if d >= start && d < end {
+            tok += (e.input + e.cache + e.output) / 1e6;
+            cost += e.cost;
+        }
     }
+    (tok, cost)
+}
 
-    // 2. Aggregate: apply current config + prices, slice by current time.
-    let cfg = UserConfig::load();
-    // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
-    // so neither parsing nor the network runs while we hold BUILD_LOCK.
-    let pricing = Pricing::shared();
-    let events: Vec<Event> = store
-        .events
-        .iter()
-        .map(|r| compute_event(r, &cfg, &pricing))
-        .collect();
+const WEEKDAY3: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-    let now = Local::now();
+fn md(d: chrono::NaiveDate) -> String {
+    format!("{} {}", MONTHS[(d.month() - 1) as usize], d.day())
+}
+fn iso(d: chrono::NaiveDate) -> String {
+    d.format("%Y-%m-%d").to_string()
+}
+fn week_start(d: chrono::NaiveDate) -> chrono::NaiveDate {
+    d - Duration::days(d.weekday().num_days_from_monday() as i64)
+}
+fn month_first(y: i32, m: u32) -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(y, m, 1).unwrap()
+}
+/// The 1st of the month `delta` months from `d`'s month (delta may be negative).
+fn add_months(d: chrono::NaiveDate, delta: i32) -> chrono::NaiveDate {
+    let total = (d.year() * 12 + d.month() as i32 - 1) + delta;
+    month_first(total.div_euclid(12), (total.rem_euclid(12) + 1) as u32)
+}
+
+/// Human label of the period containing `reference` (nav-bar title).
+fn range_label(kind: Period, reference: DateTime<Local>) -> String {
+    let d = reference.date_naive();
+    match kind {
+        Period::Day => format!(
+            "{}, {}",
+            WEEKDAY3[d.weekday().num_days_from_monday() as usize],
+            md(d)
+        ),
+        Period::Week => {
+            let s = week_start(d);
+            format!("{} – {}", md(s), md(s + Duration::days(6)))
+        }
+        Period::Month => format!("{} {}", MONTHS[(d.month() - 1) as usize], d.year()),
+    }
+}
+
+/// Zoomed-out trend ending at `reference`'s period: 14 days / 12 weeks / 6
+/// months. Points are ordered oldest→newest and carry the anchor date so the UI
+/// can click one to view it.
+fn build_trend(events: &[Event], kind: Period, reference: DateTime<Local>) -> Vec<TrendPoint> {
+    let refd = reference.date_naive();
+    match kind {
+        Period::Day => (0..14)
+            .rev()
+            .map(|i| {
+                let d = refd - Duration::days(i);
+                let (tok, cost) = sum_range(events, d, d + Duration::days(1));
+                TrendPoint {
+                    label: if i % 3 == 0 { format!("{}", d.day()) } else { String::new() },
+                    full: format!("{}, {}", WEEKDAY3[d.weekday().num_days_from_monday() as usize], md(d)),
+                    tokens: r2(tok),
+                    cost: r2(cost),
+                    date: iso(d),
+                    current: d == refd,
+                }
+            })
+            .collect(),
+        Period::Week => {
+            let cur = week_start(refd);
+            (0..12)
+                .rev()
+                .map(|i| {
+                    let s = cur - Duration::days(7 * i);
+                    let (tok, cost) = sum_range(events, s, s + Duration::days(7));
+                    TrendPoint {
+                        label: if i % 2 == 0 { md(s) } else { String::new() },
+                        full: format!("{} – {}", md(s), md(s + Duration::days(6))),
+                        tokens: r2(tok),
+                        cost: r2(cost),
+                        date: iso(s),
+                        current: s == cur,
+                    }
+                })
+                .collect()
+        }
+        Period::Month => {
+            let cur = month_first(refd.year(), refd.month());
+            (0..6)
+                .rev()
+                .map(|i| {
+                    let s = add_months(cur, -i);
+                    let (tok, cost) = sum_range(events, s, add_months(s, 1));
+                    TrendPoint {
+                        label: MONTHS[(s.month() - 1) as usize].to_string(),
+                        full: format!("{} {}", MONTHS[(s.month() - 1) as usize], s.year()),
+                        tokens: r2(tok),
+                        cost: r2(cost),
+                        date: iso(s),
+                        current: s == cur,
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// Build the Day/Week/Month reports + heatmap from a set of already-computed
+/// events (config + prices applied). `installed_servers`/`installed_skills` are
+/// the whitelist sizes to stamp onto each period (constant across windows).
+fn build_reports(
+    events: &[Event],
+    installed_servers: u64,
+    installed_skills: u64,
+    now: DateTime<Local>,
+) -> Dashboard {
     let today = now.date_naive();
-
-    let mut day = report_day(&events, now);
-    let mut week = report_week(&events, now);
-    let mut month = report_month(&events, now);
-    let heatmap = build_heatmap(&events, today);
+    let mut day = report_day(events, now);
+    let mut week = report_week(events, now);
+    let mut month = report_month(events, now);
+    let heatmap = build_heatmap(events, today);
 
     // "servers"/"skills" = how many the user has *installed* (global, constant
     // across periods), not how many were called in the window.
-    let installed_servers = cfg.mcp_servers.len() as u64;
-    let installed_skills = cfg.skills.len() as u64;
     for r in [&mut day, &mut week, &mut month] {
         r.metrics.servers = installed_servers;
         r.metrics.skills = installed_skills;
@@ -128,6 +235,118 @@ pub fn build_dashboard() -> Dashboard {
         today_tokens,
         generated_at: now.to_rfc3339(),
     }
+}
+
+/// Load one account's incremental store (ingest new log bytes, prune, persist),
+/// then compute its events with the current config + prices. Returns the events
+/// plus the account's installed MCP-server / Skill sets.
+fn account_events(
+    a: &crate::accounts::Account,
+    pricing: &Pricing,
+    cutoff: i64,
+) -> (Vec<Event>, HashSet<String>, HashSet<String>) {
+    let mut store = Store::load(&a.id);
+    let mut dirty = store.ingest(&a.data_dir.join("projects"));
+    if store.prune_before(cutoff) {
+        dirty = true;
+    }
+    if dirty {
+        store.save(&a.id);
+    }
+    let cfg = UserConfig::load_for(&a.config_file, &a.data_dir.join("skills"));
+    let events = store
+        .events
+        .iter()
+        .map(|r| compute_event(r, &cfg, pricing))
+        .collect();
+    (events, cfg.mcp_servers, cfg.skills)
+}
+
+/// Build a per-account dashboard for every discovered Claude account, plus an
+/// aggregate "All" dashboard summing them. Each account has its own incremental
+/// store (namespaced cache) and its own MCP/Skill whitelist, so cross-account
+/// tool filtering stays correct even in the aggregate.
+pub fn build_workspace() -> Workspace {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let now = Local::now();
+    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
+    let cutoff = (now - Duration::days(210)).timestamp_millis();
+    // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
+    // so neither parsing nor the network runs while we hold BUILD_LOCK.
+    let pricing = Pricing::shared();
+
+    let mut accounts: Vec<AccountData> = Vec::new();
+    // Aggregate ("All") is built from every account's computed events; union the
+    // whitelists so a server/skill installed in two accounts counts once.
+    let mut all_events: Vec<Event> = Vec::new();
+    let mut all_servers: HashSet<String> = HashSet::new();
+    let mut all_skills: HashSet<String> = HashSet::new();
+
+    for a in crate::accounts::discover() {
+        let (events, servers, skills) = account_events(&a, &pricing, cutoff);
+        let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
+        all_servers.extend(servers);
+        all_skills.extend(skills);
+        all_events.extend(events);
+        accounts.push(AccountData {
+            id: a.id,
+            label: a.label,
+            email: a.email,
+            dash,
+        });
+    }
+
+    let all = build_reports(
+        &all_events,
+        all_servers.len() as u64,
+        all_skills.len() as u64,
+        now,
+    );
+    let today_tokens = all.today_tokens;
+    Workspace {
+        accounts,
+        all,
+        today_tokens,
+    }
+}
+
+/// Build a single period report for one account (id) or the "all" aggregate at
+/// an arbitrary `reference` datetime (any moment inside the target day/week/
+/// month). Powers date navigation and drill-down into past periods.
+pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) -> PeriodReport {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    let pricing = Pricing::shared();
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut servers: HashSet<String> = HashSet::new();
+    let mut skills: HashSet<String> = HashSet::new();
+    for a in crate::accounts::discover() {
+        if account_id != "all" && a.id != account_id {
+            continue;
+        }
+        let (ev, srv, sk) = account_events(&a, &pricing, cutoff);
+        events.extend(ev);
+        servers.extend(srv);
+        skills.extend(sk);
+    }
+
+    let mut rep = match parse_period(period) {
+        Period::Day => report_day(&events, reference),
+        Period::Month => report_month(&events, reference),
+        Period::Week => report_week(&events, reference),
+    };
+    rep.metrics.servers = servers.len() as u64;
+    rep.metrics.skills = skills.len() as u64;
+    rep
+}
+
+/// The aggregate ("All") dashboard across every account — used by the tray
+/// label at startup and by the `dump` example. Acquires BUILD_LOCK via
+/// build_workspace; must not itself be called while holding it.
+pub fn build_dashboard() -> Dashboard {
+    build_workspace().all
 }
 
 /// Derive a computed Event from a stored RawEvent, applying the *current* user
@@ -320,6 +539,7 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             input: buckets[h].0,
             cache: buckets[h].1,
             output: buckets[h].2,
+            date: String::new(), // an hour isn't a drillable calendar day
         })
         .collect();
 
@@ -337,6 +557,8 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        range: range_label(Period::Day, now),
+        trend: build_trend(events, Period::Day, now),
     }
 }
 
@@ -386,6 +608,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 input: buckets[i].0,
                 cache: buckets[i].1,
                 output: buckets[i].2,
+                date: iso(date),
             }
         })
         .collect();
@@ -404,6 +627,8 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        range: range_label(Period::Week, now),
+        trend: build_trend(events, Period::Week, now),
     }
 }
 
@@ -463,6 +688,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
                 input: buckets[i].0,
                 cache: buckets[i].1,
                 output: buckets[i].2,
+                date: iso(cur_first + Duration::days(i as i64)),
             }
         })
         .collect();
@@ -481,6 +707,8 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        range: range_label(Period::Month, now),
+        trend: build_trend(events, Period::Month, now),
     }
 }
 

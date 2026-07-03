@@ -8,6 +8,20 @@ pub struct SeriesPoint {
     pub input: f64,    // M tokens (uncached new input)
     pub cache: f64,    // M tokens (cache creation + read)
     pub output: f64,   // M tokens
+    // ISO yyyy-mm-dd this bar represents, for click-to-drill-down. Empty for the
+    // Day report's hourly bars (an hour isn't a drillable calendar day).
+    pub date: String,
+}
+
+/// One point on the zoomed-out trend line: a whole day/week/month total.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendPoint {
+    pub label: String,  // sparse x-axis tick (many empty)
+    pub full: String,   // full label for the hover tooltip
+    pub tokens: f64,    // M tokens for the whole period
+    pub cost: f64,      // USD estimate for the whole period
+    pub date: String,   // ISO yyyy-mm-dd anchor of the period (for click-to-view)
+    pub current: bool,  // the period currently being viewed (highlighted)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +76,12 @@ pub struct PeriodReport {
     pub req_trend: Vec<f64>,
     #[serde(rename = "costTrend")]
     pub cost_trend: Vec<f64>,
+    // Human label of the period being shown (e.g. "Wed, Jul 3",
+    // "Jun 30 – Jul 6", "Jul 2026") for the navigation bar.
+    pub range: String,
+    // Zoomed-out trend: last 14 days (Day) / 12 weeks (Week) / 6 months (Month),
+    // ending at this report's period. Points are click-to-view.
+    pub trend: Vec<TrendPoint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,4 +101,24 @@ pub struct Dashboard {
     pub today_tokens: f64, // M tokens, for the tray label
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
+}
+
+/// One Claude CLI account (= one config directory) plus its own dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountData {
+    pub id: String,    // stable key (slug of the config dir), also the tab key
+    pub label: String, // friendly name (org / display name / email / dir)
+    pub email: String, // account email if known (may be empty)
+    pub dash: Dashboard,
+}
+
+/// Everything the panel needs in one fetch: each account's dashboard plus an
+/// aggregate ("All") that sums every account. `today_tokens` is the combined
+/// figure shown next to the tray icon.
+#[derive(Debug, Clone, Serialize)]
+pub struct Workspace {
+    pub accounts: Vec<AccountData>,
+    pub all: Dashboard,
+    #[serde(rename = "todayTokens")]
+    pub today_tokens: f64,
 }
