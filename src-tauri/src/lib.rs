@@ -1,10 +1,11 @@
+mod accounts;
 mod config;
 mod model;
 mod parser;
 mod pricing;
 mod store;
 
-use model::Dashboard;
+use model::{Dashboard, Workspace};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,9 +38,10 @@ fn now_ms() -> i64 {
 /// Rebuild the dashboard (incremental), update the tray's token count, and push
 /// the fresh data to the UI so an open popover updates live.
 fn refresh(app: &tauri::AppHandle) {
-    let dash = parser::build_dashboard();
+    let ws = parser::build_workspace();
     if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
+        // Combined today total across every account.
+        let label = fmt_tokens_m(ws.today_tokens);
         // macOS shows the label next to the menu-bar icon (set_title). Windows'
         // taskbar tray has no equivalent — set_title is a no-op there — so we
         // surface the same number through the hover tooltip instead, the only
@@ -47,8 +49,9 @@ fn refresh(app: &tauri::AppHandle) {
         let _ = tray.set_title(Some(label.clone()));
         let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
     }
-    check_milestones(app, &dash);
-    let _ = app.emit("dashboard-updated", &dash);
+    // Milestones track combined usage (the aggregate "All" dashboard).
+    check_milestones(app, &ws.all);
+    let _ = app.emit("dashboard-updated", &ws);
 }
 
 /// Persisted 100M-token milestone snapshot. Stored in the app *data* dir so it
@@ -661,26 +664,49 @@ fn show_popover(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
-async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
-    // build_dashboard does blocking IO (reads/writes the cache, parses logs) and
+async fn get_workspace(app: tauri::AppHandle) -> Workspace {
+    // build_workspace does blocking IO (reads/writes the cache, parses logs) and
     // holds BUILD_LOCK — running it inline would block the command on the async
     // runtime and, with a large cache, stall the UI. Hop to a blocking worker
     // (the 30s refresh thread already runs the same work off the main thread).
-    let dash = tauri::async_runtime::spawn_blocking(parser::build_dashboard)
+    let ws = tauri::async_runtime::spawn_blocking(parser::build_workspace)
         .await
-        .unwrap_or_else(|_| parser::build_dashboard());
+        .unwrap_or_else(|_| parser::build_workspace());
     // Sync the tray count to this freshly-fetched value. The panel refetches the
     // instant it opens, while the tray otherwise only refreshes every 30s — so
     // without this the two could disagree for up to 30s during heavy usage.
     if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
+        let label = fmt_tokens_m(ws.today_tokens);
         let _ = tray.set_title(Some(label.clone()));
         // Mirror refresh(): keep the tooltip in sync for Windows, where the
         // title isn't shown next to the icon.
         let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
     }
-    check_milestones(&app, &dash);
-    dash
+    check_milestones(&app, &ws.all);
+    ws
+}
+
+/// Parse an ISO "YYYY-MM-DD" into a local datetime (noon, to dodge DST edges);
+/// the report builders only read the date part. Falls back to now on bad input.
+fn parse_ref_date(s: &str) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(12, 0, 0))
+        .and_then(|ndt| chrono::Local.from_local_datetime(&ndt).single())
+        .unwrap_or_else(chrono::Local::now)
+}
+
+/// A single period report for `account` ("all" or an account id) at `period`
+/// ("Day"/"Week"/"Month") containing the date `reference` (ISO yyyy-mm-dd).
+/// Powers date navigation + drill-down without disturbing the live tray/heatmap.
+#[tauri::command]
+async fn get_period(account: String, period: String, reference: String) -> model::PeriodReport {
+    let reference_dt = parse_ref_date(&reference);
+    let (acc, per) = (account.clone(), period.clone());
+    tauri::async_runtime::spawn_blocking(move || parser::build_period(&account, &period, reference_dt))
+        .await
+        .unwrap_or_else(|_| parser::build_period(&acc, &per, reference_dt))
 }
 
 /// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
@@ -790,7 +816,8 @@ pub fn run() {
 
     builder
         .invoke_handler(tauri::generate_handler![
-            get_dashboard,
+            get_workspace,
+            get_period,
             save_screenshot,
             begin_drag,
             refresh_pricing,
@@ -1052,12 +1079,13 @@ pub fn run() {
             });
 
             // Filesystem watcher: reflect a log write within ~1s instead of
-            // waiting up to the 30s poll (PRD wants <=5s). Writes land in
-            // ~/.claude/projects; our own cache lives elsewhere, so this never
-            // self-triggers. Debounced so a burst of writes coalesces into one
-            // rebuild; the 30s poll above stays as a fallback. (build_dashboard
+            // waiting up to the 30s poll (PRD wants <=5s). Writes land in each
+            // account's <config-dir>/projects; our own cache lives elsewhere, so
+            // this never self-triggers. Debounced so a burst of writes coalesces
+            // into one rebuild; the 30s poll above stays as a fallback (and also
+            // picks up any account added after startup). (build_workspace
             // serializes on BUILD_LOCK, so this and the poll can't race the cache.)
-            if let Some(projects) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) {
+            {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     use notify::{RecursiveMode, Watcher};
@@ -1072,11 +1100,19 @@ pub fn run() {
                         Ok(w) => w,
                         Err(_) => return,
                     };
-                    // Claude Code may not have created the dir yet on a fresh
-                    // machine; create it so watch() registers instead of silently
-                    // falling back to the 30s poll for the whole session.
-                    let _ = std::fs::create_dir_all(&projects);
-                    if watcher.watch(&projects, RecursiveMode::Recursive).is_err() {
+                    // Watch every discovered account's projects dir. Claude Code
+                    // may not have created a dir yet on a fresh machine; create it
+                    // so watch() registers instead of silently falling back to the
+                    // 30s poll for the whole session.
+                    let mut watched = 0usize;
+                    for a in accounts::discover() {
+                        let projects = a.data_dir.join("projects");
+                        let _ = std::fs::create_dir_all(&projects);
+                        if watcher.watch(&projects, RecursiveMode::Recursive).is_ok() {
+                            watched += 1;
+                        }
+                    }
+                    if watched == 0 {
                         return;
                     }
                     // Block for the first change, then drain the burst until quiet.

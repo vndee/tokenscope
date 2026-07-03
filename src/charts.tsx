@@ -1,6 +1,6 @@
 import { useId, useRef, useState } from "react";
 import {
-  Theme, ModelStat, NamedCount, SeriesPoint, HeatDay,
+  Theme, ModelStat, NamedCount, SeriesPoint, TrendPoint, HeatDay,
   fmtInt, fmtMoney, fmtTokens, linePath, fmtHeatDate,
 } from "./data";
 
@@ -34,8 +34,8 @@ export function Segmented({ value, items = ["Day", "Week", "Month"], theme, onSe
   );
 }
 
-export function BarChart({ data, theme, height = 96, accent, accentSoft, radius = 3 }:
-  { data: SeriesPoint[]; theme: Theme; height?: number; accent?: string; accentSoft?: string; radius?: number }) {
+export function BarChart({ data, theme, height = 96, accent, accentSoft, radius = 3, onPick }:
+  { data: SeriesPoint[]; theme: Theme; height?: number; accent?: string; accentSoft?: string; radius?: number; onPick?: (p: SeriesPoint) => void }) {
   const t = theme;
   accent = accent || t.accent; accentSoft = accentSoft || t.accentSoft;
   const max = Math.max(...data.map((d) => d.input + d.cache + d.output), 1e-9);
@@ -63,11 +63,14 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
           const hO = (d.output / max) * height, hI = ((d.input + d.cache) / max) * height;
           const empty = d.input + d.cache + d.output <= 0;
           const on = hi === d;
+          // Week/Month bars carry a date → clickable to drill into that day.
+          const clickable = !!onPick && !!d.date;
           return (
             <div key={i}
               onMouseEnter={empty ? undefined : (e) => onBar(d, e)}
               onMouseLeave={empty ? undefined : () => setHi(null)}
-              style={{ flex: 1, alignSelf: "stretch", display: "flex", flexDirection: "column", justifyContent: "flex-end", position: "relative", zIndex: 1, cursor: "default", opacity: hi && !on && !empty ? 0.55 : 1, transition: "opacity .12s" }}>
+              onClick={clickable ? () => onPick!(d) : undefined}
+              style={{ flex: 1, alignSelf: "stretch", display: "flex", flexDirection: "column", justifyContent: "flex-end", position: "relative", zIndex: 1, cursor: clickable ? "pointer" : "default", opacity: hi && !on && !empty ? 0.55 : 1, transition: "opacity .12s" }}>
               <div style={{ height: hO, background: accentSoft, borderRadius: `${effRadius}px ${effRadius}px 0 0` }} />
               <div style={{ height: hI, background: accent }} />
             </div>
@@ -126,14 +129,14 @@ export function Sparkline({ values, theme, width = 80, height = 24, accent, stro
 const DONUT_PALETTE = ["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const DONUT_OVERFLOW = "#79817b";
 
-export function CostDonut({ models, theme, size = 104, thickness = 16 }:
-  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number }) {
+export function CostDonut({ models, theme, size = 104, thickness = 16, palette = DONUT_PALETTE, overflow = DONUT_OVERFLOW }:
+  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number; palette?: string[]; overflow?: string }) {
   const t = theme;
   const [hi, setHi] = useState(-1);
   // Rank by cost (desc) and recolor by that rank — usage from most to least.
   const ranked = [...models]
     .sort((a, b) => b.cost - a.cost)
-    .map((m, i) => ({ ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
+    .map((m, i) => ({ ...m, color: i < palette.length ? palette[i] : overflow }));
   models = ranked;
   const total = models.reduce((s, m) => s + m.cost, 0) || 1e-9;
   const cx = size / 2, cy = size / 2;
@@ -329,6 +332,72 @@ export function Heatmap({ days, theme, accent, gap = 2 }:
           <span style={{ opacity: 0.7 }}> · {fmtHeatDate(hi.date)}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+// Zoomed-out trend line (last N days/weeks/months). Line + area, sparse x
+// labels, hover tooltip (tokens + cost), and click-to-view points. The
+// currently-viewed period's point is filled with the accent.
+export function TrendChart({ data, theme, height = 66, onPick }:
+  { data: TrendPoint[]; theme: Theme; height?: number; onPick?: (date: string) => void }) {
+  const t = theme;
+  const [hi, setHi] = useState(-1);
+  const [tip, setTip] = useState({ x: 0, y: 0 });
+  const gid = useId().replace(/:/g, "");
+  const W = 340; // viewBox width; the svg scales to the container via width:100%
+  const values = data.length ? data.map((d) => d.tokens) : [0, 0];
+  const { d: line, px, py } = linePath(values, W, height, 7);
+  const area = data.length ? `${line} L ${px(values.length - 1).toFixed(1)} ${height} L ${px(0).toFixed(1)} ${height} Z` : "";
+  return (
+    <div>
+      <div style={{ position: "relative" }}>
+        <svg width="100%" viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none" style={{ display: "block", height, overflow: "visible" }}>
+          <defs>
+            <linearGradient id={`tr${gid}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={t.accent} stopOpacity="0.26" />
+              <stop offset="100%" stopColor={t.accent} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {area && <path d={area} fill={`url(#tr${gid})`} stroke="none" />}
+          <path d={line} fill="none" stroke={t.accent} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+          {data.map((p, i) => {
+            const cx = px(i), cy = py(values[i]);
+            const on = hi === i || p.current;
+            return (
+              <circle key={i} cx={cx} cy={cy} r={on ? 3.4 : 2} fill={p.current ? t.accent : t.card}
+                stroke={t.accent} strokeWidth={1.5} vectorEffect="non-scaling-stroke"
+                onMouseEnter={(e) => {
+                  const svg = e.currentTarget.ownerSVGElement;
+                  if (!svg) return;
+                  const r = svg.getBoundingClientRect();
+                  setHi(i);
+                  setTip({ x: r.left + (cx / W) * r.width, y: r.top + (cy / height) * r.height });
+                }}
+                onMouseLeave={() => setHi(-1)}
+                onClick={() => onPick && p.date && onPick(p.date)}
+                style={{ cursor: onPick && p.date ? "pointer" : "default" }} />
+            );
+          })}
+        </svg>
+        {hi >= 0 && (
+          <div style={{
+            position: "fixed",
+            left: Math.min(Math.max(tip.x, 96), (typeof window !== "undefined" ? window.innerWidth : 372) - 96),
+            top: tip.y - 10, transform: "translate(-50%,-100%)",
+            background: t.tip, color: "#fff", borderRadius: 6, padding: "5px 8px",
+            font: `500 10px ${t.mono}`, whiteSpace: "nowrap", pointerEvents: "none", zIndex: 9999,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.35)" }}>
+            <span style={{ color: t.accent, fontWeight: 600 }}>{data[hi].tokens === 0 ? "No usage" : fmtTokens(data[hi].tokens)}</span>
+            <span style={{ opacity: 0.7 }}> · {fmtMoney(data[hi].cost)} · {data[hi].full}</span>
+          </div>
+        )}
+      </div>
+      <div style={{ display: "flex", marginTop: 5 }}>
+        {data.map((p, i) => (
+          <div key={i} style={{ flex: 1, textAlign: "center", font: `500 8.5px ${t.mono}`, color: t.faint, whiteSpace: "nowrap", overflow: "hidden" }}>{p.label}</div>
+        ))}
+      </div>
     </div>
   );
 }

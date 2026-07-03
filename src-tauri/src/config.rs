@@ -1,26 +1,17 @@
 // Loads the "user-installed" whitelists so the dashboard only counts
-// MCP servers / Skills the user actually added (PRD decision).
+// MCP servers / Skills the user actually added (PRD decision). Each account
+// (config directory) has its own whitelist, so this is loaded per account:
+// the config file (`.claude.json`) and the skills dir belong to one account.
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct UserConfig {
     pub mcp_servers: HashSet<String>,
     pub skills: HashSet<String>,
 }
 
-fn home() -> Option<PathBuf> {
-    dirs::home_dir()
-}
-
-/// Parse ~/.claude.json once (None if missing/unreadable/invalid).
-fn read_user_config() -> Option<serde_json::Value> {
-    let path = home()?.join(".claude.json");
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-/// mcpServers (top level) + projects[*].mcpServers from a parsed ~/.claude.json.
+/// mcpServers (top level) + projects[*].mcpServers from a parsed .claude.json.
 fn mcps_from(json: Option<&serde_json::Value>) -> HashSet<String> {
     let mut set = HashSet::new();
     let Some(json) = json else { return set };
@@ -54,25 +45,20 @@ fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
     }
 }
 
-/// User-installed skills = global ~/.claude/skills/ only (PRD §3.3). Project-
-/// level skill dirs are intentionally not scanned: the PRD defines the skill
-/// source as the global directory, and folding in every registered project's
-/// dir inflated the "installed skills" metric.
-fn load_user_skills() -> HashSet<String> {
-    let mut set = HashSet::new();
-    if let Some(h) = home() {
-        scan_skill_dir(&h.join(".claude").join("skills"), &mut set);
-    }
-    set
-}
-
 impl UserConfig {
-    pub fn load() -> Self {
-        // Parse ~/.claude.json a single time and derive the MCP whitelist from it.
-        let json = read_user_config();
+    /// Load one account's whitelist from its `.claude.json` and skills dir.
+    /// `config_file` is the account's .claude.json; `skills_dir` is its
+    /// `<config-dir>/skills/`. Project-level skill dirs are intentionally not
+    /// scanned (PRD §3.3: the skill source is the account's global skills dir).
+    pub fn load_for(config_file: &Path, skills_dir: &Path) -> Self {
+        let json = fs::read_to_string(config_file)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let mut skills = HashSet::new();
+        scan_skill_dir(skills_dir, &mut skills);
         UserConfig {
             mcp_servers: mcps_from(json.as_ref()),
-            skills: load_user_skills(),
+            skills,
         }
     }
 

@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number }
+export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number; date: string }
 export interface ModelStat { name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean }
 export interface NamedCount { name: string; count: number }
+// One point on the zoomed-out trend line (a whole day/week/month total).
+export interface TrendPoint { label: string; full: string; tokens: number; cost: number; date: string; current: boolean }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
@@ -11,21 +13,66 @@ export interface Metrics {
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
+  range: string; trend: TrendPoint[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
 export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
 }
+// One Claude account (= one config dir) and its dashboard.
+export interface AccountData { id: string; label: string; email: string; dash: Dashboard }
+// Every account plus an aggregate "All"; todayTokens is the combined tray total.
+export interface Workspace { accounts: AccountData[]; all: Dashboard; todayTokens: number }
 
-export async function fetchDashboard(): Promise<Dashboard> {
+export async function fetchWorkspace(): Promise<Workspace> {
   // Inside the Tauri runtime → call the Rust backend.
   const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  if (inTauri) return invoke<Dashboard>("get_dashboard");
-  // Browser dev/preview fallback → static snapshot of real data.
+  if (inTauri) return invoke<Workspace>("get_workspace");
+  // Browser dev/preview fallback → static single-account snapshot of real data.
   const res = await fetch("/dev-dashboard.json");
   if (!res.ok) throw new Error("not running in Tauri and no dev snapshot found");
-  return res.json();
+  const dash: Dashboard = await res.json();
+  return { accounts: [{ id: "dev", label: "Dev", email: "", dash }], all: dash, todayTokens: dash.todayTokens };
+}
+
+// Fetch one period report for a specific account ("all" or an id) + reference
+// date (ISO), for date navigation / drill-down into past periods.
+export async function fetchPeriod(account: string, period: string, reference: string): Promise<PeriodReport> {
+  const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  if (inTauri) return invoke<PeriodReport>("get_period", { account, period, reference });
+  // Dev fallback: just return the snapshot's matching current period.
+  const res = await fetch("/dev-dashboard.json");
+  if (!res.ok) throw new Error("no dev snapshot");
+  const dash: Dashboard = await res.json();
+  return period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+}
+
+// ── date navigation helpers (local time) ───────────────────────────
+const pad2 = (n: number) => String(n).padStart(2, "0");
+export const fmtISO = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+export const todayISO = () => fmtISO(new Date());
+const isoToDate = (iso: string) => new Date(iso + "T00:00:00");
+export function weekStartISO(iso: string): string {
+  const d = isoToDate(iso);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // back to Monday (Mon=0)
+  return fmtISO(d);
+}
+// Step a reference date by ±1 unit of the given period. Month steps anchor to
+// the 1st first, so e.g. Mar 31 − 1mo lands in February, not "Mar 3".
+export function shiftPeriod(iso: string, period: string, delta: number): string {
+  const d = isoToDate(iso);
+  if (period === "Day") d.setDate(d.getDate() + delta);
+  else if (period === "Week") d.setDate(d.getDate() + delta * 7);
+  else { d.setDate(1); d.setMonth(d.getMonth() + delta); }
+  return fmtISO(d);
+}
+// Is `iso` inside the *current* (today's) day/week/month for this period?
+export function isCurrentPeriod(iso: string, period: string): boolean {
+  const t = todayISO();
+  if (period === "Day") return iso === t;
+  if (period === "Month") return iso.slice(0, 7) === t.slice(0, 7);
+  return weekStartISO(iso) === weekStartISO(t);
 }
 
 // ── formatting helpers ──────────────────────────────────────────
@@ -98,6 +145,48 @@ export const TH: Record<"dark" | "light", Theme> = {
     segOnShadow: "0 1px 2px rgba(0,0,0,0.12)", tip: "#1d2420",
   },
 };
+
+// ── color presets ──────────────────────────────────────────────────
+// Curated palettes the user can switch between (independent of Dark/Light/
+// System). A preset only swaps the accent family + the model-chart ramp; the
+// neutral chrome (bg/text/grid) still comes from the Dark/Light base above, so
+// every preset stays legible in both modes. `ramp` recolors the model bars /
+// cost donut (rank order, vivid→pale + one muted tail), matching the backend's
+// 5-slot + overflow scheme.
+export type PresetId = "emerald" | "azure" | "violet" | "amber" | "graphite";
+interface PresetVars { accent: string; accentSoft: string; ramp: string[] }
+export interface Preset { id: PresetId; name: string; dark: PresetVars; light: PresetVars }
+export const PRESET_OVERFLOW = "#79817b";
+export const PRESETS: Preset[] = [
+  { id: "emerald", name: "Emerald",
+    dark:  { accent: "#27b06e", accentSoft: "#5fcf9c", ramp: ["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"] },
+    light: { accent: "#178a55", accentSoft: "#8fd9b4", ramp: ["#178a55", "#2fa86e", "#66c398", "#a7e3c5", "#8fa39a"] } },
+  { id: "azure", name: "Azure",
+    dark:  { accent: "#3f9bf5", accentSoft: "#84c1fb", ramp: ["#2f8fef", "#54a4f5", "#84c1fb", "#bcdcfd", "#4b5563"] },
+    light: { accent: "#1f7fe0", accentSoft: "#8fc0f5", ramp: ["#1f7fe0", "#4a97ea", "#82bcf3", "#bcdcfd", "#94a3b8"] } },
+  { id: "violet", name: "Violet",
+    dark:  { accent: "#a279ef", accentSoft: "#c7adf7", ramp: ["#9061e8", "#a87df0", "#c7adf7", "#e2d2fb", "#524b63"] },
+    light: { accent: "#7c4ddb", accentSoft: "#c4b5fd", ramp: ["#7c4ddb", "#976fe6", "#bda2f2", "#ddccfb", "#9a94a8"] } },
+  { id: "amber", name: "Amber",
+    dark:  { accent: "#f0a53f", accentSoft: "#f7cd8f", ramp: ["#ec9224", "#f2ab52", "#f7cd8f", "#fbe6c1", "#5a5347"] },
+    light: { accent: "#d9821a", accentSoft: "#f2c88a", ramp: ["#d9821a", "#e6a047", "#f0c286", "#f8dcb0", "#a89a87"] } },
+  { id: "graphite", name: "Graphite",
+    dark:  { accent: "#9aa4a0", accentSoft: "#c3ccc8", ramp: ["#8b938f", "#a4aca8", "#bcc3bf", "#d6dbd8", "#4b5a52"] },
+    light: { accent: "#5f6b66", accentSoft: "#a7b0ab", ramp: ["#5f6b66", "#7c8681", "#9aa39e", "#c0c7c3", "#8fa39a"] } },
+];
+
+const presetVars = (dark: boolean, preset: PresetId): PresetVars =>
+  (PRESETS.find((x) => x.id === preset) ?? PRESETS[0])[dark ? "dark" : "light"];
+
+/// The Dark/Light base theme with the chosen preset's accent family applied.
+export function themeFor(dark: boolean, preset: PresetId): Theme {
+  const p = presetVars(dark, preset);
+  return { ...TH[dark ? "dark" : "light"], accent: p.accent, accentSoft: p.accentSoft };
+}
+/// The preset's model-chart color ramp (5 rank slots; overflow uses PRESET_OVERFLOW).
+export function rampFor(dark: boolean, preset: PresetId): string[] {
+  return presetVars(dark, preset).ramp;
+}
 
 export function fmtHeatDate(iso: string) {
   const d = new Date(iso + "T00:00:00");

@@ -67,10 +67,6 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-fn projects_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".claude").join("projects"))
-}
-
 fn cache_dir() -> Option<PathBuf> {
     let d = dirs::cache_dir()?.join("tokenscope");
     let _ = fs::create_dir_all(&d);
@@ -78,14 +74,16 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 impl Store {
-    /// Load persisted events + offset manifest (empty on first run).
-    pub fn load() -> Self {
+    /// Load persisted events + offset manifest for one account (empty on first
+    /// run). Cache files are namespaced by the account `id` so multiple accounts
+    /// never share (or clobber) each other's incremental state.
+    pub fn load(id: &str) -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
         if let Some(dir) = cache_dir() {
             // If the cache was written by an older parser, discard it so ingest
             // does a full rescan and picks up newly-extracted facts.
-            let version_ok = fs::read_to_string(dir.join("version"))
+            let version_ok = fs::read_to_string(dir.join(format!("version-{id}")))
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 == Some(STORE_VERSION);
@@ -97,10 +95,10 @@ impl Store {
                 // BOTH and fall back to a full rescan — otherwise a good manifest
                 // paired with empty/corrupt events would make ingest() skip every
                 // already-recorded file and silently lose all history.
-                let loaded_events = fs::read_to_string(dir.join("events.json"))
+                let loaded_events = fs::read_to_string(dir.join(format!("events-{id}.json")))
                     .ok()
                     .and_then(|t| serde_json::from_str::<Vec<RawEvent>>(&t).ok());
-                let loaded_manifest = fs::read_to_string(dir.join("offsets.json"))
+                let loaded_manifest = fs::read_to_string(dir.join(format!("offsets-{id}.json")))
                     .ok()
                     .and_then(|t| serde_json::from_str::<Manifest>(&t).ok());
                 if let (Some(e), Some(m)) = (loaded_events, loaded_manifest) {
@@ -122,7 +120,7 @@ impl Store {
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&self, id: &str) {
         if let Some(dir) = cache_dir() {
             // Atomic writes so a crash/kill mid-save can't leave a half-written
             // events.json (load() would then discard the pair and lose history).
@@ -130,12 +128,15 @@ impl Store {
             // is merely stale (points at fewer bytes → re-reads a little) rather
             // than ahead of the events on disk.
             if let Ok(t) = serde_json::to_string(&self.events) {
-                let _ = write_atomic(&dir.join("events.json"), t.as_bytes());
+                let _ = write_atomic(&dir.join(format!("events-{id}.json")), t.as_bytes());
             }
             if let Ok(t) = serde_json::to_string(&self.manifest) {
-                let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
+                let _ = write_atomic(&dir.join(format!("offsets-{id}.json")), t.as_bytes());
             }
-            let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
+            let _ = write_atomic(
+                &dir.join(format!("version-{id}")),
+                STORE_VERSION.to_string().as_bytes(),
+            );
         }
     }
 
@@ -174,15 +175,16 @@ impl Store {
         removed
     }
 
-    /// Incrementally read only the new bytes of new/changed JSONL files.
-    /// Returns whether anything changed (new events or an updated file offset),
-    /// so the caller can skip a full cache rewrite when nothing moved.
-    pub fn ingest(&mut self) -> bool {
+    /// Incrementally read only the new bytes of new/changed JSONL files under
+    /// `projects_root` (this account's `<config-dir>/projects/`). Returns whether
+    /// anything changed (new events or an updated file offset), so the caller can
+    /// skip a full cache rewrite when nothing moved.
+    pub fn ingest(&mut self, projects_root: &std::path::Path) -> bool {
         let mut dirty = false;
-        let Some(root) = projects_dir() else {
+        if !projects_root.exists() {
             return false;
-        };
-        for entry in WalkDir::new(&root)
+        }
+        for entry in WalkDir::new(projects_root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
