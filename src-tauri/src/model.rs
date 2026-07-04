@@ -86,6 +86,9 @@ pub struct PeriodReport {
     // full tool-usage counts (built-in tools, mcp__ excluded — MCP has its own view).
     pub projects: Vec<NamedTokens>,
     pub branches: Vec<NamedTokens>,
+    // Per-account token/cost split; only meaningful (>1 entry) in the "All"
+    // aggregate report, where the frontend shows it.
+    pub accounts: Vec<NamedTokens>,
     pub tools: Vec<NamedCount>,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,

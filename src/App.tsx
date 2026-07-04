@@ -7,10 +7,10 @@ import {
   Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
   fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod,
-  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange,
+  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak,
 } from "./data";
 import {
-  TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, TokenBarList, Heatmap, TrendChart,
+  Segmented, BarChart, Sparkline, CostDonut, BarList, TokenBarList, Heatmap, TrendChart,
 } from "./charts";
 
 // Count up to `target`. Restarts from 0 whenever `resetKey` changes (popover
@@ -343,6 +343,9 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
   const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
   const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months" }[period];
   const navLabel = period === "Day" && isCurrent ? "Today" : P.range;
+  // Full-period spend projection (current week/month only) + activity streak.
+  const proj = projection(period, M.totalTokens, M.cost, isCurrent);
+  const streak = activeStreak(heatmap);
   const arrowStyle = (disabled: boolean): React.CSSProperties => ({
     display: "inline-flex", alignItems: "center", justifyContent: "center",
     width: 24, height: 24, borderRadius: 6, padding: 0, font: `600 15px ${t.ui}`, lineHeight: 1,
@@ -440,11 +443,8 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
             display: "flex", alignItems: "center", justifyContent: "space-between",
             padding: tabs.length > 1 ? "6px 15px 12px" : "15px 15px 12px",
           }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <TokenGlyph color={t.accent} size={16} />
-              <div data-no-drag="" style={{ cursor: "default" }}>
-                <Segmented value={period} theme={t} onSelect={onPeriod} />
-              </div>
+            <div data-no-drag="" style={{ display: "flex", alignItems: "center", cursor: "default" }}>
+              <Segmented value={period} theme={t} onSelect={onPeriod} />
             </div>
             <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
               <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
@@ -477,6 +477,7 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           <div style={{ textAlign: "right" }}>
             <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
             <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
+            {proj && <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 2 }}>↗ on pace ~{fmtMoney(proj.cost)}</div>}
           </div>
         </div>
         {/* cached vs rest (uncached input + output) — 2-colour pill. Dark segment
@@ -492,7 +493,9 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
         {M.cacheSavings > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: -9, marginBottom: 13, font: `600 10.5px ${t.mono}`, color: t.accent }}>
             <svg width="10" height="12" viewBox="0 0 10 12" fill={t.accent} style={{ flex: "0 0 auto" }} aria-hidden="true"><path d="M6 0 0 7h3l-1 5 6-7H5z" /></svg>
-            Saved {fmtMoney(M.cacheSavings)} via cache
+            {M.cost > 0
+              ? `${((M.cost + M.cacheSavings) / M.cost).toFixed(1)}× cheaper with cache · ${fmtMoney(M.cacheSavings)} saved`
+              : `Saved ${fmtMoney(M.cacheSavings)} via cache`}
           </div>
         )}
         {/* bar chart — bars in Week/Month drill into that day */}
@@ -530,6 +533,14 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
             {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
+        )}
+        {/* tokens by account — split the aggregate "All" view across accounts */}
+        {activeTab === "all" && (P.accounts?.length ?? 0) > 1 && (
+          <>
+            <SectionRule t={t} m="12px 0 10px" />
+            <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by account</Label></div>
+            <TokenBarList key={period + "-acct"} items={P.accounts} theme={t} accent={t.accent} />
+          </>
         )}
         {/* tokens by project — where the spend actually went (cwd basename) */}
         {P.projects.length > 0 && (
@@ -593,7 +604,14 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
         )}
         {/* heatmap */}
         <SectionRule t={t} />
-        <div style={{ marginBottom: 9 }}><Label t={t}>Daily activity</Label></div>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 9 }}>
+          <Label t={t}>Daily activity</Label>
+          {streak >= 2 && (
+            <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+              🔥 <span style={{ color: t.text, fontWeight: 600 }}>{streak}</span>-day streak
+            </span>
+          )}
+        </div>
         <Heatmap days={heatmap} theme={t} accent={t.accent} />
         {/* footer note */}
         <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
