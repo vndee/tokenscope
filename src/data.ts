@@ -14,7 +14,7 @@ export interface Metrics {
 }
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
-  projects: NamedTokens[]; branches: NamedTokens[]; tools: NamedCount[];
+  projects: NamedTokens[]; branches: NamedTokens[]; accounts: NamedTokens[]; tools: NamedCount[];
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
   hourly: number[];
   range: string; trend: TrendPoint[];
@@ -216,6 +216,39 @@ export function fmtHourRange(start: number, end: number): string {
   };
   const a = parts(start), b = parts(end);
   return a.ap === b.ap ? `${a.d}–${b.d}${b.ap}` : `${a.d}${a.ap}–${b.d}${b.ap}`;
+}
+
+// Straight-line projection of a current, partially-elapsed week/month to its
+// full-period tokens+cost, from the fraction of days elapsed (today counts as a
+// whole day — a mild over-count that keeps the pace from lagging). null for Day,
+// past periods, or when nothing's been used yet.
+export function projection(period: string, tokens: number, cost: number, isCurrent: boolean):
+  { tokens: number; cost: number; label: string } | null {
+  if (!isCurrent || tokens <= 0) return null;
+  const now = new Date();
+  let frac: number, label: string;
+  if (period === "Week") {
+    frac = (((now.getDay() + 6) % 7) + 1) / 7; // Mon=1 … Sun=7
+    label = "this week";
+  } else if (period === "Month") {
+    const dim = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    frac = now.getDate() / dim;
+    label = "this month";
+  } else {
+    return null; // Day: nothing to project
+  }
+  if (frac >= 1) return null; // period complete → the actual IS the total
+  return { tokens: tokens / frac, cost: cost / frac, label };
+}
+
+// Current run of consecutive active days ending today (heatmap is oldest→newest,
+// last entry = today). A not-yet-started today (0 tokens) doesn't break the run.
+export function activeStreak(heatmap: { tokens: number }[]): number {
+  let i = heatmap.length - 1;
+  if (i >= 0 && heatmap[i].tokens <= 0) i--; // today may not have started yet
+  let s = 0;
+  for (; i >= 0 && heatmap[i].tokens > 0; i--) s++;
+  return s;
 }
 
 export function fmtHeatDate(iso: string) {

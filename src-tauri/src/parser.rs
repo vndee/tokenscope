@@ -27,6 +27,7 @@ struct Event {
     priced: bool, // whether a price was found for this model
     project: String, // cwd basename ("" if unknown)
     branch: String,  // git branch ("" if unknown)
+    account: String, // owning account label (set by account_events)
     tools: Vec<String>, // all tool_use names in this msg (mcp__ excluded here)
     sidechain: bool,    // ran inside a subagent
     mcp: Vec<String>,   // user-installed server names called in this msg
@@ -305,6 +306,7 @@ fn account_events(
                 .entry(r.cwd.clone())
                 .or_insert_with(|| resolve_project(&r.cwd))
                 .clone();
+            e.account = a.label.clone();
             e
         })
         .collect();
@@ -446,6 +448,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         priced: cost_opt.is_some(),
         project: project_of(&r.cwd),
         branch: r.branch.clone(),
+        account: String::new(), // filled in by account_events (knows the account)
         tools,
         sidechain: r.sidechain,
         mcp,
@@ -476,6 +479,8 @@ struct Agg {
     project_cost: HashMap<String, f64>,
     branch_tok: HashMap<String, f64>,
     branch_cost: HashMap<String, f64>,
+    account_tok: HashMap<String, f64>,
+    account_cost: HashMap<String, f64>,
 }
 
 impl Agg {
@@ -508,6 +513,10 @@ impl Agg {
             if !e.branch.is_empty() {
                 *self.branch_tok.entry(e.branch.clone()).or_default() += tok;
                 *self.branch_cost.entry(e.branch.clone()).or_default() += e.cost;
+            }
+            if !e.account.is_empty() {
+                *self.account_tok.entry(e.account.clone()).or_default() += tok;
+                *self.account_cost.entry(e.account.clone()).or_default() += e.cost;
             }
         }
         for t in &e.tools {
@@ -669,6 +678,7 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         models: agg.models(),
         projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
         branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        accounts: Agg::named_tokens(&agg.account_tok, &agg.account_cost),
         tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
@@ -745,6 +755,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         models: agg.models(),
         projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
         branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        accounts: Agg::named_tokens(&agg.account_tok, &agg.account_cost),
         tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
@@ -831,6 +842,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         models: agg.models(),
         projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
         branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        accounts: Agg::named_tokens(&agg.account_tok, &agg.account_cost),
         tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
