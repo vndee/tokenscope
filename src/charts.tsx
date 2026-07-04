@@ -1,6 +1,6 @@
 import { useId, useRef, useState } from "react";
 import {
-  Theme, ModelStat, NamedCount, SeriesPoint, TrendPoint, HeatDay,
+  Theme, ModelStat, NamedCount, NamedTokens, SeriesPoint, TrendPoint, HeatDay,
   fmtInt, fmtMoney, fmtTokens, linePath, fmtHeatDate,
 } from "./data";
 
@@ -243,6 +243,39 @@ export function BarList({ items, theme, accent, limit = 5 }:
           show less
         </div>
       )}
+    </div>
+  );
+}
+
+// Ranked token/cost ladder (projects, branches): name · bar · tokens · cost.
+// Bars scale to the top item so it's a comparison ladder like ModelRow.
+export function TokenBarList({ items, theme, accent, limit = 5 }:
+  { items: NamedTokens[]; theme: Theme; accent?: string; limit?: number }) {
+  const t = theme; accent = accent || t.accent;
+  const [open, setOpen] = useState(false);
+  const shown = items.slice(0, open ? items.length : limit);
+  const max = items.reduce((m, i) => Math.max(m, i.tokens), 0) || 1;
+  const more = items.length - shown.length;
+  const link = (label: string, onClick: () => void) => (
+    <div onClick={onClick} style={{ font: `500 9.5px ${t.ui}`, color: t.faint, paddingTop: 4, cursor: "pointer", userSelect: "none" }}
+      onMouseEnter={(e) => (e.currentTarget.style.color = t.dim)} onMouseLeave={(e) => (e.currentTarget.style.color = t.faint)}>
+      {label}
+    </div>
+  );
+  return (
+    <div>
+      {shown.map((it, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, padding: "3.5px 0" }}>
+          <span style={{ font: `500 10.5px ${t.ui}`, color: t.text, flex: "0 0 96px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={it.name}>{it.name}</span>
+          <div style={{ flex: 1, height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
+            <div style={{ width: `${(it.tokens / max) * 100}%`, height: "100%", background: accent, borderRadius: 3 }} />
+          </div>
+          <span style={{ font: `500 10px ${t.mono}`, color: t.dim, flex: "0 0 auto", width: 44, textAlign: "right" }}>{fmtTokens(it.tokens)}</span>
+          <span style={{ font: `600 10px ${t.mono}`, color: t.text, flex: "0 0 auto", width: 50, textAlign: "right" }}>{fmtMoney(it.cost)}</span>
+        </div>
+      ))}
+      {more > 0 && link(`+${more} more`, () => setOpen(true))}
+      {open && items.length > limit && link("show less", () => setOpen(false))}
     </div>
   );
 }

@@ -40,6 +40,14 @@ pub struct NamedCount {
     pub count: u64,
 }
 
+/// A named token/cost bucket (project, branch, …): tokens in M, cost in USD.
+#[derive(Debug, Clone, Serialize)]
+pub struct NamedTokens {
+    pub name: String,
+    pub tokens: f64,
+    pub cost: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
@@ -51,6 +59,10 @@ pub struct Metrics {
     #[serde(rename = "outputTokens")]
     pub output_tokens: f64,
     pub cost: f64,
+    #[serde(rename = "cacheSavings")]
+    pub cache_savings: f64, // USD saved by cache reads this period
+    #[serde(rename = "subagentTokens")]
+    pub subagent_tokens: f64, // M tokens spent inside subagents (isSidechain)
     #[serde(rename = "mcpCalls")]
     pub mcp_calls: u64,
     #[serde(rename = "skillCalls")]
@@ -70,12 +82,20 @@ pub struct PeriodReport {
     pub metrics: Metrics,
     pub series: Vec<SeriesPoint>,
     pub models: Vec<ModelStat>,
+    // Token/cost attribution by project (cwd basename) and git branch, plus the
+    // full tool-usage counts (built-in tools, mcp__ excluded — MCP has its own view).
+    pub projects: Vec<NamedTokens>,
+    pub branches: Vec<NamedTokens>,
+    pub tools: Vec<NamedCount>,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]
     pub req_trend: Vec<f64>,
     #[serde(rename = "costTrend")]
     pub cost_trend: Vec<f64>,
+    // Hour-of-day token histogram (24 buckets, M tokens) across this period's
+    // events — powers the "most active hours" insight for any period.
+    pub hourly: Vec<f64>,
     // Human label of the period being shown (e.g. "Wed, Jul 3",
     // "Jun 30 – Jul 6", "Jul 2026") for the navigation bar.
     pub range: String,

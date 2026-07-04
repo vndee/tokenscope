@@ -291,6 +291,15 @@ impl Pricing {
         )
     }
 
+    /// USD saved by cache *reads* on this call: the gap between paying full input
+    /// price for those tokens and the (much cheaper) cache-read price actually
+    /// billed. Cache *creation* is a premium (a cost, not a saving), so it's
+    /// excluded — this is the pure upside of a cache hit. None = no pricing data.
+    pub fn cache_savings(&self, model: &str, cache_read: f64) -> Option<f64> {
+        let p = self.lookup(model)?;
+        Some((cache_read * (p.input - p.cache_read)).max(0.0))
+    }
+
     #[allow(dead_code)]
     pub fn known(&self, model: &str) -> bool {
         self.lookup(model).is_some()

@@ -7,10 +7,10 @@ import {
   Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
   fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod,
-  fmtInt, fmtTokens, pct,
+  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange,
 } from "./data";
 import {
-  TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap, TrendChart,
+  TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, TokenBarList, Heatmap, TrendChart,
 } from "./charts";
 
 // Count up to `target`. Restarts from 0 whenever `resetKey` changes (popover
@@ -429,12 +429,13 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
             display: "flex", alignItems: "center", justifyContent: "space-between",
             padding: tabs.length > 1 ? "6px 15px 12px" : "15px 15px 12px",
           }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <TokenGlyph color={t.accent} size={16} />
-              <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
+              <div data-no-drag="" style={{ cursor: "default" }}>
+                <Segmented value={period} theme={t} onSelect={onPeriod} />
+              </div>
             </div>
             <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
-              <Segmented value={period} theme={t} onSelect={onPeriod} />
               <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
               <ThemePicker t={t} dark={dark} preset={preset} onPick={onPickPreset} />
               <ScreenshotButton theme={t} busy={shotBusy} onClick={captureScreenshot} />
@@ -476,8 +477,25 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           </>}
         </div>
         <SplitLegend t={t} inputM={M.inputTokens + M.cacheTokens} outputM={M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
+        {/* cache-savings callout — what caching kept off the bill this period */}
+        {M.cacheSavings > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: -9, marginBottom: 13, font: `600 10.5px ${t.mono}`, color: t.accent }}>
+            <svg width="10" height="12" viewBox="0 0 10 12" fill={t.accent} style={{ flex: "0 0 auto" }} aria-hidden="true"><path d="M6 0 0 7h3l-1 5 6-7H5z" /></svg>
+            Saved {fmtMoney(M.cacheSavings)} via cache
+          </div>
+        )}
         {/* bar chart — bars in Week/Month drill into that day */}
         <BarChart data={P.series} theme={t} height={84} onPick={(p) => onDrillDay(p.date)} />
+        {(() => {
+          // Busiest 3-hour window of the period — a quick "when do I work" read.
+          const pk = peakHours(P.hourly);
+          return pk ? (
+            <div style={{ marginTop: 8, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke={t.faint} strokeWidth="1.3" style={{ flex: "0 0 auto" }} aria-hidden="true"><circle cx="6" cy="6" r="4.6" /><path d="M6 3.4V6l1.9 1.1" strokeLinecap="round" /></svg>
+              Most active {fmtHourRange(pk.start, pk.end)} · {Math.round(pk.share * 100)}% of tokens
+            </div>
+          ) : null;
+        })()}
         {/* zoomed-out trend line (click a point to jump to that period) */}
         <SectionRule t={t} m="14px 0 10px" />
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
@@ -494,13 +512,21 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
         {/* cost donut */}
         <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
         {costModels.length > 0
-          ? <CostDonut models={costModels} theme={t} size={100} thickness={15} palette={ramp} overflow={PRESET_OVERFLOW} />
+          ? <CostDonut models={costModels} theme={t} size={costModels.length === 1 ? 84 : 100} thickness={costModels.length === 1 ? 13 : 15} palette={ramp} overflow={PRESET_OVERFLOW} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
             {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
+        )}
+        {/* tokens by project — where the spend actually went (cwd basename) */}
+        {P.projects.length > 0 && (
+          <>
+            <SectionRule t={t} m="12px 0 10px" />
+            <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by project</Label></div>
+            <TokenBarList key={period} items={P.projects} theme={t} accent={t.accent} />
+          </>
         )}
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
@@ -512,6 +538,22 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
             <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
         </div>
+        {/* tools — the real workhorses (Bash/Read/Edit…); header carries the
+            subagent token share, since the Agent tool lives in this list too */}
+        {P.tools.length > 0 && (
+          <>
+            <SectionRule t={t} />
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+              <Label t={t}>Tools</Label>
+              {M.subagentTokens > 0 && (
+                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                  <span style={{ color: t.text, fontWeight: 600 }}>{pct(M.subagentTokens, M.totalTokens)}%</span> via subagents
+                </span>
+              )}
+            </div>
+            <BarList key={period} items={P.tools} theme={t} accent={t.accent} />
+          </>
+        )}
         {/* MCP — shown whenever the user has installed MCP servers */}
         {M.servers > 0 && (
           <>
