@@ -63,6 +63,10 @@ pub struct Metrics {
     pub cache_savings: f64, // USD saved by cache reads this period
     #[serde(rename = "subagentTokens")]
     pub subagent_tokens: f64, // M tokens spent inside subagents (isSidechain)
+    #[serde(rename = "toolResults")]
+    pub tool_results: u64, // tool_result blocks seen (reliability denominator)
+    #[serde(rename = "toolErrors")]
+    pub tool_errors: u64, // of those, how many were is_error
     #[serde(rename = "mcpCalls")]
     pub mcp_calls: u64,
     #[serde(rename = "skillCalls")]
