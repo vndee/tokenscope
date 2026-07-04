@@ -44,6 +44,12 @@ pub struct RawEvent {
     // isSidechain: this assistant turn ran inside a subagent, not the main loop.
     #[serde(default)]
     pub sidechain: bool,
+    // Reliability: tool_result blocks in a user message and how many were errors
+    // (`is_error`). Zero for assistant / slash-command events.
+    #[serde(default)]
+    pub tool_results: u32,
+    #[serde(default)]
+    pub tool_errors: u32,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -70,7 +76,8 @@ pub struct Store {
 //       tool_use line were deduped, dropping the tool call).
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: capture cwd (project), git branch, full tool list, and subagent flag.
-const STORE_VERSION: u32 = 5;
+//   v6: count tool_result blocks + errors (is_error) from user messages.
+const STORE_VERSION: u32 = 6;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -281,12 +288,58 @@ fn parse_line(line: &str) -> Option<RawEvent> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     match v.get("type")?.as_str()? {
         "assistant" => parse_assistant(&v),
-        // Skills invoked via slash command (e.g. `/find-skills`) are logged as a
-        // user message with a <command-name> tag, NOT as a Skill tool_use, so
-        // they need a separate path or they'd never be counted.
-        "user" => parse_user_command(&v),
+        "user" => parse_user(&v),
         _ => None,
     }
+}
+
+/// A user message is either a slash-command invocation (string content) or a
+/// batch of tool_result blocks (array content). Route to the right extractor.
+fn parse_user(v: &serde_json::Value) -> Option<RawEvent> {
+    let content = v.get("message")?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return parse_user_command(v, text);
+    }
+    let arr = content.as_array()?;
+    let mut results = 0u32;
+    let mut errors = 0u32;
+    for b in arr {
+        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            results += 1;
+            if b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
+                errors += 1;
+            }
+        }
+    }
+    if results == 0 {
+        return None;
+    }
+    let ts = v.get("timestamp")?.as_str()?;
+    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
+    // dedup key: the line's own uuid (tool_result messages carry no message.id)
+    let id = v.get("uuid").and_then(|i| i.as_str()).unwrap_or("").to_string();
+    if id.is_empty() {
+        return None;
+    }
+    Some(RawEvent {
+        ts_ms,
+        session: v.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        model: String::new(), // not an LLM request → no model/tokens
+        in_tok: 0.0,
+        cc: 0.0,
+        cr: 0.0,
+        out_tok: 0.0,
+        mcp: Vec::new(),
+        skills: Vec::new(),
+        id,
+        source: String::new(),
+        cwd: String::new(),
+        branch: String::new(),
+        tools: Vec::new(),
+        sidechain: false,
+        tool_results: results,
+        tool_errors: errors,
+    })
 }
 
 /// Extract the inner text of `<tag>...</tag>` from `s`, if present.
@@ -302,8 +355,7 @@ fn extract_tag(s: &str, tag: &str) -> Option<String> {
 /// A user message that is a slash-command invocation of a skill, e.g.
 /// `<command-name>/find-skills</command-name>`. The skill name is left
 /// unfiltered here; compute_event drops non-user skills via the whitelist.
-fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
-    let text = v.get("message")?.get("content")?.as_str()?;
+fn parse_user_command(v: &serde_json::Value, text: &str) -> Option<RawEvent> {
     let raw = extract_tag(text, "command-name")?;
     let skill = raw.trim().trim_start_matches('/').trim().to_string();
     if skill.is_empty() {
@@ -337,6 +389,8 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
         tools: Vec::new(),
         sidechain: false,
+        tool_results: 0,
+        tool_errors: 0,
     })
 }
 
@@ -411,5 +465,7 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
         tools,
         sidechain: v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false),
+        tool_results: 0,
+        tool_errors: 0,
     })
 }

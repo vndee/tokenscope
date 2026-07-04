@@ -7,7 +7,7 @@ import {
   Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
   fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod,
-  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak,
+  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak, weekdayRhythm,
 } from "./data";
 import {
   Segmented, BarChart, Sparkline, CostDonut, BarList, TokenBarList, Heatmap, TrendChart,
@@ -542,7 +542,7 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <MiniStat label="Requests" value={fmtInt(M.requests)} sub={`${M.sessions} sessions`} theme={t}>
+          <MiniStat label="Requests" value={fmtInt(M.requests)} sub={M.sessions > 0 ? `${M.sessions} sessions · ${fmtTokens(M.totalTokens / M.sessions)}/ea` : `${M.sessions} sessions`} theme={t}>
             <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
           <MiniStat label="Cost trend" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}>
@@ -563,6 +563,12 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
               )}
             </div>
             <BarList key={period} items={P.tools} theme={t} accent={t.accent} />
+            {M.toolResults > 0 && (
+              <div style={{ marginTop: 7, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ color: M.toolErrors > 0 ? "#e0795f" : t.accent, fontWeight: 600 }}>{((M.toolErrors / M.toolResults) * 100).toFixed(1)}%</span>
+                of {fmtInt(M.toolResults)} tool calls errored
+              </div>
+            )}
           </>
         )}
         {/* MCP — shown whenever the user has installed MCP servers */}
@@ -602,6 +608,34 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           )}
         </div>
         <Heatmap days={heatmap} theme={t} accent={t.accent} />
+        {/* weekly rhythm — day-of-week token pattern over the heatmap window */}
+        {(() => {
+          const wr = weekdayRhythm(heatmap);
+          if (!wr) return null;
+          const max = Math.max(...wr.bars, 1e-9);
+          const ini = ["M", "T", "W", "T", "F", "S", "S"];
+          const full = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+          return (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+                <Label t={t}>Weekly rhythm</Label>
+                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                  busiest <span style={{ color: t.text, fontWeight: 600 }}>{full[wr.busiest]}</span> · {Math.round(wr.weekendPct)}% weekend
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 38 }}>
+                {wr.bars.map((v, i) => (
+                  <div key={i} title={`${full[i]} · ${fmtTokens(v)}`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: "100%", height: 28, display: "flex", alignItems: "flex-end" }}>
+                      <div style={{ width: "100%", height: `${Math.max((v / max) * 100, 3)}%`, background: i === wr.busiest ? t.accent : t.accentSoft, borderRadius: "3px 3px 0 0" }} />
+                    </div>
+                    <span style={{ font: `500 8.5px ${t.mono}`, color: i >= 5 ? t.faint : t.dim }}>{ini[i]}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
         {/* footer note */}
         <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
           Est. cost via models.dev / LiteLLM · estimate

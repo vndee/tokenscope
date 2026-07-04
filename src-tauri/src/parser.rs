@@ -30,6 +30,8 @@ struct Event {
     account: String, // owning account label (set by account_events)
     tools: Vec<String>, // all tool_use names in this msg (mcp__ excluded here)
     sidechain: bool,    // ran inside a subagent
+    tool_results: u64,  // tool_result blocks (reliability denominator)
+    tool_errors: u64,   // of those, is_error count
     mcp: Vec<String>,   // user-installed server names called in this msg
     skills: Vec<String>, // user-installed skill names called in this msg
 }
@@ -451,6 +453,8 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         account: String::new(), // filled in by account_events (knows the account)
         tools,
         sidechain: r.sidechain,
+        tool_results: r.tool_results as u64,
+        tool_errors: r.tool_errors as u64,
         mcp,
         skills,
     }
@@ -465,6 +469,8 @@ struct Agg {
     cost: f64,
     savings: f64,
     subagent_tok: f64, // raw tokens spent inside subagents (isSidechain)
+    tool_results: u64,
+    tool_errors: u64,
     requests: u64,
     sessions: HashSet<String>,
     mcp_calls: u64,
@@ -490,6 +496,8 @@ impl Agg {
         self.output += e.output;
         self.cost += e.cost;
         self.savings += e.savings;
+        self.tool_results += e.tool_results;
+        self.tool_errors += e.tool_errors;
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
@@ -597,6 +605,8 @@ impl Agg {
             cost: (self.cost * 100.0).round() / 100.0,
             cache_savings: (self.savings * 100.0).round() / 100.0,
             subagent_tokens: (self.subagent_tok / 1e6 * 100.0).round() / 100.0,
+            tool_results: self.tool_results,
+            tool_errors: self.tool_errors,
             mcp_calls: self.mcp_calls,
             skill_calls: self.skill_calls,
             requests: self.requests,

@@ -8,7 +8,7 @@ export interface NamedTokens { name: string; tokens: number; cost: number }
 export interface TrendPoint { label: string; full: string; tokens: number; cost: number; date: string; current: boolean }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
-  cacheSavings: number; subagentTokens: number;
+  cacheSavings: number; subagentTokens: number; toolResults: number; toolErrors: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
   deltaTokens: number; deltaCost: number; servers: number; skills: number;
 }
@@ -239,6 +239,24 @@ export function projection(period: string, tokens: number, cost: number, isCurre
   }
   if (frac >= 1) return null; // period complete → the actual IS the total
   return { tokens: tokens / frac, cost: cost / frac, label };
+}
+
+// Day-of-week token rhythm from the heatmap window (~26 weeks): 7 buckets
+// (Mon→Sun, M tokens), the busiest weekday index, and the weekend share (%).
+// null when the heatmap is empty / all-zero.
+export function weekdayRhythm(heatmap: { date: string; tokens: number }[]):
+  { bars: number[]; busiest: number; weekendPct: number } | null {
+  if (!heatmap || !heatmap.length) return null;
+  const bars = [0, 0, 0, 0, 0, 0, 0]; // Mon…Sun
+  for (const d of heatmap) {
+    const wd = (new Date(d.date + "T00:00:00").getDay() + 6) % 7; // Sun=0 → Mon=0
+    bars[wd] += d.tokens;
+  }
+  const total = bars.reduce((s, v) => s + v, 0);
+  if (total <= 0) return null;
+  let busiest = 0;
+  for (let i = 1; i < 7; i++) if (bars[i] > bars[busiest]) busiest = i;
+  return { bars, busiest, weekendPct: ((bars[5] + bars[6]) / total) * 100 };
 }
 
 // Current run of consecutive active days ending today (heatmap is oldest→newest,
