@@ -3,16 +3,20 @@ import { invoke } from "@tauri-apps/api/core";
 export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number; date: string }
 export interface ModelStat { name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean }
 export interface NamedCount { name: string; count: number }
+export interface NamedTokens { name: string; tokens: number; cost: number }
 // One point on the zoomed-out trend line (a whole day/week/month total).
 export interface TrendPoint { label: string; full: string; tokens: number; cost: number; date: string; current: boolean }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
+  cacheSavings: number; subagentTokens: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
   deltaTokens: number; deltaCost: number; servers: number; skills: number;
 }
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
+  projects: NamedTokens[]; branches: NamedTokens[]; tools: NamedCount[];
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
+  hourly: number[];
   range: string; trend: TrendPoint[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
@@ -186,6 +190,32 @@ export function themeFor(dark: boolean, preset: PresetId): Theme {
 /// The preset's model-chart color ramp (5 rank slots; overflow uses PRESET_OVERFLOW).
 export function rampFor(dark: boolean, preset: PresetId): string[] {
   return presetVars(dark, preset).ramp;
+}
+
+// The busiest contiguous 3-hour block of a 24-bucket hour histogram, plus the
+// share of the period's tokens it holds. null when there's no usage.
+export function peakHours(hourly: number[]): { start: number; end: number; share: number } | null {
+  if (!hourly || hourly.length !== 24) return null;
+  const total = hourly.reduce((s, v) => s + v, 0);
+  if (total <= 0) return null;
+  const win = 3;
+  let best = 0, bestSum = -1;
+  for (let i = 0; i <= 24 - win; i++) {
+    let s = 0;
+    for (let j = 0; j < win; j++) s += hourly[i + j];
+    if (s > bestSum) { bestSum = s; best = i; }
+  }
+  return { start: best, end: best + win, share: bestSum / total };
+}
+// Render an hour boundary pair as a friendly 12-hour range, e.g. "9am–12pm",
+// "9–11am" (shared meridiem collapses), "10pm–1am".
+export function fmtHourRange(start: number, end: number): string {
+  const parts = (h: number) => {
+    const hh = ((h % 24) + 24) % 24;
+    return { d: hh % 12 === 0 ? 12 : hh % 12, ap: hh < 12 ? "am" : "pm" };
+  };
+  const a = parts(start), b = parts(end);
+  return a.ap === b.ap ? `${a.d}–${b.d}${b.ap}` : `${a.d}${a.ap}–${b.d}${b.ap}`;
 }
 
 export function fmtHeatDate(iso: string) {

@@ -31,6 +31,19 @@ pub struct RawEvent {
     // own stale events before being re-read, so re-ingestion stays idempotent.
     #[serde(default)]
     pub source: String,
+    // Working directory of the session (its basename is the "project").
+    #[serde(default)]
+    pub cwd: String,
+    // git branch checked out during the session (may be empty / detached HEAD).
+    #[serde(default)]
+    pub branch: String,
+    // Every tool_use name in this message (built-in + mcp__ + Skill) — powers the
+    // full tool-usage breakdown, distinct from the mcp/skill whitelisted views.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    // isSidechain: this assistant turn ran inside a subagent, not the main loop.
+    #[serde(default)]
+    pub sidechain: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -56,7 +69,8 @@ pub struct Store {
 //   v3: merge tool_use across lines sharing a message id (a thinking line + a
 //       tool_use line were deduped, dropping the tool call).
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
-const STORE_VERSION: u32 = 4;
+//   v5: capture cwd (project), git branch, full tool list, and subagent flag.
+const STORE_VERSION: u32 = 5;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -246,6 +260,7 @@ impl Store {
                             let prev = &mut self.events[i];
                             prev.mcp.extend(ev.mcp);
                             prev.skills.extend(ev.skills);
+                            prev.tools.extend(ev.tools);
                             continue;
                         }
                         self.index.insert(ev.id.clone(), self.events.len());
@@ -318,6 +333,10 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         skills: vec![skill],
         id,
         source: String::new(),
+        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
+        tools: Vec::new(),
+        sidechain: false,
     })
 }
 
@@ -350,12 +369,16 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
 
     let mut mcp = Vec::new();
     let mut skills = Vec::new();
+    let mut tools = Vec::new();
     if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                 continue;
             }
             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                tools.push(name.to_string());
+            }
             if let Some(rest) = name.strip_prefix("mcp__") {
                 mcp.push(rest.split("__").next().unwrap_or("").to_string());
             } else if name == "Skill" {
@@ -384,5 +407,9 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         skills,
         id,
         source: String::new(),
+        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
+        tools,
+        sidechain: v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false),
     })
 }

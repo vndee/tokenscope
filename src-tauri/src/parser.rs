@@ -23,7 +23,12 @@ struct Event {
     cache: f64,  // raw tokens, cache creation + read
     output: f64, // raw tokens
     cost: f64,   // USD (differentiated by token type), 0 if unknown model
+    savings: f64, // USD saved by cache reads on this call (0 if unknown model)
     priced: bool, // whether a price was found for this model
+    project: String, // cwd basename ("" if unknown)
+    branch: String,  // git branch ("" if unknown)
+    tools: Vec<String>, // all tool_use names in this msg (mcp__ excluded here)
+    sidechain: bool,    // ran inside a subagent
     mcp: Vec<String>,   // user-installed server names called in this msg
     skills: Vec<String>, // user-installed skill names called in this msg
 }
@@ -46,6 +51,40 @@ fn normalize_model(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Last path component of a session cwd → a fallback "project" label. Handles
+/// unix and windows separators; empty/blank → "(unknown)".
+fn project_of(cwd: &str) -> String {
+    let name = cwd.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("");
+    if name.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Resolve the "project" for a session cwd by walking up to the nearest ancestor
+/// that contains a `.git` entry (the repo root) and returning its basename, so a
+/// session launched in a subdir (…/repo/backend) rolls up to the repo (repo).
+/// Falls back to the cwd's own basename when no repo is found or the path is gone.
+/// Filesystem-backed, so callers memoize per unique cwd (see `account_events`).
+fn resolve_project(cwd: &str) -> String {
+    if !cwd.is_empty() {
+        let mut dir = std::path::Path::new(cwd);
+        loop {
+            if dir.join(".git").exists() {
+                if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                    return name.to_string();
+                }
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    project_of(cwd)
 }
 
 fn vendor_of(model: &str) -> &'static str {
@@ -254,10 +293,20 @@ fn account_events(
         store.save(&a.id);
     }
     let cfg = UserConfig::load_for(&a.config_file, &a.data_dir.join("skills"));
+    // Resolve each event's project to its git-repo root, memoized per unique cwd
+    // so the (filesystem-backed) walk-up runs once per directory, not per event.
+    let mut proj_memo: HashMap<String, String> = HashMap::new();
     let events = store
         .events
         .iter()
-        .map(|r| compute_event(r, &cfg, pricing))
+        .map(|r| {
+            let mut e = compute_event(r, &cfg, pricing);
+            e.project = proj_memo
+                .entry(r.cwd.clone())
+                .or_insert_with(|| resolve_project(&r.cwd))
+                .clone();
+            e
+        })
         .collect();
     (events, cfg.mcp_servers, cfg.skills)
 }
@@ -361,6 +410,10 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
     let cost_opt = pricing
         .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
         .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr));
+    let savings = pricing
+        .cache_savings(&r.model, r.cr)
+        .or_else(|| pricing.cache_savings(&model, r.cr))
+        .unwrap_or(0.0);
     let mcp = r
         .mcp
         .iter()
@@ -373,6 +426,14 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .filter(|s| cfg.is_user_skill(s))
         .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
         .collect();
+    // Tool-usage breakdown covers built-in tools; mcp__ calls have their own
+    // (server-grouped) view, so drop them here to avoid a duplicated, noisier list.
+    let tools = r
+        .tools
+        .iter()
+        .filter(|t| !t.starts_with("mcp__"))
+        .cloned()
+        .collect();
     Event {
         ts,
         session: r.session.clone(),
@@ -381,7 +442,12 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         cache: r.cc + r.cr,
         output: r.out_tok,
         cost: cost_opt.unwrap_or(0.0),
+        savings,
         priced: cost_opt.is_some(),
+        project: project_of(&r.cwd),
+        branch: r.branch.clone(),
+        tools,
+        sidechain: r.sidechain,
         mcp,
         skills,
     }
@@ -394,6 +460,8 @@ struct Agg {
     cache: f64,
     output: f64,
     cost: f64,
+    savings: f64,
+    subagent_tok: f64, // raw tokens spent inside subagents (isSidechain)
     requests: u64,
     sessions: HashSet<String>,
     mcp_calls: u64,
@@ -403,6 +471,11 @@ struct Agg {
     model_priced: HashMap<String, bool>,
     mcp_counts: HashMap<String, u64>,
     skill_counts: HashMap<String, u64>,
+    tool_counts: HashMap<String, u64>,
+    project_tok: HashMap<String, f64>,
+    project_cost: HashMap<String, f64>,
+    branch_tok: HashMap<String, f64>,
+    branch_cost: HashMap<String, f64>,
 }
 
 impl Agg {
@@ -411,6 +484,7 @@ impl Agg {
         self.cache += e.cache;
         self.output += e.output;
         self.cost += e.cost;
+        self.savings += e.savings;
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
@@ -418,11 +492,26 @@ impl Agg {
         // requests, so they must not inflate request counts or the model split.
         if !e.model.is_empty() {
             self.requests += 1;
+            let tok = e.input + e.cache + e.output;
             // model totals keep all token types so shares sum to Total tokens
-            *self.model_tok.entry(e.model.clone()).or_default() += e.input + e.cache + e.output;
+            *self.model_tok.entry(e.model.clone()).or_default() += tok;
             *self.model_cost.entry(e.model.clone()).or_default() += e.cost;
             // a model is "priced" if any of its messages had a known price
             *self.model_priced.entry(e.model.clone()).or_default() |= e.priced;
+            if e.sidechain {
+                self.subagent_tok += tok;
+            }
+            if !e.project.is_empty() {
+                *self.project_tok.entry(e.project.clone()).or_default() += tok;
+                *self.project_cost.entry(e.project.clone()).or_default() += e.cost;
+            }
+            if !e.branch.is_empty() {
+                *self.branch_tok.entry(e.branch.clone()).or_default() += tok;
+                *self.branch_cost.entry(e.branch.clone()).or_default() += e.cost;
+            }
+        }
+        for t in &e.tools {
+            *self.tool_counts.entry(t.clone()).or_default() += 1;
         }
         for s in &e.mcp {
             self.mcp_calls += 1;
@@ -469,6 +558,27 @@ impl Agg {
         v
     }
 
+    /// Named token/cost buckets (project / branch), sorted by tokens desc.
+    fn named_tokens(
+        tok: &HashMap<String, f64>,
+        cost: &HashMap<String, f64>,
+    ) -> Vec<NamedTokens> {
+        let mut v: Vec<NamedTokens> = tok
+            .iter()
+            .map(|(k, t)| NamedTokens {
+                name: k.clone(),
+                tokens: (t / 1e6 * 100.0).round() / 100.0,
+                cost: (cost.get(k).copied().unwrap_or(0.0) * 100.0).round() / 100.0,
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            b.tokens
+                .partial_cmp(&a.tokens)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        v
+    }
+
     fn metrics(&self, delta_tokens: f64, delta_cost: f64) -> Metrics {
         Metrics {
             total_tokens: ((self.input + self.cache + self.output) / 1e6 * 100.0).round() / 100.0,
@@ -476,6 +586,8 @@ impl Agg {
             cache_tokens: (self.cache / 1e6 * 100.0).round() / 100.0,
             output_tokens: (self.output / 1e6 * 100.0).round() / 100.0,
             cost: (self.cost * 100.0).round() / 100.0,
+            cache_savings: (self.savings * 100.0).round() / 100.0,
+            subagent_tokens: (self.subagent_tok / 1e6 * 100.0).round() / 100.0,
             mcp_calls: self.mcp_calls,
             skill_calls: self.skill_calls,
             requests: self.requests,
@@ -506,12 +618,14 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 24]; // (input, cache, output) M
     let mut req_b = vec![0.0f64; 24];
     let mut cost_b = vec![0.0f64; 24];
+    let mut hour = vec![0.0f64; 24];
 
     for e in events {
         let d = e.ts.date_naive();
         if d == today {
             agg.add(e);
             let h = e.ts.hour() as usize;
+            hour[h] += (e.input + e.cache + e.output) / 1e6;
             buckets[h].0 += e.input / 1e6;
             buckets[h].1 += e.cache / 1e6;
             buckets[h].2 += e.output / 1e6;
@@ -553,10 +667,14 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         ),
         series,
         models: agg.models(),
+        projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
+        branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        hourly: hour,
         range: range_label(Period::Day, now),
         trend: build_trend(events, Period::Day, now),
     }
@@ -575,11 +693,13 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 7];
     let mut req_b = vec![0.0f64; 7];
     let mut cost_b = vec![0.0f64; 7];
+    let mut hour = vec![0.0f64; 24];
 
     for e in events {
         let d = e.ts.date_naive();
         if d >= start && d < next_start {
             agg.add(e);
+            hour[e.ts.hour() as usize] += (e.input + e.cache + e.output) / 1e6;
             let idx = (d - start).num_days() as usize;
             if idx < buckets.len() {
                 buckets[idx].0 += e.input / 1e6;
@@ -623,10 +743,14 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         ),
         series,
         models: agg.models(),
+        projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
+        branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        hourly: hour,
         range: range_label(Period::Week, now),
         trend: build_trend(events, Period::Week, now),
     }
@@ -652,11 +776,13 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); days_in_month];
     let mut req_b = vec![0.0f64; days_in_month];
     let mut cost_b = vec![0.0f64; days_in_month];
+    let mut hour = vec![0.0f64; 24];
 
     for e in events {
         let d = e.ts.date_naive();
         if d >= cur_first && d < next_first {
             agg.add(e);
+            hour[e.ts.hour() as usize] += (e.input + e.cache + e.output) / 1e6;
             let idx = (d - cur_first).num_days() as usize;
             if idx < buckets.len() {
                 buckets[idx].0 += e.input / 1e6;
@@ -703,10 +829,14 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
         ),
         series,
         models: agg.models(),
+        projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
+        branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+        tools: Agg::named(&agg.tool_counts),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        hourly: hour,
         range: range_label(Period::Month, now),
         trend: build_trend(events, Period::Month, now),
     }
