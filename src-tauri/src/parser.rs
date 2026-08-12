@@ -503,8 +503,10 @@ impl Agg {
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
-        // Slash-command skill events carry no model (empty) — they're not LLM
-        // requests, so they must not inflate request counts or the model split.
+        // An empty model marks an event that is not an LLM request: Claude's
+        // slash-command events and Codex's tool/MCP/skill records. Only real API
+        // turns may inflate the request count or the model split — a Codex
+        // session emits roughly twice as many tool records as turns.
         if !e.model.is_empty() {
             self.requests += 1;
             let tok = e.input + e.cache + e.output;

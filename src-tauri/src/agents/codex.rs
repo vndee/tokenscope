@@ -239,15 +239,18 @@ impl CodexState {
     /// A RawEvent pre-filled with this session's attribution, carrying no usage.
     /// Tool/skill events reuse it; `id` stays empty because the byte-offset
     /// manifest already guarantees each line is read exactly once.
+    ///
+    /// `model` is deliberately left empty, which is the store's existing marker
+    /// for "not an LLM request" (Claude's slash-command events use it the same
+    /// way). A tool, MCP or skill record is not an API turn — only a
+    /// `token_count` is — and filling the model in here made every one of them
+    /// count as a request. `on_token_count` sets the model on the events that
+    /// really are turns.
     fn base(&self, ts_ms: i64) -> RawEvent {
         RawEvent {
             ts_ms,
             session: self.c.session.clone(),
-            model: if self.c.model.is_empty() {
-                "unknown".into()
-            } else {
-                self.c.model.clone()
-            },
+            model: String::new(),
             in_tok: 0.0,
             cc: 0.0,
             cr: 0.0,
@@ -361,6 +364,14 @@ impl CodexState {
             return None;
         }
         let mut e = self.base(ts_ms);
+        // This one *is* an API turn, so it carries the model — both for pricing
+        // and as the request-count marker (see `base`). A turn whose model we
+        // never saw is recorded as "unknown" rather than dropped.
+        e.model = if self.c.model.is_empty() {
+            "unknown".into()
+        } else {
+            self.c.model.clone()
+        };
         e.in_tok = uncached;
         e.cr = d_cached;
         e.cc = d_cw;
@@ -880,6 +891,32 @@ mod tests {
             .flat_map(|r| r.skills.iter().map(|s| s.as_str()))
             .collect();
         assert_eq!(skills, vec!["review", "review"]);
+    }
+
+    #[test]
+    fn only_token_count_events_carry_a_model_so_only_they_count_as_requests() {
+        // Requests are counted from events with a non-empty model. A tool, MCP
+        // or skill record is not an API turn, and filling the model in on those
+        // reported 8,305 requests for 4,598 real turns on this machine (+81%),
+        // skewing the request trend and the "All" tab with it.
+        let m = r#"{"timestamp":"2026-08-12T04:00:06.000Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"github","tool":"get_pr_info"}}}"#;
+        let f = r#"{"timestamp":"2026-08-12T04:00:07.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent"}}"#;
+        let e = r#"{"timestamp":"2026-08-12T04:00:08.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"cat /r/skills/review/SKILL.md"}}"#;
+        let a = tc("2026-08-12T04:00:09.000Z", 1000, 400, 0, 50);
+        let ev = feed(&[META, CTX, m, f, e, &a]);
+        assert_eq!(ev.len(), 4);
+        let with_model: Vec<&str> = ev
+            .iter()
+            .filter(|r| !r.model.is_empty())
+            .map(|r| r.model.as_str())
+            .collect();
+        assert_eq!(with_model, vec!["gpt-5.6-sol"]);
+        // The one that does carry a model is the one that carries the usage.
+        assert_eq!(ev[3].in_tok, 600.0);
+        // Everything else is still recorded — only the request marker is gone.
+        assert_eq!(ev[0].mcp, vec!["github"]);
+        assert_eq!(ev[1].tools, vec!["spawn_agent"]);
+        assert_eq!(ev[2].skills, vec!["review"]);
     }
 
     #[test]
