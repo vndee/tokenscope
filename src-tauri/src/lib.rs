@@ -1,4 +1,4 @@
-mod accounts;
+mod agents;
 mod config;
 mod model;
 mod parser;
@@ -1105,10 +1105,9 @@ pub fn run() {
                     // so watch() registers instead of silently falling back to the
                     // 30s poll for the whole session.
                     let mut watched = 0usize;
-                    for a in accounts::discover() {
-                        let projects = a.data_dir.join("projects");
-                        let _ = std::fs::create_dir_all(&projects);
-                        if watcher.watch(&projects, RecursiveMode::Recursive).is_ok() {
+                    for (_, a) in agents::discover_all() {
+                        let _ = std::fs::create_dir_all(&a.log_root);
+                        if watcher.watch(&a.log_root, RecursiveMode::Recursive).is_ok() {
                             watched += 1;
                         }
                     }

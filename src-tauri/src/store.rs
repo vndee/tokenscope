@@ -7,7 +7,6 @@
 // and persists everything to the cache dir. Aggregation (parser.rs) then works
 // purely on these in-memory events — cheap, and recomputed per request because
 // the Day/Week/Month windows are relative to "now".
-use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -197,15 +196,15 @@ impl Store {
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files under
-    /// `projects_root` (this account's `<config-dir>/projects/`). Returns whether
-    /// anything changed (new events or an updated file offset), so the caller can
-    /// skip a full cache rewrite when nothing moved.
-    pub fn ingest(&mut self, projects_root: &std::path::Path) -> bool {
+    /// `log_root` (this account's log directory). Returns whether anything
+    /// changed (new events or an updated file offset), so the caller can skip a
+    /// full cache rewrite when nothing moved.
+    pub fn ingest(&mut self, log_root: &std::path::Path, parser: &dyn crate::agents::LogParser) -> bool {
         let mut dirty = false;
-        if !projects_root.exists() {
+        if !log_root.exists() {
             return false;
         }
-        for entry in WalkDir::new(projects_root)
+        for entry in WalkDir::new(log_root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
@@ -253,12 +252,13 @@ impl Store {
                 Some(i) => i + 1,
                 None => 0,
             };
+            let mut state = parser.new_file_state(None);
             for line in buf[..process_until].split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
                 let Ok(s) = std::str::from_utf8(line) else { continue };
-                if let Some(mut ev) = parse_line(s) {
+                if let Some(mut ev) = state.parse_line(s) {
                     ev.source = key.clone();
                     if !ev.id.is_empty() {
                         if let Some(&i) = self.index.get(&ev.id) {
@@ -281,191 +281,4 @@ impl Store {
         }
         dirty
     }
-}
-
-/// Parse one JSONL line into a RawEvent (assistant messages only).
-fn parse_line(line: &str) -> Option<RawEvent> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    match v.get("type")?.as_str()? {
-        "assistant" => parse_assistant(&v),
-        "user" => parse_user(&v),
-        _ => None,
-    }
-}
-
-/// A user message is either a slash-command invocation (string content) or a
-/// batch of tool_result blocks (array content). Route to the right extractor.
-fn parse_user(v: &serde_json::Value) -> Option<RawEvent> {
-    let content = v.get("message")?.get("content")?;
-    if let Some(text) = content.as_str() {
-        return parse_user_command(v, text);
-    }
-    let arr = content.as_array()?;
-    let mut results = 0u32;
-    let mut errors = 0u32;
-    for b in arr {
-        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-            results += 1;
-            if b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
-                errors += 1;
-            }
-        }
-    }
-    if results == 0 {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    // dedup key: the line's own uuid (tool_result messages carry no message.id)
-    let id = v.get("uuid").and_then(|i| i.as_str()).unwrap_or("").to_string();
-    if id.is_empty() {
-        return None;
-    }
-    Some(RawEvent {
-        ts_ms,
-        session: v.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-        model: String::new(), // not an LLM request → no model/tokens
-        in_tok: 0.0,
-        cc: 0.0,
-        cr: 0.0,
-        out_tok: 0.0,
-        mcp: Vec::new(),
-        skills: Vec::new(),
-        id,
-        source: String::new(),
-        cwd: String::new(),
-        branch: String::new(),
-        tools: Vec::new(),
-        sidechain: false,
-        tool_results: results,
-        tool_errors: errors,
-    })
-}
-
-/// Extract the inner text of `<tag>...</tag>` from `s`, if present.
-fn extract_tag(s: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = s.find(&open)? + open.len();
-    let rest = &s[start..];
-    let end = rest.find(&close)?;
-    Some(rest[..end].to_string())
-}
-
-/// A user message that is a slash-command invocation of a skill, e.g.
-/// `<command-name>/find-skills</command-name>`. The skill name is left
-/// unfiltered here; compute_event drops non-user skills via the whitelist.
-fn parse_user_command(v: &serde_json::Value, text: &str) -> Option<RawEvent> {
-    let raw = extract_tag(text, "command-name")?;
-    let skill = raw.trim().trim_start_matches('/').trim().to_string();
-    if skill.is_empty() {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    let session = v
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    // dedup key: the line's own uuid (command messages have no message.id)
-    let id = v.get("uuid").and_then(|i| i.as_str())?.to_string();
-    if id.is_empty() {
-        return None;
-    }
-    Some(RawEvent {
-        ts_ms,
-        session,
-        model: String::new(), // not an LLM request → no model/tokens/cost
-        in_tok: 0.0,
-        cc: 0.0,
-        cr: 0.0,
-        out_tok: 0.0,
-        mcp: Vec::new(),
-        skills: vec![skill],
-        id,
-        source: String::new(),
-        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        tools: Vec::new(),
-        sidechain: false,
-        tool_results: 0,
-        tool_errors: 0,
-    })
-}
-
-fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
-    let msg = v.get("message")?;
-    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
-    if model == "<synthetic>" {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    let session = v
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let id = msg
-        .get("id")
-        .and_then(|i| i.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let usage = msg.get("usage");
-    let g = |k: &str| -> f64 {
-        usage
-            .and_then(|u| u.get(k))
-            .and_then(|x| x.as_f64())
-            .unwrap_or(0.0)
-    };
-
-    let mut mcp = Vec::new();
-    let mut skills = Vec::new();
-    let mut tools = Vec::new();
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        for block in content {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if !name.is_empty() {
-                tools.push(name.to_string());
-            }
-            if let Some(rest) = name.strip_prefix("mcp__") {
-                mcp.push(rest.split("__").next().unwrap_or("").to_string());
-            } else if name == "Skill" {
-                if let Some(sk) = block
-                    .get("input")
-                    .and_then(|i| i.get("skill"))
-                    .and_then(|s| s.as_str())
-                {
-                    if !sk.is_empty() {
-                        skills.push(sk.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    Some(RawEvent {
-        ts_ms,
-        session,
-        model: model.to_string(),
-        in_tok: g("input_tokens"),
-        cc: g("cache_creation_input_tokens"),
-        cr: g("cache_read_input_tokens"),
-        out_tok: g("output_tokens"),
-        mcp,
-        skills,
-        id,
-        source: String::new(),
-        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        tools,
-        sidechain: v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false),
-        tool_results: 0,
-        tool_errors: 0,
-    })
 }

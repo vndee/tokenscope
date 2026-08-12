@@ -283,19 +283,20 @@ fn build_reports(
 /// then compute its events with the current config + prices. Returns the events
 /// plus the account's installed MCP-server / Skill sets.
 fn account_events(
-    a: &crate::accounts::Account,
+    d: &crate::agents::AgentDescriptor,
+    a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
 ) -> (Vec<Event>, HashSet<String>, HashSet<String>) {
     let mut store = Store::load(&a.id);
-    let mut dirty = store.ingest(&a.data_dir.join("projects"));
+    let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
     if store.prune_before(cutoff) {
         dirty = true;
     }
     if dirty {
         store.save(&a.id);
     }
-    let cfg = UserConfig::load_for(&a.config_file, &a.data_dir.join("skills"));
+    let cfg = (d.load_config)(a);
     // Resolve each event's project to its git-repo root, memoized per unique cwd
     // so the (filesystem-backed) walk-up runs once per directory, not per event.
     let mut proj_memo: HashMap<String, String> = HashMap::new();
@@ -336,8 +337,8 @@ pub fn build_workspace() -> Workspace {
     let mut all_servers: HashSet<String> = HashSet::new();
     let mut all_skills: HashSet<String> = HashSet::new();
 
-    for a in crate::accounts::discover() {
-        let (events, servers, skills) = account_events(&a, &pricing, cutoff);
+    for (d, a) in crate::agents::discover_all() {
+        let (events, servers, skills) = account_events(d, &a, &pricing, cutoff);
         let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
         all_servers.extend(servers);
         all_skills.extend(skills);
@@ -375,11 +376,11 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
     let mut events: Vec<Event> = Vec::new();
     let mut servers: HashSet<String> = HashSet::new();
     let mut skills: HashSet<String> = HashSet::new();
-    for a in crate::accounts::discover() {
+    for (d, a) in crate::agents::discover_all() {
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk) = account_events(&a, &pricing, cutoff);
+        let (ev, srv, sk) = account_events(d, &a, &pricing, cutoff);
         events.extend(ev);
         servers.extend(srv);
         skills.extend(sk);
