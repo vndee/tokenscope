@@ -139,6 +139,16 @@ const SectionRule = ({ t, m = "12px 0 10px" }: { t: Theme; m?: string }) => (
 const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
   <span style={{ font: `600 10px ${t.ui}`, color: t.dim, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{children}</span>
 );
+// Tiny per-agent mark on each tab, so a Claude and a Codex account are
+// distinguishable without spending a second row of navigation on it.
+const AgentBadge = ({ t, agent }: { t: Theme; agent: string }) => {
+  if (agent !== "claude" && agent !== "codex") return null;
+  return (
+    <span aria-hidden="true" style={{
+      font: `600 8px ${t.mono}`, color: t.faint, marginRight: 4, opacity: 0.85,
+    }}>{agent === "codex" ? "▲" : "◆"}</span>
+  );
+};
 
 function ThemeToggle({ pref, theme, onCycle }: { pref: "dark" | "light" | "system"; theme: Theme; onCycle: () => void }) {
   const t = theme;
@@ -243,7 +253,7 @@ function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolea
 // or blur saves; Escape cancels; clearing it resets to the auto-derived name).
 // The "All" tab is fixed and not renamable.
 function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
-  { t: Theme; tabs: { id: string; label: string }[]; activeTab: string; onSelect: (id: string) => void; onRename: (id: string, label: string) => void }) {
+  { t: Theme; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelect: (id: string) => void; onRename: (id: string, label: string) => void }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -292,14 +302,14 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
               background: on ? t.accent : t.segBg,
               color: on ? "#fff" : t.segOffText,
               transition: "background .15s, color .15s",
-            }}>{tab.label}</button>
+            }}><AgentBadge t={t} agent={tab.agent} />{tab.label}</button>
         );
       })}
     </div>
   );
 }
 
-function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean }) {
+function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -837,7 +847,7 @@ export default function App() {
   // Tabs only when there's more than one account (else the single account IS the
   // aggregate). "All" first so it's the default view.
   const tabs = ws.accounts.length > 1
-    ? [{ id: "all", label: "All" }, ...ws.accounts.map((a) => ({ id: a.id, label: labelOverrides[a.id] ?? a.label }))]
+    ? [{ id: "all", label: "All", agent: "all" }, ...ws.accounts.map((a) => ({ id: a.id, label: labelOverrides[a.id] ?? a.label, agent: a.agent }))]
     : [];
   // Selected dashboard; fall back to the aggregate if the active account is gone.
   const selected = activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
