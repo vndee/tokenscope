@@ -999,7 +999,7 @@ use serde_json::Value;
 /// as running session totals, so usage is the difference between consecutive
 /// snapshots — repeated or replayed events then contribute nothing, which
 /// summing `last_token_usage` would get wrong.
-#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct Cum {
     input: f64,
     cached: f64,
