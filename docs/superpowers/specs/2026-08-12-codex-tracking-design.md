@@ -303,11 +303,16 @@ feeding `UserConfig::is_user_skill` unchanged.
 - `AccountData` gains `agent: "claude" | "codex"`; `data.ts` type updated.
 - `AccountTabs` renders a small per-agent badge so the two CLIs are
   distinguishable at a glance without a second nav level.
-- MCP and Skill sections hide when their list is empty. This is a general
-  improvement, applied to every tab, and is what keeps a Codex tab from showing
-  two dead panels.
 - `parser.rs::vendor_of` gains a `codex` → OpenAI branch, so
   `codex-auto-review` is not bucketed as "Other".
+
+No change is needed to hide empty MCP/Skill panels. `App.tsx` already gates both
+sections on `M.servers > 0` / `M.skills > 0` — the size of the *whitelist*, not
+the call list. A Codex account with no configured servers and no skill dirs
+hides both automatically; one with servers configured but no user-MCP calls
+shows the existing "No MCP calls in this period" line, which is accurate.
+Re-gating on the call list would instead suppress that message for Claude users,
+so the existing behaviour stands.
 
 ## Testing
 
