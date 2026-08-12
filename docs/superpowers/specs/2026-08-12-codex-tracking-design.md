@@ -144,9 +144,24 @@ above suggest. Matching is plain substring scanning, so the wrapper is harmless.
 ### Sub-agents
 
 20 of 66 files are sub-agent sessions, identified by `session_meta.source` being
-an object (`{"subagent": {...}}`) rather than the string `"vscode"`. They are
-separate files with their own `token_count` series, so counting every file is
-correct and does not double-count the parent.
+an object (`{"subagent": {...}}`) rather than the string `"vscode"`. A sub-agent
+*spawned* fresh has its own `token_count` series from zero, so counting its file
+is correct and does not double-count the parent.
+
+A sub-agent that **forked** an existing thread does not. Its `session_meta`
+carries `forked_from_id`, and the file opens by replaying the forked-from
+thread's whole transcript — `session_meta`, `task_started`, `turn_context`,
+`token_count` and `mcp_tool_call_end` — restamped at the fork instant but
+carrying the parent's cumulative counters verbatim. Diffing those from a zero
+baseline re-counts the parent's entire history as fresh usage, at the wrong
+hour and day: measured over one day of real logs, 102,682,825 of 576,858,003
+tokens ($77.91 of $437.02) and 106 of 143 MCP calls.
+
+The replayed prefix must therefore establish the fork's baseline and contribute
+nothing. Turn ids and thread ids are UUIDv7, so the boundary is exact rather
+than a timing guess: a turn minted before this thread's own id existed belongs
+to the thread it forked from. The first turn minted at or after the fork ends
+the replay for good (`agents/codex.rs`).
 
 ### No overlap with Claude data
 

@@ -88,7 +88,9 @@ pub struct Store {
 //   v5: capture cwd (project), git branch, full tool list, and subagent flag.
 //   v6: count tool_result blocks + errors (is_error) from user messages.
 //   v7: per-file parser carry in the manifest (Codex cumulative token deltas).
-const STORE_VERSION: u32 = 7;
+//   v8: skip the parent transcript a forked Codex rollout replays (it was
+//       counted as fresh usage, at the fork's timestamp).
+const STORE_VERSION: u32 = 8;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids

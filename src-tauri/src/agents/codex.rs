@@ -129,6 +129,16 @@ struct Carry {
     branch: String,
     sidechain: bool,
     prev: Option<Cum>,
+    /// Set while the replayed parent transcript at the top of a forked rollout
+    /// is being skipped: the UUIDv7 mint time (ms) of *this* thread's own id.
+    /// `None` in a normal file, and cleared for good at the first own-era turn.
+    /// Carried because an incremental read can resume mid-replay.
+    replay_until: Option<u64>,
+    /// Latched once a fork marker has armed the skip in this file. A nested
+    /// fork's *replayed* session_meta carries a `forked_from_id` of its own;
+    /// without this latch it would re-arm the skip mid-file and swallow the
+    /// fork's real usage.
+    replay_armed: bool,
 }
 
 pub(super) struct CodexParser;
@@ -213,6 +223,18 @@ fn ms(ts: &str) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 
+/// Milliseconds encoded in the leading 48 bits of a UUIDv7. Codex mints thread
+/// ids and turn ids as UUIDv7, so comparing two of these orders them by mint
+/// time — which is how a forked rollout's replayed (parent-era) turns are told
+/// apart from its own. `None` for anything that isn't a readable UUID.
+fn uuid7_ms(id: &str) -> Option<u64> {
+    let hex: String = id.chars().filter(|c| *c != '-').take(12).collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16).ok()
+}
+
 impl CodexState {
     /// A RawEvent pre-filled with this session's attribution, carrying no usage.
     /// Tool/skill events reuse it; `id` stays empty because the byte-offset
@@ -268,6 +290,50 @@ impl CodexState {
         {
             self.c.sidechain = true;
         }
+        // A forked thread's rollout does not start empty: it opens by replaying
+        // the whole transcript of the thread it forked from — session_meta,
+        // task_started, turn_context, token_count and mcp_tool_call_end alike —
+        // restamped at the fork instant but carrying the parent's cumulative
+        // counters verbatim. Those records are the parent's and are already
+        // counted in the parent's own file, so here they may only establish this
+        // file's baseline. `forked_from_id` is the fork's own declaration that a
+        // replay follows; `id` is its own thread id, which dates the fork.
+        //
+        // A file with no `forked_from_id` is never touched by this, so an
+        // ordinary session (and a spawned sub-agent, which starts clean) is
+        // parsed exactly as before.
+        if !self.c.replay_armed && p.get("forked_from_id").is_some() {
+            if let Some(own) = p.get("id").and_then(|v| v.as_str()).and_then(uuid7_ms) {
+                self.c.replay_until = Some(own);
+                self.c.replay_armed = true;
+            }
+        }
+    }
+
+    /// A turn boundary (`task_started` / `turn_context`). Turn ids are UUIDv7,
+    /// so a turn minted before this thread's own id existed cannot be this
+    /// thread's work — it belongs to the replayed parent transcript. The first
+    /// turn minted at or after the fork ends the replay for good (the marker is
+    /// cleared, never re-armed), which is also why the skipped region is exactly
+    /// the file's leading prefix. A turn id we cannot read ends the replay too:
+    /// counting a little twice is a smaller error than discarding real usage.
+    /// A record with no turn id at all says nothing about the boundary and
+    /// leaves the state untouched.
+    fn on_turn(&mut self, turn_id: Option<&str>) {
+        let Some(own) = self.c.replay_until else {
+            return;
+        };
+        let Some(id) = turn_id else {
+            return;
+        };
+        if uuid7_ms(id).map(|t| t >= own).unwrap_or(true) {
+            self.c.replay_until = None;
+        }
+    }
+
+    /// Are we inside the replayed parent prefix of a forked rollout?
+    fn replaying(&self) -> bool {
+        self.c.replay_until.is_some()
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
@@ -347,12 +413,16 @@ impl FileState for CodexState {
             }
             // turn_context has no payload.type; the model lives directly on it.
             "turn_context" => {
+                self.on_turn(p.get("turn_id").and_then(|v| v.as_str()));
                 if let Some(m) = p.get("model").and_then(|v| v.as_str()) {
                     self.c.model = m.to_string();
                 }
                 self.turn_skills.clear();
                 None
             }
+            // Tool calls inside the replayed prefix are the parent's, and are
+            // counted in the parent's own file.
+            "response_item" if self.replaying() => None,
             "response_item" => self.on_response_item(p, ts_ms),
             "event_msg" => match p.get("type").and_then(|v| v.as_str())? {
                 "thread_settings_applied" => {
@@ -365,11 +435,24 @@ impl FileState for CodexState {
                     }
                     None
                 }
-                "token_count" => self.on_token_count(p, ts_ms),
+                "token_count" => {
+                    let e = self.on_token_count(p, ts_ms);
+                    // A replayed snapshot still advances `prev` (inside
+                    // on_token_count), so it sets this fork's baseline and the
+                    // fork's own turns are measured from it — but it emits
+                    // nothing, because those tokens are the parent's.
+                    if self.replaying() {
+                        None
+                    } else {
+                        e
+                    }
+                }
                 "task_started" => {
+                    self.on_turn(p.get("turn_id").and_then(|v| v.as_str()));
                     self.turn_skills.clear();
                     None
                 }
+                "mcp_tool_call_end" if self.replaying() => None,
                 "mcp_tool_call_end" => self.on_mcp_call(p, ts_ms),
                 _ => None,
             },
@@ -522,6 +605,153 @@ mod tests {
         let ev = feed(&[subagent_meta, replay_meta, CTX, &a]);
         assert_eq!(ev.len(), 1);
         assert!(ev[0].sidechain);
+    }
+
+    // ── forked rollouts replay the parent transcript ──────────────────
+    //
+    // Shapes taken from a real fork file
+    // (rollout-…-019ff536-97a5-… , forked from …-019ff518-4ec9-…): the fork's
+    // own session_meta, then the parent's session_meta and the parent's turns
+    // replayed in a sub-second burst, then the fork's own first turn.
+    const FORK_META: &str = r#"{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{"session_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","id":"019ff536-97a5-7f60-8522-ce6613a468da","forked_from_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","parent_thread_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","cwd":"/w/proj","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","depth":1}}},"git":{"branch":"main"}}}"#;
+    const PARENT_META: &str = r#"{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{"session_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","id":"019ff518-4ec9-7070-a0bf-955b00458f8c","cwd":"/w/proj","source":"vscode","git":{"branch":"main"}}}"#;
+
+    fn turn(ts: &str, turn_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn_id}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_forked_rollout_counts_nothing_for_the_replayed_parent_transcript() {
+        // The parent's turns (minted before the fork's own thread id) replay
+        // first, carrying the parent's cumulative counters verbatim. They are
+        // already counted in the parent's own file, so they must contribute
+        // zero here — while still baselining the fork's counter, so the fork's
+        // own turn is measured as a delta rather than as its whole cumulative.
+        let p_turn1 = turn("2026-08-12T09:03:43.707Z", "019ff518-4ff6-7e72-820b-4c9df55290b9");
+        let p_tc1 = tc("2026-08-12T09:03:43.718Z", 22068, 11008, 0, 288);
+        let p_turn2 = turn("2026-08-12T09:03:43.723Z", "019ff535-225e-7960-b555-2be47c5403bc");
+        let p_tc2 = tc("2026-08-12T09:03:43.724Z", 8196108, 4000000, 0, 90000);
+        // The fork's own first turn: minted *after* 019ff536-97a5.
+        let own_turn = turn("2026-08-12T09:03:43.847Z", "019ff536-98c5-76d2-a06a-5bb8f482cfe1");
+        let own_tc = tc("2026-08-12T09:03:51.408Z", 8219573, 4010000, 0, 92000);
+
+        let ev = feed(&[
+            FORK_META, PARENT_META, &p_turn1, CTX, &p_tc1, &p_turn2, CTX, &p_tc2, &own_turn, CTX,
+            &own_tc,
+        ]);
+        assert_eq!(ev.len(), 1, "only the fork's own turn may be emitted");
+        // 8219573-8196108 = 23465 input, of which 4010000-4000000 = 10000 cached.
+        assert_eq!(ev[0].in_tok, 13465.0);
+        assert_eq!(ev[0].cr, 10000.0);
+        assert_eq!(ev[0].out_tok, 2000.0);
+        // The fork is still a sub-agent: the latch survives the replayed
+        // session_meta, and the replay skip must not disturb it.
+        assert!(ev[0].sidechain);
+    }
+
+    #[test]
+    fn a_forked_rollout_drops_replayed_tool_and_mcp_records_only() {
+        // mcp_tool_call_end and tool calls inside the replayed prefix are the
+        // parent's (74% of this corpus's MCP calls were replays); after the
+        // replay ends the fork's own must still be counted.
+        let mcp = |ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"mcp_tool_call_end","invocation":{{"server":"github","tool":"get_pr"}}}}}}"#
+            )
+        };
+        let exec = |ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"custom_tool_call","name":"exec","input":"cat /r/skills/review/SKILL.md"}}}}"#
+            )
+        };
+        let p_turn = turn("2026-08-12T09:03:43.707Z", "019ff518-4ff6-7e72-820b-4c9df55290b9");
+        let own_turn = turn("2026-08-12T09:03:43.847Z", "019ff536-98c5-76d2-a06a-5bb8f482cfe1");
+        let ev = feed(&[
+            FORK_META,
+            PARENT_META,
+            &p_turn,
+            &mcp("2026-08-12T09:03:43.710Z"),
+            &exec("2026-08-12T09:03:43.711Z"),
+            &own_turn,
+            &mcp("2026-08-12T09:04:10.000Z"),
+            &exec("2026-08-12T09:04:11.000Z"),
+        ]);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0].mcp, vec!["github"]);
+        assert_eq!(ev[1].skills, vec!["review"]);
+    }
+
+    #[test]
+    fn an_unforked_session_is_never_treated_as_a_replay() {
+        // No forked_from_id → the skip is never armed, so an ordinary session
+        // (and a spawned sub-agent, which starts clean) parses exactly as
+        // before, even though its first turn id predates nothing.
+        let t = turn("2026-08-12T04:00:01.000Z", "019ff518-4ff6-7e72-820b-4c9df55290b9");
+        let a = tc("2026-08-12T04:00:02.000Z", 1000, 400, 0, 50);
+        let ev = feed(&[META, &t, CTX, &a]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].in_tok, 600.0);
+    }
+
+    #[test]
+    fn a_replayed_nested_fork_marker_cannot_re_arm_the_skip() {
+        // The replayed transcript of a parent that was itself a fork carries
+        // that parent's own forked_from_id. Re-arming on it would restart the
+        // skip mid-file and swallow the fork's real usage, so the arm latches.
+        let own_turn = turn("2026-08-12T09:03:43.847Z", "019ff536-98c5-76d2-a06a-5bb8f482cfe1");
+        let nested = r#"{"timestamp":"2026-08-12T09:03:43.720Z","type":"session_meta","payload":{"session_id":"019ff518-4ec9-7070-a0bf-955b00458f8c","id":"019ff600-0000-7000-8000-000000000000","forked_from_id":"019ff400-0000-7000-8000-000000000000","cwd":"/w/proj","source":"vscode"}}"#;
+        let a = tc("2026-08-12T09:04:00.000Z", 1000, 0, 0, 50);
+        let b = tc("2026-08-12T09:04:01.000Z", 1600, 0, 0, 80);
+        let ev = feed(&[FORK_META, PARENT_META, &own_turn, CTX, nested, &a, &b]);
+        // `a` baselines nothing new (it is the first post-replay snapshot, so
+        // it is a genuine delta from 0); `b` is its delta. Both counted.
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1].in_tok, 600.0);
+    }
+
+    #[test]
+    fn the_replay_skip_survives_an_incremental_read() {
+        // An incremental pass can stop mid-replay. Without replay_until in
+        // Carry the next pass would resume with the skip disarmed and re-count
+        // the rest of the parent's transcript as fresh usage.
+        let p_turn = turn("2026-08-12T09:03:43.707Z", "019ff518-4ff6-7e72-820b-4c9df55290b9");
+        let p_tc = tc("2026-08-12T09:03:43.718Z", 22068, 0, 0, 288);
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [FORK_META, PARENT_META, p_turn.as_str(), CTX] {
+            assert!(st.parse_line(l).is_none());
+        }
+        let saved = st.carry().expect("codex state must be persistable");
+
+        let mut st2 = p.new_file_state(Some(&saved));
+        assert!(st2.parse_line(&p_tc).is_none(), "still inside the replay");
+        let own_turn = turn("2026-08-12T09:03:43.847Z", "019ff536-98c5-76d2-a06a-5bb8f482cfe1");
+        st2.parse_line(&own_turn);
+        let own_tc = tc("2026-08-12T09:03:51.408Z", 32068, 0, 0, 388);
+        let ev = st2.parse_line(&own_tc).expect("the fork's own turn");
+        assert_eq!(ev.in_tok, 10000.0);
+        assert_eq!(ev.out_tok, 100.0);
+    }
+
+    #[test]
+    fn uuid7_ms_reads_the_leading_48_bits_and_rejects_non_uuids() {
+        assert_eq!(
+            uuid7_ms("019ff536-97a5-7f60-8522-ce6613a468da"),
+            Some(0x019ff53697a5)
+        );
+        // Mint order is what the replay boundary relies on.
+        assert!(
+            uuid7_ms("019ff535-225e-7960-b555-2be47c5403bc").unwrap()
+                < uuid7_ms("019ff536-97a5-7f60-8522-ce6613a468da").unwrap()
+        );
+        assert!(
+            uuid7_ms("019ff536-98c5-76d2-a06a-5bb8f482cfe1").unwrap()
+                > uuid7_ms("019ff536-97a5-7f60-8522-ce6613a468da").unwrap()
+        );
+        assert_eq!(uuid7_ms("not-a-uuid"), None);
+        assert_eq!(uuid7_ms("short"), None);
     }
 
     #[test]
@@ -691,4 +921,5 @@ mod tests {
         assert_eq!(ev[0].tool_results, 0);
         assert_eq!(ev[0].tool_errors, 0);
     }
+
 }
