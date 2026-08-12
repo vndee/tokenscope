@@ -1008,7 +1008,12 @@ struct Cum {
 }
 
 /// Parser state persisted between incremental reads of one session file.
+// #[serde(default)] so a payload written by an older build — or one missing a
+// field added later — still deserializes field-by-field. Without it a single
+// unknown-shape payload fails wholesale, `prev` falls back to None, and the
+// next incremental pass re-adds an entire session's tokens.
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 struct Carry {
     session: String,
     model: String,
@@ -1089,12 +1094,19 @@ impl CodexState {
             self.c.branch = s.to_string();
         }
         // A sub-agent thread records its parent under source.subagent; a normal
-        // session's source is a plain string ("vscode").
-        self.c.sidechain = p
-            .get("source")
+        // session's source is a plain string ("vscode"). This LATCHES: a file
+        // can hold several session_meta records, and in real subagent logs a
+        // replayed one carrying source:"vscode" lands ~3ms after the first.
+        // Assigning unconditionally would flip the flag back and misattribute
+        // the whole thread's tokens to the main loop. A plain `if let Some`
+        // would not help either — the replayed record does carry a `source`.
+        if p.get("source")
             .and_then(|v| v.as_object())
             .map(|o| o.contains_key("subagent"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            self.c.sidechain = true;
+        }
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {

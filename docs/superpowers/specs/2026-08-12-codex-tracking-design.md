@@ -269,7 +269,7 @@ Field mapping into `RawEvent`:
 | `id` | empty — the byte-offset manifest already guarantees one read per line |
 | `cwd` | `session_meta.payload.cwd` |
 | `branch` | `session_meta.payload.git.branch` (may be null) |
-| `sidechain` | true when `session_meta.payload.source` is an object with a `subagent` key |
+| `sidechain` | latches true once any `session_meta.payload.source` is an object with a `subagent` key |
 | `tools` | every `function_call` / `custom_tool_call` name, plus `<server>.<tool>` from `mcp_tool_call_end` |
 | `tool_results`, `tool_errors` | left 0 — see below |
 
