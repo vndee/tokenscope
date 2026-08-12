@@ -24,8 +24,8 @@ export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
 }
-// One Claude account (= one config dir) and its dashboard.
-export interface AccountData { id: string; label: string; email: string; dash: Dashboard }
+// One tracked account (= one agent CLI config dir) and its dashboard.
+export interface AccountData { id: string; label: string; email: string; agent: string; dash: Dashboard }
 // Every account plus an aggregate "All"; todayTokens is the combined tray total.
 export interface Workspace { accounts: AccountData[]; all: Dashboard; todayTokens: number }
 
@@ -37,7 +37,7 @@ export async function fetchWorkspace(): Promise<Workspace> {
   const res = await fetch("/dev-dashboard.json");
   if (!res.ok) throw new Error("not running in Tauri and no dev snapshot found");
   const dash: Dashboard = await res.json();
-  return { accounts: [{ id: "dev", label: "Dev", email: "", dash }], all: dash, todayTokens: dash.todayTokens };
+  return { accounts: [{ id: "dev", label: "Dev", email: "", agent: "claude", dash }], all: dash, todayTokens: dash.todayTokens };
 }
 
 // Fetch one period report for a specific account ("all" or an id) + reference

@@ -7,7 +7,6 @@
 // and persists everything to the cache dir. Aggregation (parser.rs) then works
 // purely on these in-memory events — cheap, and recomputed per request because
 // the Day/Week/Month windows are relative to "now".
-use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -52,10 +51,41 @@ pub struct RawEvent {
     pub tool_errors: u32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct FileEntry {
+    size: u64,
+    mtime_ms: i64,
+    /// Bytes of this file already ingested.
+    offset: u64,
+    /// Parser state at that offset, so an incremental read resumes exactly
+    /// (Codex diffs a cumulative token counter and cannot restart from zero).
+    #[serde(default)]
+    carry: Option<serde_json::Value>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
-    // path -> (size, mtime_ms, byte offset already ingested)
-    files: HashMap<String, (u64, i64, u64)>,
+    files: HashMap<String, FileEntry>,
+}
+
+/// One account's whole cache. The events, the byte-offset manifest and the
+/// store version are a single consistency unit — an offset only means anything
+/// relative to the events that were loaded — so they live in one document,
+/// written under one atomic rename. Split across separate files they could skew
+/// against each other if a crash landed between two writes; see `save`.
+#[derive(Deserialize)]
+struct Snapshot {
+    version: u32,
+    events: Vec<RawEvent>,
+    manifest: Manifest,
+}
+
+/// Borrowing twin of `Snapshot`, so saving doesn't clone the event vector.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    version: u32,
+    events: &'a [RawEvent],
+    manifest: &'a Manifest,
 }
 
 pub struct Store {
@@ -77,7 +107,10 @@ pub struct Store {
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: capture cwd (project), git branch, full tool list, and subagent flag.
 //   v6: count tool_result blocks + errors (is_error) from user messages.
-const STORE_VERSION: u32 = 6;
+//   v7: per-file parser carry in the manifest (Codex cumulative token deltas).
+//   v8: skip the parent transcript a forked Codex rollout replays (it was
+//       counted as fresh usage, at the fork's timestamp).
+const STORE_VERSION: u32 = 8;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -99,33 +132,32 @@ impl Store {
     /// run). Cache files are namespaced by the account `id` so multiple accounts
     /// never share (or clobber) each other's incremental state.
     pub fn load(id: &str) -> Self {
+        let Some(dir) = cache_dir() else {
+            return Store {
+                events: Vec::new(),
+                index: HashMap::new(),
+                manifest: Manifest::default(),
+            };
+        };
+        Self::load_from(&dir, id)
+    }
+
+    /// `load`, against an explicit cache directory (so it is testable).
+    fn load_from(dir: &std::path::Path, id: &str) -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
-        if let Some(dir) = cache_dir() {
-            // If the cache was written by an older parser, discard it so ingest
-            // does a full rescan and picks up newly-extracted facts.
-            let version_ok = fs::read_to_string(dir.join(format!("version-{id}")))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                == Some(STORE_VERSION);
-            if version_ok {
-                // events.json and offsets.json are ONE consistent unit: the
-                // manifest's per-file byte offsets are only meaningful relative
-                // to the events we actually loaded. If either is missing or fails
-                // to parse (e.g. a crash left events.json half-written), discard
-                // BOTH and fall back to a full rescan — otherwise a good manifest
-                // paired with empty/corrupt events would make ingest() skip every
-                // already-recorded file and silently lose all history.
-                let loaded_events = fs::read_to_string(dir.join(format!("events-{id}.json")))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Vec<RawEvent>>(&t).ok());
-                let loaded_manifest = fs::read_to_string(dir.join(format!("offsets-{id}.json")))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Manifest>(&t).ok());
-                if let (Some(e), Some(m)) = (loaded_events, loaded_manifest) {
-                    events = e;
-                    manifest = m;
-                }
+        // A snapshot that is missing, truncated by a crash mid-write, or written
+        // by an older parser is discarded whole, and ingest() does a full
+        // rescan. Nothing partial is ever adopted: a manifest without its events
+        // would make ingest() skip every already-recorded file and silently lose
+        // all history.
+        if let Some(s) = fs::read_to_string(dir.join(format!("store-{id}.json")))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Snapshot>(&t).ok())
+        {
+            if s.version == STORE_VERSION {
+                events = s.events;
+                manifest = s.manifest;
             }
         }
         let index = events
@@ -143,21 +175,29 @@ impl Store {
 
     pub fn save(&self, id: &str) {
         if let Some(dir) = cache_dir() {
-            // Atomic writes so a crash/kill mid-save can't leave a half-written
-            // events.json (load() would then discard the pair and lose history).
-            // Write events before offsets: if we crash between them, the manifest
-            // is merely stale (points at fewer bytes → re-reads a little) rather
-            // than ahead of the events on disk.
-            if let Ok(t) = serde_json::to_string(&self.events) {
-                let _ = write_atomic(&dir.join(format!("events-{id}.json")), t.as_bytes());
-            }
-            if let Ok(t) = serde_json::to_string(&self.manifest) {
-                let _ = write_atomic(&dir.join(format!("offsets-{id}.json")), t.as_bytes());
-            }
-            let _ = write_atomic(
-                &dir.join(format!("version-{id}")),
-                STORE_VERSION.to_string().as_bytes(),
-            );
+            self.save_to(&dir, id);
+        }
+    }
+
+    /// `save`, against an explicit cache directory (so it is testable).
+    ///
+    /// The events and the offset manifest go out as ONE document under ONE
+    /// atomic rename, because they cannot be allowed to disagree. Written as two
+    /// files, a crash between the writes leaves offsets that describe bytes the
+    /// events file doesn't cover, and the next pass re-reads the overlap:
+    /// Claude's message-id dedup absorbs that, but Codex events carry no message
+    /// id (`agents/codex.rs`), so re-read lines are pushed a second time and the
+    /// stale `carry` re-diffs their cumulative snapshots — duplicating tokens as
+    /// well as events, silently. One rename means a crash leaves the *previous*
+    /// snapshot intact instead, which is merely stale and self-heals.
+    fn save_to(&self, dir: &std::path::Path, id: &str) {
+        let snap = SnapshotRef {
+            version: STORE_VERSION,
+            events: &self.events,
+            manifest: &self.manifest,
+        };
+        if let Ok(t) = serde_json::to_string(&snap) {
+            let _ = write_atomic(&dir.join(format!("store-{id}.json")), t.as_bytes());
         }
     }
 
@@ -197,15 +237,15 @@ impl Store {
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files under
-    /// `projects_root` (this account's `<config-dir>/projects/`). Returns whether
-    /// anything changed (new events or an updated file offset), so the caller can
-    /// skip a full cache rewrite when nothing moved.
-    pub fn ingest(&mut self, projects_root: &std::path::Path) -> bool {
+    /// `log_root` (this account's log directory). Returns whether anything
+    /// changed (new events or an updated file offset), so the caller can skip a
+    /// full cache rewrite when nothing moved.
+    pub fn ingest(&mut self, log_root: &std::path::Path, parser: &dyn crate::agents::LogParser) -> bool {
         let mut dirty = false;
-        if !projects_root.exists() {
+        if !log_root.exists() {
             return false;
         }
-        for entry in WalkDir::new(projects_root)
+        for entry in WalkDir::new(log_root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
@@ -221,23 +261,26 @@ impl Store {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
 
-            let mut offset = match self.manifest.files.get(&key).copied() {
-                Some((psize, pmtime, poff)) => {
-                    if psize == size && pmtime == mtime_ms {
+            let (offset, carry) = match self.manifest.files.get(&key).cloned() {
+                Some(e) => {
+                    if e.size == size && e.mtime_ms == mtime_ms {
                         continue; // unchanged → skip
                     }
-                    if size < poff {
+                    if size < e.offset {
                         // truncated / rewritten (e.g. log compaction): the bytes
                         // we already ingested are gone, so purge this file's
-                        // events and re-read from the start, idempotently.
+                        // events and re-read from the start, idempotently. The
+                        // carried parser state described those bytes, so it goes
+                        // too — otherwise the rescan diffs against a stale baseline.
                         self.purge_source(&key);
-                        0
+                        (0, None)
                     } else {
-                        poff
+                        (e.offset, e.carry)
                     }
                 }
-                None => 0,
+                None => (0, None),
             };
+            let mut offset = offset;
 
             let Ok(mut f) = fs::File::open(path) else { continue };
             if f.seek(SeekFrom::Start(offset)).is_err() {
@@ -253,12 +296,13 @@ impl Store {
                 Some(i) => i + 1,
                 None => 0,
             };
+            let mut state = parser.new_file_state(carry.as_ref());
             for line in buf[..process_until].split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
                 let Ok(s) = std::str::from_utf8(line) else { continue };
-                if let Some(mut ev) = parse_line(s) {
+                if let Some(mut ev) = state.parse_line(s) {
                     ev.source = key.clone();
                     if !ev.id.is_empty() {
                         if let Some(&i) = self.index.get(&ev.id) {
@@ -276,196 +320,271 @@ impl Store {
                 }
             }
             offset += process_until as u64;
-            self.manifest.files.insert(key, (size, mtime_ms, offset));
+            self.manifest.files.insert(
+                key,
+                FileEntry {
+                    size,
+                    mtime_ms,
+                    offset,
+                    carry: state.carry(),
+                },
+            );
             dirty = true;
         }
         dirty
     }
 }
 
-/// Parse one JSONL line into a RawEvent (assistant messages only).
-fn parse_line(line: &str) -> Option<RawEvent> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    match v.get("type")?.as_str()? {
-        "assistant" => parse_assistant(&v),
-        "user" => parse_user(&v),
-        _ => None,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::{FileState, LogParser};
 
-/// A user message is either a slash-command invocation (string content) or a
-/// batch of tool_result blocks (array content). Route to the right extractor.
-fn parse_user(v: &serde_json::Value) -> Option<RawEvent> {
-    let content = v.get("message")?.get("content")?;
-    if let Some(text) = content.as_str() {
-        return parse_user_command(v, text);
+    /// A parser whose state is a running line count, exposed via carry(). Lets us
+    /// assert that state survives a split (incremental) read of the same file.
+    struct CountParser;
+    struct CountState {
+        n: u64,
     }
-    let arr = content.as_array()?;
-    let mut results = 0u32;
-    let mut errors = 0u32;
-    for b in arr {
-        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-            results += 1;
-            if b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false) {
-                errors += 1;
-            }
-        }
-    }
-    if results == 0 {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    // dedup key: the line's own uuid (tool_result messages carry no message.id)
-    let id = v.get("uuid").and_then(|i| i.as_str()).unwrap_or("").to_string();
-    if id.is_empty() {
-        return None;
-    }
-    Some(RawEvent {
-        ts_ms,
-        session: v.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-        model: String::new(), // not an LLM request → no model/tokens
-        in_tok: 0.0,
-        cc: 0.0,
-        cr: 0.0,
-        out_tok: 0.0,
-        mcp: Vec::new(),
-        skills: Vec::new(),
-        id,
-        source: String::new(),
-        cwd: String::new(),
-        branch: String::new(),
-        tools: Vec::new(),
-        sidechain: false,
-        tool_results: results,
-        tool_errors: errors,
-    })
-}
 
-/// Extract the inner text of `<tag>...</tag>` from `s`, if present.
-fn extract_tag(s: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = s.find(&open)? + open.len();
-    let rest = &s[start..];
-    let end = rest.find(&close)?;
-    Some(rest[..end].to_string())
-}
-
-/// A user message that is a slash-command invocation of a skill, e.g.
-/// `<command-name>/find-skills</command-name>`. The skill name is left
-/// unfiltered here; compute_event drops non-user skills via the whitelist.
-fn parse_user_command(v: &serde_json::Value, text: &str) -> Option<RawEvent> {
-    let raw = extract_tag(text, "command-name")?;
-    let skill = raw.trim().trim_start_matches('/').trim().to_string();
-    if skill.is_empty() {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    let session = v
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    // dedup key: the line's own uuid (command messages have no message.id)
-    let id = v.get("uuid").and_then(|i| i.as_str())?.to_string();
-    if id.is_empty() {
-        return None;
-    }
-    Some(RawEvent {
-        ts_ms,
-        session,
-        model: String::new(), // not an LLM request → no model/tokens/cost
-        in_tok: 0.0,
-        cc: 0.0,
-        cr: 0.0,
-        out_tok: 0.0,
-        mcp: Vec::new(),
-        skills: vec![skill],
-        id,
-        source: String::new(),
-        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        tools: Vec::new(),
-        sidechain: false,
-        tool_results: 0,
-        tool_errors: 0,
-    })
-}
-
-fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
-    let msg = v.get("message")?;
-    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
-    if model == "<synthetic>" {
-        return None;
-    }
-    let ts = v.get("timestamp")?.as_str()?;
-    let ts_ms = DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis();
-    let session = v
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let id = msg
-        .get("id")
-        .and_then(|i| i.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let usage = msg.get("usage");
-    let g = |k: &str| -> f64 {
-        usage
-            .and_then(|u| u.get(k))
-            .and_then(|x| x.as_f64())
-            .unwrap_or(0.0)
-    };
-
-    let mut mcp = Vec::new();
-    let mut skills = Vec::new();
-    let mut tools = Vec::new();
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        for block in content {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if !name.is_empty() {
-                tools.push(name.to_string());
-            }
-            if let Some(rest) = name.strip_prefix("mcp__") {
-                mcp.push(rest.split("__").next().unwrap_or("").to_string());
-            } else if name == "Skill" {
-                if let Some(sk) = block
-                    .get("input")
-                    .and_then(|i| i.get("skill"))
-                    .and_then(|s| s.as_str())
-                {
-                    if !sk.is_empty() {
-                        skills.push(sk.to_string());
-                    }
-                }
-            }
+    impl LogParser for CountParser {
+        fn new_file_state(&self, carry: Option<&serde_json::Value>) -> Box<dyn FileState> {
+            let n = carry.and_then(|v| v.get("n")).and_then(|v| v.as_u64()).unwrap_or(0);
+            Box::new(CountState { n })
         }
     }
 
-    Some(RawEvent {
-        ts_ms,
-        session,
-        model: model.to_string(),
-        in_tok: g("input_tokens"),
-        cc: g("cache_creation_input_tokens"),
-        cr: g("cache_read_input_tokens"),
-        out_tok: g("output_tokens"),
-        mcp,
-        skills,
-        id,
-        source: String::new(),
-        cwd: v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-        branch: v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        tools,
-        sidechain: v.get("isSidechain").and_then(|b| b.as_bool()).unwrap_or(false),
-        tool_results: 0,
-        tool_errors: 0,
-    })
+    impl FileState for CountState {
+        fn parse_line(&mut self, _line: &str) -> Option<RawEvent> {
+            self.n += 1;
+            None
+        }
+        fn carry(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "n": self.n }))
+        }
+    }
+
+    #[test]
+    fn carry_survives_an_incremental_read() {
+        let dir = std::env::temp_dir().join(format!("ts-carry-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("a.jsonl");
+        fs::write(&log, "one\ntwo\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &CountParser);
+        let key = log.to_string_lossy().to_string();
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 2 })));
+
+        // Append two more lines; the second pass must resume from 2, not 0.
+        fs::write(&log, "one\ntwo\nthree\nfour\n").unwrap();
+        store.ingest(&dir, &CountParser);
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 4 })));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forked_codex_rollout_ingests_as_the_union_of_the_two_files_not_their_sum() {
+        // The defect this guards is cross-file, so no per-file invariant can
+        // see it: a fork's own file replays its parent's whole token series, and
+        // each replayed snapshot legitimately sums into that file's own final
+        // cumulative. Only ingesting parent *and* fork together shows it.
+        //
+        // Parent runs two turns (cumulative input 1000 then 3000); the fork
+        // replays both, then runs one of its own (3500). The union is 3500 in /
+        // 350 out = 3850 tokens. Counting the replay makes it 7150.
+        const P: &str = "019ff518-4ec9-7070-a0bf-955b00458f8c";
+        const T1: &str = "019ff518-4ff6-7e72-820b-4c9df55290b9";
+        const T2: &str = "019ff535-225e-7960-b555-2be47c5403bc";
+        const F: &str = "019ff536-97a5-7f60-8522-ce6613a468da";
+        const T3: &str = "019ff536-98c5-76d2-a06a-5bb8f482cfe1";
+        let started = |ts: &str, id: &str| format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_started","turn_id":"{id}"}}}}"#
+        );
+        let ctx = |ts: &str| format!(
+            r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.6-sol"}}}}"#
+        );
+        let tc = |ts: &str, i: u64, o: u64| format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":{o}}}}}}}}}"#
+        );
+
+        let dir = std::env::temp_dir().join(format!("ts-fork-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let parent = [
+            format!(r#"{{"timestamp":"2026-08-12T08:30:38.824Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{P}","cwd":"/w","source":"vscode"}}}}"#),
+            started("2026-08-12T08:30:40.000Z", T1),
+            ctx("2026-08-12T08:30:40.100Z"),
+            tc("2026-08-12T08:30:51.951Z", 1000, 100),
+            started("2026-08-12T09:03:30.000Z", T2),
+            tc("2026-08-12T09:03:30.915Z", 3000, 300),
+        ]
+        .join("\n");
+        let fork = [
+            // The fork's own meta, then the parent's replayed transcript.
+            format!(r#"{{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{F}","forked_from_id":"{P}","cwd":"/w","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{P}"}}}}}}}}}}"#),
+            format!(r#"{{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{P}","cwd":"/w","source":"vscode"}}}}"#),
+            started("2026-08-12T09:03:43.707Z", T1),
+            ctx("2026-08-12T09:03:43.718Z"),
+            tc("2026-08-12T09:03:43.718Z", 1000, 100),
+            started("2026-08-12T09:03:43.723Z", T2),
+            tc("2026-08-12T09:03:43.724Z", 3000, 300),
+            // The fork's own first turn.
+            started("2026-08-12T09:03:43.847Z", T3),
+            ctx("2026-08-12T09:03:47.461Z"),
+            tc("2026-08-12T09:03:51.408Z", 3500, 350),
+        ]
+        .join("\n");
+        fs::write(dir.join("parent.jsonl"), parent + "\n").unwrap();
+        fs::write(dir.join("fork.jsonl"), fork + "\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &*(crate::agents::codex::DESCRIPTOR.parser)());
+
+        let total: f64 = store
+            .events
+            .iter()
+            .map(|e| e.in_tok + e.cc + e.cr + e.out_tok)
+            .sum();
+        assert_eq!(total, 3850.0, "the union of the two files, not their sum");
+        // The fork contributes exactly its own turn, still marked sidechain.
+        let sub: Vec<&RawEvent> = store.events.iter().filter(|e| e.sidechain).collect();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].in_tok, 500.0);
+        assert_eq!(sub[0].out_tok, 50.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn codex_shaped_event(ts_ms: i64) -> RawEvent {
+        RawEvent {
+            ts_ms,
+            session: "s1".into(),
+            model: "gpt-5.6-sol".into(),
+            in_tok: 100.0,
+            cc: 0.0,
+            cr: 0.0,
+            out_tok: 10.0,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            // Codex events deliberately carry no message id, so nothing dedupes
+            // them if the same bytes are ever read twice.
+            id: String::new(),
+            source: "/logs/a.jsonl".into(),
+            cwd: "/w".into(),
+            branch: "main".into(),
+            tools: Vec::new(),
+            sidechain: true,
+            tool_results: 0,
+            tool_errors: 0,
+        }
+    }
+
+    #[test]
+    fn the_cache_is_one_document_so_events_and_offsets_cannot_skew() {
+        let dir = std::env::temp_dir().join(format!("ts-snap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        let mut store = Store {
+            events: vec![codex_shaped_event(1_000)],
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.manifest.files.insert(
+            "/logs/a.jsonl".to_string(),
+            FileEntry {
+                size: 42,
+                mtime_ms: 7,
+                offset: 42,
+                carry: Some(serde_json::json!({ "prev": { "input": 100.0 } })),
+            },
+        );
+        store.save_to(&dir, "acct");
+
+        // One file, so there is no window in which one artifact is newer than
+        // the other. A second file here would mean a crash could skew the pair.
+        let mut written: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        written.sort();
+        assert_eq!(written, vec!["store-acct.json".to_string()]);
+
+        // Events and offsets come back together, or not at all.
+        let back = Store::load_from(&dir, "acct");
+        assert_eq!(back.events.len(), 1);
+        assert_eq!(back.events[0].out_tok, 10.0);
+        assert_eq!(back.manifest.files["/logs/a.jsonl"].offset, 42);
+        assert!(back.manifest.files["/logs/a.jsonl"].carry.is_some());
+
+        // A snapshot truncated by a crash is discarded whole: an offset without
+        // its events would make ingest() skip the file and lose its history.
+        let path = dir.join("store-acct.json");
+        let half = fs::read_to_string(&path).unwrap();
+        fs::write(&path, &half[..half.len() / 2]).unwrap();
+        let broken = Store::load_from(&dir, "acct");
+        assert!(broken.events.is_empty());
+        assert!(broken.manifest.files.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_store_version_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("ts-snapver-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("store-acct.json"),
+            serde_json::json!({
+                "version": STORE_VERSION - 1,
+                "events": [],
+                "manifest": { "files": { "/logs/a.jsonl": { "size": 1, "mtime_ms": 1, "offset": 1 } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Stale offsets must not survive a parser change, or ingest() skips the
+        // bytes whose newly-extracted facts the bump exists to pick up.
+        let s = Store::load_from(&dir, "acct");
+        assert!(s.manifest.files.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncation_clears_carry_and_rereads() {
+        let dir = std::env::temp_dir().join(format!("ts-trunc-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("b.jsonl");
+        fs::write(&log, "one\ntwo\nthree\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &CountParser);
+        let key = log.to_string_lossy().to_string();
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 3 })));
+
+        // Rewrite shorter: the old bytes are gone, so counting restarts at 1.
+        fs::write(&log, "x\n").unwrap();
+        store.ingest(&dir, &CountParser);
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 1 })));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

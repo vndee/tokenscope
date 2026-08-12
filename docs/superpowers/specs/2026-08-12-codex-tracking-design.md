@@ -113,16 +113,55 @@ Codex has no skill tool call. A skill is invoked by the agent reading its
 11  /Users/vndee/.agents/skills/payment-integration
 ```
 
-Detection is a path match on `skills/<name>/SKILL.md` inside the exec input.
+Detection is a path match inside the exec input, accepting two shapes:
+
+| Path | Skill id |
+|---|---|
+| `skills/<name>/SKILL.md` | `<name>` |
+| `skills/<plugin>/<name>/SKILL.md` | `<plugin>:<name>` |
+
+A segment starting with `.` is excluded, which keeps the real
+`skills/.system/openai-docs/SKILL.md` out. Reference files under a skill —
+the real `skills/using-superpowers/references/codex-tools.md` — have no
+`SKILL.md` tail and fall out naturally. One exec input can open several skills,
+so every match is collected, de-duplicated within the input.
+
+The `<plugin>:<name>` label matters for consistency, not filtering:
+`UserConfig::is_user_skill` strips at the last `:` before checking the
+whitelist, so either label filters identically — but Claude's parser emits raw
+`input.skill` values that are already `plugin:skill`, so both agents' Skill
+breakdowns end up labelled the same way. An earlier draft of this spec accepted
+only the one-segment shape, which silently dropped the real
+`skills/gstack/review/SKILL.md` and put the two agents out of step.
+
 This is a heuristic — it counts "agent opened this skill", which approximates but
 does not equal "agent used this skill".
+
+Note also that real `exec` inputs are JS-wrapped
+(`tools.exec_command({cmd: "..."})`), not the plain shell strings the samples
+above suggest. Matching is plain substring scanning, so the wrapper is harmless.
 
 ### Sub-agents
 
 20 of 66 files are sub-agent sessions, identified by `session_meta.source` being
-an object (`{"subagent": {...}}`) rather than the string `"vscode"`. They are
-separate files with their own `token_count` series, so counting every file is
-correct and does not double-count the parent.
+an object (`{"subagent": {...}}`) rather than the string `"vscode"`. A sub-agent
+*spawned* fresh has its own `token_count` series from zero, so counting its file
+is correct and does not double-count the parent.
+
+A sub-agent that **forked** an existing thread does not. Its `session_meta`
+carries `forked_from_id`, and the file opens by replaying the forked-from
+thread's whole transcript — `session_meta`, `task_started`, `turn_context`,
+`token_count` and `mcp_tool_call_end` — restamped at the fork instant but
+carrying the parent's cumulative counters verbatim. Diffing those from a zero
+baseline re-counts the parent's entire history as fresh usage, at the wrong
+hour and day: measured over one day of real logs, 102,682,825 of 576,858,003
+tokens ($77.91 of $437.02) and 106 of 143 MCP calls.
+
+The replayed prefix must therefore establish the fork's baseline and contribute
+nothing. Turn ids and thread ids are UUIDv7, so the boundary is exact rather
+than a timing guess: a turn minted before this thread's own id existed belongs
+to the thread it forked from. The first turn minted at or after the fork ends
+the replay for good (`agents/codex.rs`).
 
 ### No overlap with Claude data
 
@@ -247,7 +286,7 @@ Per line:
   then store the new cumulative as `prev`. Skip when every delta is zero.
 - `mcp_tool_call_end` → emit a zero-token `RawEvent` with
   `mcp: vec![invocation.server]`.
-- `custom_tool_call` named `exec` whose input matches `skills/<name>/SKILL.md`
+- `custom_tool_call` named `exec` whose input matches a skill path (see above)
   and whose `<name>` is not already in `turn_skills` → emit a zero-token
   `RawEvent` with `skills: vec![name]`, and record it.
 
@@ -269,7 +308,7 @@ Field mapping into `RawEvent`:
 | `id` | empty — the byte-offset manifest already guarantees one read per line |
 | `cwd` | `session_meta.payload.cwd` |
 | `branch` | `session_meta.payload.git.branch` (may be null) |
-| `sidechain` | true when `session_meta.payload.source` is an object with a `subagent` key |
+| `sidechain` | latches true once any `session_meta.payload.source` is an object with a `subagent` key |
 | `tools` | every `function_call` / `custom_tool_call` name, plus `<server>.<tool>` from `mcp_tool_call_end` |
 | `tool_results`, `tool_errors` | left 0 — see below |
 

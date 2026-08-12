@@ -999,7 +999,7 @@ use serde_json::Value;
 /// as running session totals, so usage is the difference between consecutive
 /// snapshots — repeated or replayed events then contribute nothing, which
 /// summing `last_token_usage` would get wrong.
-#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct Cum {
     input: f64,
     cached: f64,
@@ -1008,7 +1008,12 @@ struct Cum {
 }
 
 /// Parser state persisted between incremental reads of one session file.
+// #[serde(default)] so a payload written by an older build — or one missing a
+// field added later — still deserializes field-by-field. Without it a single
+// unknown-shape payload fails wholesale, `prev` falls back to None, and the
+// next incremental pass re-adds an entire session's tokens.
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 struct Carry {
     session: String,
     model: String,
@@ -1089,12 +1094,19 @@ impl CodexState {
             self.c.branch = s.to_string();
         }
         // A sub-agent thread records its parent under source.subagent; a normal
-        // session's source is a plain string ("vscode").
-        self.c.sidechain = p
-            .get("source")
+        // session's source is a plain string ("vscode"). This LATCHES: a file
+        // can hold several session_meta records, and in real subagent logs a
+        // replayed one carrying source:"vscode" lands ~3ms after the first.
+        // Assigning unconditionally would flip the flag back and misattribute
+        // the whole thread's tokens to the main loop. A plain `if let Some`
+        // would not help either — the replayed record does carry a `source`.
+        if p.get("source")
             .and_then(|v| v.as_object())
             .map(|o| o.contains_key("subagent"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            self.c.sidechain = true;
+        }
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
@@ -1291,25 +1303,46 @@ Expected: FAIL to compile — `skill_names` does not exist.
 Add the free function to `codex.rs`:
 
 ```rust
-/// Every `skills/<name>/SKILL.md` path in a shell command, in order.
+/// Every `skills/<name>/SKILL.md` or `skills/<plugin>/<name>/SKILL.md` path in
+/// a shell command, in order. A plugin-scoped skill is labelled `plugin:name`,
+/// matching the `input.skill` values Claude's parser already emits for its own
+/// plugin-scoped skills, so the two agents' Skill breakdowns line up.
 ///
 /// Codex has no skill tool call: a skill is invoked by reading its SKILL.md, so
-/// that read is the signal. Requiring the exact `<name>/SKILL.md` tail keeps
-/// out reference files under a skill and nested system paths
-/// (`skills/.system/openai-docs/SKILL.md`), and one command can open several.
+/// that read is the signal. Requiring an exact `/SKILL.md` tail (at one or two
+/// path levels) keeps out reference files under a skill
+/// (`skills/using-superpowers/references/codex-tools.md`, no `SKILL.md` tail
+/// at either level). A path whose segment right after `skills/` starts with
+/// `.` is excluded outright — that's how nested system paths
+/// (`skills/.system/openai-docs/SKILL.md`) stay out even though they'd
+/// otherwise match the two-level shape. One command can open several skills.
 fn skill_names(cmd: &str) -> Vec<String> {
     const MARK: &str = "skills/";
     let mut out = Vec::new();
     let mut rest = cmd;
     while let Some(i) = rest.find(MARK) {
         rest = &rest[i + MARK.len()..];
-        let Some(name) = rest.split('/').next() else {
+        let mut segs = rest.split('/');
+        let Some(seg1) = segs.next() else {
             continue;
         };
-        if !name.is_empty() && rest[name.len()..].starts_with("/SKILL.md") {
-            let n = name.to_string();
+        if seg1.is_empty() || seg1.starts_with('.') {
+            continue;
+        }
+        if rest[seg1.len()..].starts_with("/SKILL.md") {
+            let n = seg1.to_string();
             if !out.contains(&n) {
                 out.push(n);
+            }
+            continue;
+        }
+        if let Some(seg2) = segs.next() {
+            let prefix_len = seg1.len() + 1 + seg2.len();
+            if !seg2.is_empty() && rest[prefix_len..].starts_with("/SKILL.md") {
+                let n = format!("{seg1}:{seg2}");
+                if !out.contains(&n) {
+                    out.push(n);
+                }
             }
         }
     }

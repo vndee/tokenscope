@@ -136,6 +136,7 @@ pub struct AccountData {
     pub id: String,    // stable key (slug of the config dir), also the tab key
     pub label: String, // friendly name (org / display name / email / dir)
     pub email: String, // account email if known (may be empty)
+    pub agent: String, // owning CLI ("claude" / "codex") — drives the tab badge
     pub dash: Dashboard,
 }
 

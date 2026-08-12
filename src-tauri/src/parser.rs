@@ -94,7 +94,7 @@ fn vendor_of(model: &str) -> &'static str {
     let m = model.to_lowercase();
     if m.contains("claude") {
         "Anthropic"
-    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") {
+    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") || m.contains("codex") {
         "OpenAI"
     } else if m.contains("gemini") {
         "Google"
@@ -283,19 +283,20 @@ fn build_reports(
 /// then compute its events with the current config + prices. Returns the events
 /// plus the account's installed MCP-server / Skill sets.
 fn account_events(
-    a: &crate::accounts::Account,
+    d: &crate::agents::AgentDescriptor,
+    a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
 ) -> (Vec<Event>, HashSet<String>, HashSet<String>) {
     let mut store = Store::load(&a.id);
-    let mut dirty = store.ingest(&a.data_dir.join("projects"));
+    let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
     if store.prune_before(cutoff) {
         dirty = true;
     }
     if dirty {
         store.save(&a.id);
     }
-    let cfg = UserConfig::load_for(&a.config_file, &a.data_dir.join("skills"));
+    let cfg = (d.load_config)(a);
     // Resolve each event's project to its git-repo root, memoized per unique cwd
     // so the (filesystem-backed) walk-up runs once per directory, not per event.
     let mut proj_memo: HashMap<String, String> = HashMap::new();
@@ -336,8 +337,8 @@ pub fn build_workspace() -> Workspace {
     let mut all_servers: HashSet<String> = HashSet::new();
     let mut all_skills: HashSet<String> = HashSet::new();
 
-    for a in crate::accounts::discover() {
-        let (events, servers, skills) = account_events(&a, &pricing, cutoff);
+    for (d, a) in crate::agents::discover_all() {
+        let (events, servers, skills) = account_events(d, &a, &pricing, cutoff);
         let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
         all_servers.extend(servers);
         all_skills.extend(skills);
@@ -346,6 +347,7 @@ pub fn build_workspace() -> Workspace {
             id: a.id,
             label: a.label,
             email: a.email,
+            agent: a.agent.to_string(),
             dash,
         });
     }
@@ -375,11 +377,11 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
     let mut events: Vec<Event> = Vec::new();
     let mut servers: HashSet<String> = HashSet::new();
     let mut skills: HashSet<String> = HashSet::new();
-    for a in crate::accounts::discover() {
+    for (d, a) in crate::agents::discover_all() {
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk) = account_events(&a, &pricing, cutoff);
+        let (ev, srv, sk) = account_events(d, &a, &pricing, cutoff);
         events.extend(ev);
         servers.extend(srv);
         skills.extend(sk);
@@ -501,8 +503,10 @@ impl Agg {
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
-        // Slash-command skill events carry no model (empty) — they're not LLM
-        // requests, so they must not inflate request counts or the model split.
+        // An empty model marks an event that is not an LLM request: Claude's
+        // slash-command events and Codex's tool/MCP/skill records. Only real API
+        // turns may inflate the request count or the model split — a Codex
+        // session emits roughly twice as many tool records as turns.
         if !e.model.is_empty() {
             self.requests += 1;
             let tok = e.input + e.cache + e.output;
@@ -904,4 +908,18 @@ fn build_heatmap(events: &[Event], today: chrono::NaiveDate) -> Vec<HeatDay> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_models_are_attributed_to_openai() {
+        assert_eq!(vendor_of("gpt-5.6-sol"), "OpenAI");
+        // Has no "gpt" in the name, so it needs its own rule or it lands in "Other".
+        assert_eq!(vendor_of("codex-auto-review"), "OpenAI");
+        // Unchanged for the models already handled.
+        assert_eq!(vendor_of("claude-opus-5"), "Anthropic");
+    }
 }

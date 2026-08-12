@@ -4,7 +4,7 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-A **menu-bar / system-tray app for macOS and Windows** that shows your Claude CLI **daily token usage, estimated cost, and per-model / MCP / Skill call breakdown**.
+A **menu-bar / system-tray app for macOS and Windows** that shows your Claude Code and OpenAI Codex **daily token usage, estimated cost, and per-model / MCP / Skill call breakdown**.
 
 Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
@@ -17,16 +17,21 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
 - Cost donut (hover for a single model), year-long activity heatmap
-- **Counts only the MCP servers / Skills you installed yourself** — all Claude built-in tools and Anthropic's bundled MCP servers are filtered out
+- **Counts only the MCP servers / Skills you installed yourself** — built-in tools and vendor-bundled connectors are filtered out (Claude's built-in tools and Anthropic's bundled MCP servers; Codex's built-in `codex_apps` connector); plugin-scoped skills (e.g. `gstack:review`) count too, for both agents
 
 ## Data sources (zero-intrusion, read-only)
 
 | Purpose | Path |
 |---------|------|
-| Session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
-| User MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
-| User Skill whitelist | `~/.claude/skills/` directory |
-| Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
+| Claude session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
+| Claude MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Claude Skill whitelist | `~/.claude/skills/` directory |
+| Codex session logs (tokens / model / tool calls) | `~/.codex/sessions/**/*.jsonl` |
+| Codex MCP whitelist | `~/.codex/config.toml` → `[mcp_servers.*]` |
+| Codex Skill whitelist | `~/.codex/skills/` and `~/.agents/skills/` |
+| Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI / Codex logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
+
+Each Skill whitelist directory is scanned two ways: every non-dot top-level directory `<name>/` registers `<name>` (no `SKILL.md` required at that level), and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill, gated on that `SKILL.md` existing) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review` (as well as `gstack` itself, from the top-level scan). Directories starting with `.` are always skipped, at both levels. This applies to both agents' whitelists.
 
 ### Key processing
 - Deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
@@ -34,7 +39,8 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins
 - Cost is priced per the four token types; each model carries a `priced` flag — **models not found in either source still count tokens but are labelled "no price" in the UI**
 - Logs contain only the bare model name (no vendor) → third-party models default to the official vendor price (an estimate)
-- Tool classification: `mcp__<server>__*` where the server is in your config → MCP; a Skill call (the `Skill` tool's `input.skill`, or a `/skill` slash command) whose name is in your skills directory → Skill; everything else is ignored
+- Tool classification (Claude): `mcp__<server>__*` where the server is in your config → MCP; a Skill call (the `Skill` tool's `input.skill`, or a `/skill` slash command) whose name is in your skills whitelist → Skill; everything else is ignored. A plugin-scoped skill is labelled `<plugin>:<skill>`
+- Tool classification (Codex): an `mcp_tool_call_end` event names its server → MCP (checked against `config.toml`'s whitelist, so the built-in `codex_apps` connector is filtered out); reading a `skills/<name>/SKILL.md` (or `skills/<plugin>/<name>/SKILL.md`) path during a turn → Skill, once per turn
 
 > Cost is an **estimate** based on public prices; subscription users should read it as "equivalent spend value".
 
@@ -149,6 +155,9 @@ src-tauri/src/
   config.rs           user MCP / Skill whitelist
   model.rs            data structures returned to the frontend
   lib.rs              Tauri commands + menu-bar tray
+  agents/mod.rs       agent adapter registry (where logs live, how to parse them)
+  agents/claude.rs    Claude Code discovery + log parsing
+  agents/codex.rs     Codex discovery + log parsing (cumulative token deltas)
 ```
 
 ## Bug log
