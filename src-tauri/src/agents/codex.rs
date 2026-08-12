@@ -2,6 +2,9 @@
 // one session per file. See docs/superpowers/specs/2026-08-12-codex-tracking-design.md.
 use super::{AccountSpec, FileState, LogParser};
 use crate::config::{self, UserConfig};
+use crate::store::RawEvent;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -92,6 +95,182 @@ pub(super) fn load_config(a: &AccountSpec) -> UserConfig {
     }
 }
 
+/// Cumulative token counters as of one `token_count` event. Codex reports these
+/// as running session totals, so usage is the difference between consecutive
+/// snapshots — repeated or replayed events then contribute nothing, which
+/// summing `last_token_usage` would get wrong.
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+struct Cum {
+    input: f64,
+    cached: f64,
+    cache_write: f64,
+    output: f64,
+}
+
+/// Parser state persisted between incremental reads of one session file.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Carry {
+    session: String,
+    model: String,
+    cwd: String,
+    branch: String,
+    sidechain: bool,
+    prev: Option<Cum>,
+}
+
+pub(super) struct CodexParser;
+
+struct CodexState {
+    c: Carry,
+}
+
+impl LogParser for CodexParser {
+    fn new_file_state(&self, carry: Option<&Value>) -> Box<dyn FileState> {
+        let c = carry
+            .and_then(|v| serde_json::from_value::<Carry>(v.clone()).ok())
+            .unwrap_or_default();
+        Box::new(CodexState { c })
+    }
+}
+
+pub(super) fn parser() -> Box<dyn LogParser> {
+    Box::new(CodexParser)
+}
+
+fn num(v: &Value, k: &str) -> f64 {
+    v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
+}
+
+fn ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|d| d.timestamp_millis())
+}
+
+impl CodexState {
+    /// A RawEvent pre-filled with this session's attribution, carrying no usage.
+    /// Tool/skill events reuse it; `id` stays empty because the byte-offset
+    /// manifest already guarantees each line is read exactly once.
+    fn base(&self, ts_ms: i64) -> RawEvent {
+        RawEvent {
+            ts_ms,
+            session: self.c.session.clone(),
+            model: if self.c.model.is_empty() {
+                "unknown".into()
+            } else {
+                self.c.model.clone()
+            },
+            in_tok: 0.0,
+            cc: 0.0,
+            cr: 0.0,
+            out_tok: 0.0,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            id: String::new(),
+            source: String::new(),
+            cwd: self.c.cwd.clone(),
+            branch: self.c.branch.clone(),
+            tools: Vec::new(),
+            sidechain: self.c.sidechain,
+            // Codex has no general tool-error flag; see the spec.
+            tool_results: 0,
+            tool_errors: 0,
+        }
+    }
+
+    fn on_session_meta(&mut self, p: &Value) {
+        if let Some(s) = p.get("session_id").and_then(|v| v.as_str()) {
+            self.c.session = s.to_string();
+        }
+        if let Some(s) = p.get("cwd").and_then(|v| v.as_str()) {
+            self.c.cwd = s.to_string();
+        }
+        if let Some(s) = p.get("git").and_then(|g| g.get("branch")).and_then(|v| v.as_str()) {
+            self.c.branch = s.to_string();
+        }
+        // A sub-agent thread records its parent under source.subagent; a normal
+        // session's source is a plain string ("vscode").
+        self.c.sidechain = p
+            .get("source")
+            .and_then(|v| v.as_object())
+            .map(|o| o.contains_key("subagent"))
+            .unwrap_or(false);
+    }
+
+    fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
+        let t = p.get("info")?.get("total_token_usage")?;
+        let cur = Cum {
+            input: num(t, "input_tokens"),
+            cached: num(t, "cached_input_tokens"),
+            cache_write: num(t, "cache_write_input_tokens"),
+            output: num(t, "output_tokens"),
+        };
+        let prev = self.c.prev.unwrap_or_default();
+        self.c.prev = Some(cur);
+
+        // Clamp each delta at zero. The counter is monotonic in practice, but a
+        // resumed or forked session can restart it; treat any decrease as a new
+        // baseline rather than emitting negative usage.
+        let d_in = (cur.input - prev.input).max(0.0);
+        let d_cached = (cur.cached - prev.cached).max(0.0);
+        let d_cw = (cur.cache_write - prev.cache_write).max(0.0);
+        let d_out = (cur.output - prev.output).max(0.0);
+        // cached_input_tokens is a subset of input_tokens, not a sibling.
+        let uncached = (d_in - d_cached).max(0.0);
+
+        if uncached == 0.0 && d_cached == 0.0 && d_cw == 0.0 && d_out == 0.0 {
+            return None;
+        }
+        let mut e = self.base(ts_ms);
+        e.in_tok = uncached;
+        e.cr = d_cached;
+        e.cc = d_cw;
+        e.out_tok = d_out;
+        Some(e)
+    }
+}
+
+impl FileState for CodexState {
+    fn parse_line(&mut self, line: &str) -> Option<RawEvent> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        let ts_ms = ms(v.get("timestamp")?.as_str()?)?;
+        let ty = v.get("type")?.as_str()?;
+        let p = v.get("payload")?;
+        match ty {
+            "session_meta" => {
+                self.on_session_meta(p);
+                None
+            }
+            // turn_context has no payload.type; the model lives directly on it.
+            "turn_context" => {
+                if let Some(m) = p.get("model").and_then(|v| v.as_str()) {
+                    self.c.model = m.to_string();
+                }
+                None
+            }
+            "event_msg" => match p.get("type").and_then(|v| v.as_str())? {
+                "thread_settings_applied" => {
+                    if let Some(m) = p
+                        .get("thread_settings")
+                        .and_then(|s| s.get("model"))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.c.model = m.to_string();
+                    }
+                    None
+                }
+                "token_count" => self.on_token_count(p, ts_ms),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn carry(&self) -> Option<Value> {
+        serde_json::to_value(&self.c).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +309,106 @@ mod tests {
         assert_eq!(label_for(&root.join(".codex-work")), "codex-work");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn feed(lines: &[&str]) -> Vec<RawEvent> {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        lines.iter().filter_map(|l| st.parse_line(l)).collect()
+    }
+
+    const META: &str = r#"{"timestamp":"2026-08-12T04:00:00.000Z","type":"session_meta","payload":{"session_id":"s1","cwd":"/w/proj","source":"vscode","git":{"branch":"main"}}}"#;
+    const CTX: &str = r#"{"timestamp":"2026-08-12T04:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#;
+
+    fn tc(ts: &str, input: u64, cached: u64, cw: u64, out: u64) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{cw},"output_tokens":{out},"total_tokens":0}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn tokens_come_from_the_cumulative_difference() {
+        let a = tc("2026-08-12T04:00:02.000Z", 1000, 400, 10, 50);
+        let b = tc("2026-08-12T04:00:03.000Z", 3000, 1400, 10, 120);
+        let ev = feed(&[META, CTX, &a, &b]);
+        assert_eq!(ev.len(), 2);
+
+        // First event: uncached input = 1000 - 400.
+        assert_eq!(ev[0].in_tok, 600.0);
+        assert_eq!(ev[0].cr, 400.0);
+        assert_eq!(ev[0].cc, 10.0);
+        assert_eq!(ev[0].out_tok, 50.0);
+        assert_eq!(ev[0].model, "gpt-5.6-sol");
+        assert_eq!(ev[0].session, "s1");
+
+        // Second event is the delta only: input +2000, cached +1000 → uncached 1000.
+        assert_eq!(ev[1].in_tok, 1000.0);
+        assert_eq!(ev[1].cr, 1000.0);
+        assert_eq!(ev[1].cc, 0.0);
+        assert_eq!(ev[1].out_tok, 70.0);
+    }
+
+    #[test]
+    fn a_repeated_cumulative_snapshot_adds_nothing() {
+        // Codex re-emits token_count with an unchanged cumulative; summing
+        // last_token_usage would double-count here, diffing must not.
+        let a = tc("2026-08-12T04:00:02.000Z", 1000, 400, 0, 50);
+        let ev = feed(&[META, CTX, &a, &a, &a]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].in_tok, 600.0);
+    }
+
+    #[test]
+    fn a_zero_component_baseline_attributes_nothing() {
+        // Observed in real logs: a forked/resumed session opens with a nonzero
+        // total_tokens but every component zero. It must contribute no usage.
+        let a = tc("2026-08-12T04:00:02.000Z", 0, 0, 0, 0);
+        assert!(feed(&[META, CTX, &a]).is_empty());
+    }
+
+    #[test]
+    fn a_backwards_counter_rebaselines_instead_of_going_negative() {
+        let a = tc("2026-08-12T04:00:02.000Z", 5000, 0, 0, 200);
+        let b = tc("2026-08-12T04:00:03.000Z", 100, 0, 0, 10);
+        let ev = feed(&[META, CTX, &a, &b]);
+        assert_eq!(ev.len(), 1);
+        assert!(ev.iter().all(|e| e.in_tok >= 0.0 && e.out_tok >= 0.0));
+    }
+
+    #[test]
+    fn carry_resumes_the_cumulative_across_a_split_read() {
+        let p = CodexParser;
+        let a = tc("2026-08-12T04:00:02.000Z", 1000, 0, 0, 50);
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, a.as_str()] {
+            st.parse_line(l);
+        }
+        let saved = st.carry().expect("codex state must be persistable");
+
+        // Second pass sees only the new line but must diff against 1000/50.
+        let b = tc("2026-08-12T04:00:03.000Z", 1500, 0, 0, 70);
+        let mut st2 = p.new_file_state(Some(&saved));
+        let ev = st2.parse_line(&b).expect("a delta event");
+        assert_eq!(ev.in_tok, 500.0);
+        assert_eq!(ev.out_tok, 20.0);
+        // Session and model must survive too, or the event is unattributable.
+        assert_eq!(ev.session, "s1");
+        assert_eq!(ev.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn thread_settings_applied_also_supplies_the_model() {
+        let ts = r#"{"timestamp":"2026-08-12T04:00:01.000Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"codex-auto-review"}}}"#;
+        let a = tc("2026-08-12T04:00:02.000Z", 100, 0, 0, 10);
+        let ev = feed(&[META, ts, &a]);
+        assert_eq!(ev[0].model, "codex-auto-review");
+    }
+
+    #[test]
+    fn an_unknown_model_is_recorded_not_dropped() {
+        let a = tc("2026-08-12T04:00:02.000Z", 100, 0, 0, 10);
+        let ev = feed(&[META, &a]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].model, "unknown");
     }
 }
