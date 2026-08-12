@@ -113,9 +113,33 @@ Codex has no skill tool call. A skill is invoked by the agent reading its
 11  /Users/vndee/.agents/skills/payment-integration
 ```
 
-Detection is a path match on `skills/<name>/SKILL.md` inside the exec input.
+Detection is a path match inside the exec input, accepting two shapes:
+
+| Path | Skill id |
+|---|---|
+| `skills/<name>/SKILL.md` | `<name>` |
+| `skills/<plugin>/<name>/SKILL.md` | `<plugin>:<name>` |
+
+A segment starting with `.` is excluded, which keeps the real
+`skills/.system/openai-docs/SKILL.md` out. Reference files under a skill —
+the real `skills/using-superpowers/references/codex-tools.md` — have no
+`SKILL.md` tail and fall out naturally. One exec input can open several skills,
+so every match is collected, de-duplicated within the input.
+
+The `<plugin>:<name>` label matters for consistency, not filtering:
+`UserConfig::is_user_skill` strips at the last `:` before checking the
+whitelist, so either label filters identically — but Claude's parser emits raw
+`input.skill` values that are already `plugin:skill`, so both agents' Skill
+breakdowns end up labelled the same way. An earlier draft of this spec accepted
+only the one-segment shape, which silently dropped the real
+`skills/gstack/review/SKILL.md` and put the two agents out of step.
+
 This is a heuristic — it counts "agent opened this skill", which approximates but
 does not equal "agent used this skill".
+
+Note also that real `exec` inputs are JS-wrapped
+(`tools.exec_command({cmd: "..."})`), not the plain shell strings the samples
+above suggest. Matching is plain substring scanning, so the wrapper is harmless.
 
 ### Sub-agents
 
@@ -247,7 +271,7 @@ Per line:
   then store the new cumulative as `prev`. Skip when every delta is zero.
 - `mcp_tool_call_end` → emit a zero-token `RawEvent` with
   `mcp: vec![invocation.server]`.
-- `custom_tool_call` named `exec` whose input matches `skills/<name>/SKILL.md`
+- `custom_tool_call` named `exec` whose input matches a skill path (see above)
   and whose `<name>` is not already in `turn_skills` → emit a zero-token
   `RawEvent` with `skills: vec![name]`, and record it.
 
