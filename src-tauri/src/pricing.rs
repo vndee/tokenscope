@@ -489,7 +489,7 @@ mod tests {
     // table after `reload_shared` has run (app startup / tray refresh) and
     // otherwise silently serves the 5-entry `ingest_builtin` backstop. Ignored
     // by default so `cargo test` stays hermetic; run explicitly with:
-    //   cargo test --lib -- --ignored live_load_resolves_new_model --exact
+    //   cargo test --lib -- --ignored pricing::tests::live_load_resolves_new_model --exact
     #[test]
     #[ignore]
     fn live_load_resolves_new_model() {

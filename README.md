@@ -31,7 +31,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 | Codex Skill whitelist | `~/.codex/skills/` and `~/.agents/skills/` |
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI / Codex logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 
-Each Skill whitelist directory is scanned two ways: a top-level `<name>/SKILL.md` registers `<name>`, and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review`. Directories starting with `.` are always skipped. This applies to both agents' whitelists.
+Each Skill whitelist directory is scanned two ways: every non-dot top-level directory `<name>/` registers `<name>` (no `SKILL.md` required at that level), and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill, gated on that `SKILL.md` existing) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review` (as well as `gstack` itself, from the top-level scan). Directories starting with `.` are always skipped, at both levels. This applies to both agents' whitelists.
 
 ### Key processing
 - Deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once

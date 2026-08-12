@@ -31,7 +31,7 @@
 | Codex Skill 白名单 | `~/.codex/skills/` 与 `~/.agents/skills/` |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI / Codex 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
 
-每个 Skill 白名单目录都按两种形状扫描：顶层的 `<name>/SKILL.md` 记为 `<name>`；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`。以 `.` 开头的目录一律跳过。两个 Agent 的白名单都遵循这一规则。
+每个 Skill 白名单目录都按两种规则扫描：顶层任意非 `.` 开头的目录 `<name>/` 都会记为 `<name>`（顶层不要求存在 `SKILL.md`）；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill，这一层才要求 `SKILL.md` 存在）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`（顶层扫描本身也会把 `gstack` 记入）。以 `.` 开头的目录在两层都会被跳过。两个 Agent 的白名单都遵循这一规则。
 
 ### 关键处理
 - 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
