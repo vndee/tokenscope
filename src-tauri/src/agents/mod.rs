@@ -3,6 +3,7 @@
 // to read — lives behind these traits, so store.rs stays generic and a new CLI
 // is a new file here rather than a new branch everywhere.
 pub mod claude;
+pub mod codex;
 
 use crate::config::UserConfig;
 use crate::store::RawEvent;
