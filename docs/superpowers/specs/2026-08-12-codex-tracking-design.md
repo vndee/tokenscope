@@ -199,7 +199,7 @@ loses every Claude-specific line. Claude's `parse_line` / `parse_assistant` /
 `parse_user_command` move verbatim into `agents/claude.rs` behind a stateless
 `FileState`.
 
-### Store version 4 → 5
+### Store version 6 → 7
 
 `Manifest` currently stores `path -> (size, mtime_ms, offset)`. Codex's
 cumulative-diff parsing needs the last cumulative counter to survive between
@@ -217,9 +217,15 @@ struct FileEntry {
 }
 ```
 
-Bump `STORE_VERSION` to 5 so existing caches are discarded and rescanned once.
+Bump `STORE_VERSION` to 7 so existing caches are discarded and rescanned once.
 The truncation path (`size < offset`) must clear `carry` along with purging the
 file's events, or the rescan diffs against a stale baseline.
+
+### Watcher
+
+`lib.rs` watches each account's `<data_dir>/projects` for sub-second refresh. It
+must iterate `AccountSpec.log_root` instead, so Codex's `sessions/` tree is
+watched on the same path.
 
 ### Codex file state
 
@@ -261,6 +267,23 @@ Field mapping into `RawEvent`:
 | `session` | `session_meta.session_id` |
 | `model` | resolved model, else `"unknown"` |
 | `id` | empty — the byte-offset manifest already guarantees one read per line |
+| `cwd` | `session_meta.payload.cwd` |
+| `branch` | `session_meta.payload.git.branch` (may be null) |
+| `sidechain` | true when `session_meta.payload.source` is an object with a `subagent` key |
+| `tools` | every `function_call` / `custom_tool_call` name, plus `<server>.<tool>` from `mcp_tool_call_end` |
+| `tool_results`, `tool_errors` | left 0 — see below |
+
+`RawEvent` grew past what the earlier draft of this spec assumed; the table above
+reflects the fields as of `STORE_VERSION` 6.
+
+Codex has **no general tool-error flag**. `custom_tool_call_output` /
+`function_call_output` carry free text ("Script completed / Wall time / Output:")
+with no `is_error` equivalent, and `exec` failures — the bulk of tool calls —
+are indistinguishable from successes. Only `patch_apply_end` exposes a `success`
+boolean. Reporting reliability from patch applications alone would understate the
+true error rate, so both counters stay 0 for Codex and the reliability panel
+shows no data on a Codex tab. This must be verified to render as "no data"
+rather than a misleading 0%.
 
 ### Codex discovery and whitelist
 
