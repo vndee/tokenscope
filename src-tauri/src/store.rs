@@ -388,6 +388,83 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_forked_codex_rollout_ingests_as_the_union_of_the_two_files_not_their_sum() {
+        // The defect this guards is cross-file, so no per-file invariant can
+        // see it: a fork's own file replays its parent's whole token series, and
+        // each replayed snapshot legitimately sums into that file's own final
+        // cumulative. Only ingesting parent *and* fork together shows it.
+        //
+        // Parent runs two turns (cumulative input 1000 then 3000); the fork
+        // replays both, then runs one of its own (3500). The union is 3500 in /
+        // 350 out = 3850 tokens. Counting the replay makes it 7150.
+        const P: &str = "019ff518-4ec9-7070-a0bf-955b00458f8c";
+        const T1: &str = "019ff518-4ff6-7e72-820b-4c9df55290b9";
+        const T2: &str = "019ff535-225e-7960-b555-2be47c5403bc";
+        const F: &str = "019ff536-97a5-7f60-8522-ce6613a468da";
+        const T3: &str = "019ff536-98c5-76d2-a06a-5bb8f482cfe1";
+        let started = |ts: &str, id: &str| format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_started","turn_id":"{id}"}}}}"#
+        );
+        let ctx = |ts: &str| format!(
+            r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.6-sol"}}}}"#
+        );
+        let tc = |ts: &str, i: u64, o: u64| format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":{o}}}}}}}}}"#
+        );
+
+        let dir = std::env::temp_dir().join(format!("ts-fork-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        let parent = [
+            format!(r#"{{"timestamp":"2026-08-12T08:30:38.824Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{P}","cwd":"/w","source":"vscode"}}}}"#),
+            started("2026-08-12T08:30:40.000Z", T1),
+            ctx("2026-08-12T08:30:40.100Z"),
+            tc("2026-08-12T08:30:51.951Z", 1000, 100),
+            started("2026-08-12T09:03:30.000Z", T2),
+            tc("2026-08-12T09:03:30.915Z", 3000, 300),
+        ]
+        .join("\n");
+        let fork = [
+            // The fork's own meta, then the parent's replayed transcript.
+            format!(r#"{{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{F}","forked_from_id":"{P}","cwd":"/w","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{P}"}}}}}}}}}}"#),
+            format!(r#"{{"timestamp":"2026-08-12T09:03:43.706Z","type":"session_meta","payload":{{"session_id":"{P}","id":"{P}","cwd":"/w","source":"vscode"}}}}"#),
+            started("2026-08-12T09:03:43.707Z", T1),
+            ctx("2026-08-12T09:03:43.718Z"),
+            tc("2026-08-12T09:03:43.718Z", 1000, 100),
+            started("2026-08-12T09:03:43.723Z", T2),
+            tc("2026-08-12T09:03:43.724Z", 3000, 300),
+            // The fork's own first turn.
+            started("2026-08-12T09:03:43.847Z", T3),
+            ctx("2026-08-12T09:03:47.461Z"),
+            tc("2026-08-12T09:03:51.408Z", 3500, 350),
+        ]
+        .join("\n");
+        fs::write(dir.join("parent.jsonl"), parent + "\n").unwrap();
+        fs::write(dir.join("fork.jsonl"), fork + "\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &*(crate::agents::codex::DESCRIPTOR.parser)());
+
+        let total: f64 = store
+            .events
+            .iter()
+            .map(|e| e.in_tok + e.cc + e.cr + e.out_tok)
+            .sum();
+        assert_eq!(total, 3850.0, "the union of the two files, not their sum");
+        // The fork contributes exactly its own turn, still marked sidechain.
+        let sub: Vec<&RawEvent> = store.events.iter().filter(|e| e.sidechain).collect();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].in_tok, 500.0);
+        assert_eq!(sub[0].out_tok, 50.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn codex_shaped_event(ts_ms: i64) -> RawEvent {
         RawEvent {
             ts_ms,
