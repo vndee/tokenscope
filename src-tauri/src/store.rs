@@ -68,6 +68,26 @@ struct Manifest {
     files: HashMap<String, FileEntry>,
 }
 
+/// One account's whole cache. The events, the byte-offset manifest and the
+/// store version are a single consistency unit — an offset only means anything
+/// relative to the events that were loaded — so they live in one document,
+/// written under one atomic rename. Split across separate files they could skew
+/// against each other if a crash landed between two writes; see `save`.
+#[derive(Deserialize)]
+struct Snapshot {
+    version: u32,
+    events: Vec<RawEvent>,
+    manifest: Manifest,
+}
+
+/// Borrowing twin of `Snapshot`, so saving doesn't clone the event vector.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    version: u32,
+    events: &'a [RawEvent],
+    manifest: &'a Manifest,
+}
+
 pub struct Store {
     pub events: Vec<RawEvent>,
     // message id -> index in `events`. A single assistant message can be split
@@ -112,33 +132,32 @@ impl Store {
     /// run). Cache files are namespaced by the account `id` so multiple accounts
     /// never share (or clobber) each other's incremental state.
     pub fn load(id: &str) -> Self {
+        let Some(dir) = cache_dir() else {
+            return Store {
+                events: Vec::new(),
+                index: HashMap::new(),
+                manifest: Manifest::default(),
+            };
+        };
+        Self::load_from(&dir, id)
+    }
+
+    /// `load`, against an explicit cache directory (so it is testable).
+    fn load_from(dir: &std::path::Path, id: &str) -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
-        if let Some(dir) = cache_dir() {
-            // If the cache was written by an older parser, discard it so ingest
-            // does a full rescan and picks up newly-extracted facts.
-            let version_ok = fs::read_to_string(dir.join(format!("version-{id}")))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                == Some(STORE_VERSION);
-            if version_ok {
-                // events.json and offsets.json are ONE consistent unit: the
-                // manifest's per-file byte offsets are only meaningful relative
-                // to the events we actually loaded. If either is missing or fails
-                // to parse (e.g. a crash left events.json half-written), discard
-                // BOTH and fall back to a full rescan — otherwise a good manifest
-                // paired with empty/corrupt events would make ingest() skip every
-                // already-recorded file and silently lose all history.
-                let loaded_events = fs::read_to_string(dir.join(format!("events-{id}.json")))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Vec<RawEvent>>(&t).ok());
-                let loaded_manifest = fs::read_to_string(dir.join(format!("offsets-{id}.json")))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Manifest>(&t).ok());
-                if let (Some(e), Some(m)) = (loaded_events, loaded_manifest) {
-                    events = e;
-                    manifest = m;
-                }
+        // A snapshot that is missing, truncated by a crash mid-write, or written
+        // by an older parser is discarded whole, and ingest() does a full
+        // rescan. Nothing partial is ever adopted: a manifest without its events
+        // would make ingest() skip every already-recorded file and silently lose
+        // all history.
+        if let Some(s) = fs::read_to_string(dir.join(format!("store-{id}.json")))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Snapshot>(&t).ok())
+        {
+            if s.version == STORE_VERSION {
+                events = s.events;
+                manifest = s.manifest;
             }
         }
         let index = events
@@ -156,21 +175,29 @@ impl Store {
 
     pub fn save(&self, id: &str) {
         if let Some(dir) = cache_dir() {
-            // Atomic writes so a crash/kill mid-save can't leave a half-written
-            // events.json (load() would then discard the pair and lose history).
-            // Write events before offsets: if we crash between them, the manifest
-            // is merely stale (points at fewer bytes → re-reads a little) rather
-            // than ahead of the events on disk.
-            if let Ok(t) = serde_json::to_string(&self.events) {
-                let _ = write_atomic(&dir.join(format!("events-{id}.json")), t.as_bytes());
-            }
-            if let Ok(t) = serde_json::to_string(&self.manifest) {
-                let _ = write_atomic(&dir.join(format!("offsets-{id}.json")), t.as_bytes());
-            }
-            let _ = write_atomic(
-                &dir.join(format!("version-{id}")),
-                STORE_VERSION.to_string().as_bytes(),
-            );
+            self.save_to(&dir, id);
+        }
+    }
+
+    /// `save`, against an explicit cache directory (so it is testable).
+    ///
+    /// The events and the offset manifest go out as ONE document under ONE
+    /// atomic rename, because they cannot be allowed to disagree. Written as two
+    /// files, a crash between the writes leaves offsets that describe bytes the
+    /// events file doesn't cover, and the next pass re-reads the overlap:
+    /// Claude's message-id dedup absorbs that, but Codex events carry no message
+    /// id (`agents/codex.rs`), so re-read lines are pushed a second time and the
+    /// stale `carry` re-diffs their cumulative snapshots — duplicating tokens as
+    /// well as events, silently. One rename means a crash leaves the *previous*
+    /// snapshot intact instead, which is merely stale and self-heals.
+    fn save_to(&self, dir: &std::path::Path, id: &str) {
+        let snap = SnapshotRef {
+            version: STORE_VERSION,
+            events: &self.events,
+            manifest: &self.manifest,
+        };
+        if let Ok(t) = serde_json::to_string(&snap) {
+            let _ = write_atomic(&dir.join(format!("store-{id}.json")), t.as_bytes());
         }
     }
 
@@ -357,6 +384,105 @@ mod tests {
         fs::write(&log, "one\ntwo\nthree\nfour\n").unwrap();
         store.ingest(&dir, &CountParser);
         assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 4 })));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn codex_shaped_event(ts_ms: i64) -> RawEvent {
+        RawEvent {
+            ts_ms,
+            session: "s1".into(),
+            model: "gpt-5.6-sol".into(),
+            in_tok: 100.0,
+            cc: 0.0,
+            cr: 0.0,
+            out_tok: 10.0,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            // Codex events deliberately carry no message id, so nothing dedupes
+            // them if the same bytes are ever read twice.
+            id: String::new(),
+            source: "/logs/a.jsonl".into(),
+            cwd: "/w".into(),
+            branch: "main".into(),
+            tools: Vec::new(),
+            sidechain: true,
+            tool_results: 0,
+            tool_errors: 0,
+        }
+    }
+
+    #[test]
+    fn the_cache_is_one_document_so_events_and_offsets_cannot_skew() {
+        let dir = std::env::temp_dir().join(format!("ts-snap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        let mut store = Store {
+            events: vec![codex_shaped_event(1_000)],
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.manifest.files.insert(
+            "/logs/a.jsonl".to_string(),
+            FileEntry {
+                size: 42,
+                mtime_ms: 7,
+                offset: 42,
+                carry: Some(serde_json::json!({ "prev": { "input": 100.0 } })),
+            },
+        );
+        store.save_to(&dir, "acct");
+
+        // One file, so there is no window in which one artifact is newer than
+        // the other. A second file here would mean a crash could skew the pair.
+        let mut written: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        written.sort();
+        assert_eq!(written, vec!["store-acct.json".to_string()]);
+
+        // Events and offsets come back together, or not at all.
+        let back = Store::load_from(&dir, "acct");
+        assert_eq!(back.events.len(), 1);
+        assert_eq!(back.events[0].out_tok, 10.0);
+        assert_eq!(back.manifest.files["/logs/a.jsonl"].offset, 42);
+        assert!(back.manifest.files["/logs/a.jsonl"].carry.is_some());
+
+        // A snapshot truncated by a crash is discarded whole: an offset without
+        // its events would make ingest() skip the file and lose its history.
+        let path = dir.join("store-acct.json");
+        let half = fs::read_to_string(&path).unwrap();
+        fs::write(&path, &half[..half.len() / 2]).unwrap();
+        let broken = Store::load_from(&dir, "acct");
+        assert!(broken.events.is_empty());
+        assert!(broken.manifest.files.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_store_version_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("ts-snapver-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("store-acct.json"),
+            serde_json::json!({
+                "version": STORE_VERSION - 1,
+                "events": [],
+                "manifest": { "files": { "/logs/a.jsonl": { "size": 1, "mtime_ms": 1, "offset": 1 } } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Stale offsets must not survive a parser change, or ingest() skips the
+        // bytes whose newly-extracted facts the bump exists to pick up.
+        let s = Store::load_from(&dir, "acct");
+        assert!(s.manifest.files.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
