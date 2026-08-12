@@ -94,7 +94,7 @@ fn vendor_of(model: &str) -> &'static str {
     let m = model.to_lowercase();
     if m.contains("claude") {
         "Anthropic"
-    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") {
+    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") || m.contains("codex") {
         "OpenAI"
     } else if m.contains("gemini") {
         "Google"
@@ -347,6 +347,7 @@ pub fn build_workspace() -> Workspace {
             id: a.id,
             label: a.label,
             email: a.email,
+            agent: a.agent.to_string(),
             dash,
         });
     }
@@ -905,4 +906,18 @@ fn build_heatmap(events: &[Event], today: chrono::NaiveDate) -> Vec<HeatDay> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_models_are_attributed_to_openai() {
+        assert_eq!(vendor_of("gpt-5.6-sol"), "OpenAI");
+        // Has no "gpt" in the name, so it needs its own rule or it lands in "Other".
+        assert_eq!(vendor_of("codex-auto-review"), "OpenAI");
+        // Unchanged for the models already handled.
+        assert_eq!(vendor_of("claude-opus-5"), "Anthropic");
+    }
 }

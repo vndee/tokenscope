@@ -1,12 +1,20 @@
 // Codex CLI adapter. Logs live at <codex-dir>/sessions/YYYY/MM/DD/rollout-*.jsonl,
 // one session per file. See docs/superpowers/specs/2026-08-12-codex-tracking-design.md.
-use super::{AccountSpec, FileState, LogParser};
+use super::{AccountSpec, AgentDescriptor, FileState, LogParser};
 use crate::config::{self, UserConfig};
 use crate::store::RawEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+pub const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
+    id: "codex",
+    display: "Codex",
+    discover,
+    load_config,
+    parser,
+};
 
 /// Friendly tab label. The default `~/.codex` is just "Codex"; a sibling config
 /// dir shows its own name so two Codex installs are distinguishable. auth.json

@@ -47,7 +47,7 @@ pub struct AgentDescriptor {
     pub parser: fn() -> Box<dyn LogParser>,
 }
 
-static REGISTRY: &[AgentDescriptor] = &[claude::DESCRIPTOR];
+static REGISTRY: &[AgentDescriptor] = &[claude::DESCRIPTOR, codex::DESCRIPTOR];
 
 pub fn registry() -> &'static [AgentDescriptor] {
     REGISTRY
