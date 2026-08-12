@@ -4,7 +4,7 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-**macOS 菜单栏 / Windows 系统托盘工具**，展示 Claude CLI 的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**。
+**macOS 菜单栏 / Windows 系统托盘工具**，展示 Claude Code 与 OpenAI Codex 的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -17,16 +17,21 @@
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
-- **只统计用户自己安装的 MCP / Skill**，过滤所有 Claude 内置工具与 Anthropic 自带 MCP
+- **只统计用户自己安装的 MCP / Skill**，内置工具与厂商自带的连接器会被过滤（Claude 自己的内置工具与 Anthropic 自带 MCP；Codex 内置的 `codex_apps` 连接器）；插件域 Skill（如 `gstack:review`）两个 Agent 都会计入
 
 ## 数据来源（零侵入，只读）
 
 | 用途 | 路径 |
 |------|------|
-| 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
-| 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
-| 用户 Skill 白名单 | `~/.claude/skills/` 目录 |
-| 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+| Claude 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
+| Claude MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Claude Skill 白名单 | `~/.claude/skills/` 目录 |
+| Codex 会话日志（Token / 模型 / 工具调用） | `~/.codex/sessions/**/*.jsonl` |
+| Codex MCP 白名单 | `~/.codex/config.toml` → `[mcp_servers.*]` |
+| Codex Skill 白名单 | `~/.codex/skills/` 与 `~/.agents/skills/` |
+| 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI / Codex 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+
+每个 Skill 白名单目录都按两种形状扫描：顶层的 `<name>/SKILL.md` 记为 `<name>`；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`。以 `.` 开头的目录一律跳过。两个 Agent 的白名单都遵循这一规则。
 
 ### 关键处理
 - 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
@@ -34,7 +39,8 @@
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
 - 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**
 - 日志只有裸模型名、无厂商信息 → 第三方模型默认取官方厂商价（估算）
-- 工具分类：`mcp__<server>__*` 且 server 在用户配置中 → MCP；Skill 调用（`Skill` 工具的 `input.skill`，或 `/skill` 斜杠命令）且在 skills 目录中 → Skill；其余忽略
+- 工具分类（Claude）：`mcp__<server>__*` 且 server 在用户配置中 → MCP；Skill 调用（`Skill` 工具的 `input.skill`，或 `/skill` 斜杠命令）且在 skills 白名单中 → Skill；其余忽略。插件域 Skill 记为 `<plugin>:<skill>`
+- 工具分类（Codex）：`mcp_tool_call_end` 事件带出的 server 名 → MCP（对照 `config.toml` 白名单校验，内置的 `codex_apps` 连接器会被过滤掉）；某一轮内读取过 `skills/<name>/SKILL.md`（或 `skills/<plugin>/<name>/SKILL.md`）路径 → Skill，每轮只计一次
 
 > 花费为按公开价格的**估算**；订阅用户应理解为「等效消费价值」。
 
@@ -149,6 +155,9 @@ src-tauri/src/
   config.rs           用户 MCP / Skill 白名单
   model.rs            返回给前端的数据结构
   lib.rs              Tauri 命令 + 菜单栏托盘
+  agents/mod.rs       Agent 适配器注册表（日志位置、如何解析）
+  agents/claude.rs    Claude Code 发现 + 日志解析
+  agents/codex.rs     Codex 发现 + 日志解析（累计 token 差值）
 ```
 
 ## Bug 记录
