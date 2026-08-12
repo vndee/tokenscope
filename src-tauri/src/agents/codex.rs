@@ -145,25 +145,46 @@ impl LogParser for CodexParser {
     }
 }
 
-/// Every `skills/<name>/SKILL.md` path in a shell command, in order.
+/// Every `skills/<name>/SKILL.md` or `skills/<plugin>/<name>/SKILL.md` path in
+/// a shell command, in order. A plugin-scoped skill is labelled `plugin:name`,
+/// matching the `input.skill` values Claude's parser already emits for its own
+/// plugin-scoped skills, so the two agents' Skill breakdowns line up.
 ///
 /// Codex has no skill tool call: a skill is invoked by reading its SKILL.md, so
-/// that read is the signal. Requiring the exact `<name>/SKILL.md` tail keeps
-/// out reference files under a skill and nested system paths
-/// (`skills/.system/openai-docs/SKILL.md`), and one command can open several.
+/// that read is the signal. Requiring an exact `/SKILL.md` tail (at one or two
+/// path levels) keeps out reference files under a skill
+/// (`skills/using-superpowers/references/codex-tools.md`, no `SKILL.md` tail
+/// at either level). A path whose segment right after `skills/` starts with
+/// `.` is excluded outright — that's how nested system paths
+/// (`skills/.system/openai-docs/SKILL.md`) stay out even though they'd
+/// otherwise match the two-level shape. One command can open several skills.
 fn skill_names(cmd: &str) -> Vec<String> {
     const MARK: &str = "skills/";
     let mut out = Vec::new();
     let mut rest = cmd;
     while let Some(i) = rest.find(MARK) {
         rest = &rest[i + MARK.len()..];
-        let Some(name) = rest.split('/').next() else {
+        let mut segs = rest.split('/');
+        let Some(seg1) = segs.next() else {
             continue;
         };
-        if !name.is_empty() && rest[name.len()..].starts_with("/SKILL.md") {
-            let n = name.to_string();
+        if seg1.is_empty() || seg1.starts_with('.') {
+            continue;
+        }
+        if rest[seg1.len()..].starts_with("/SKILL.md") {
+            let n = seg1.to_string();
             if !out.contains(&n) {
                 out.push(n);
+            }
+            continue;
+        }
+        if let Some(seg2) = segs.next() {
+            let prefix_len = seg1.len() + 1 + seg2.len();
+            if !seg2.is_empty() && rest[prefix_len..].starts_with("/SKILL.md") {
+                let n = format!("{seg1}:{seg2}");
+                if !out.contains(&n) {
+                    out.push(n);
+                }
             }
         }
     }
@@ -570,6 +591,22 @@ mod tests {
     }
 
     #[test]
+    fn skill_names_labels_a_plugin_scoped_skill_as_plugin_colon_name() {
+        // skills/<plugin>/<name>/SKILL.md, e.g. the real
+        // skills/gstack/review/SKILL.md, is a plugin-scoped skill and must be
+        // labelled the same way Claude's parser labels its own (plugin:name),
+        // not dropped and not flattened to the bare name.
+        assert_eq!(
+            skill_names("sed -n '1,320p' /Users/u/.agents/skills/gstack/review/SKILL.md"),
+            vec!["gstack:review"]
+        );
+        // The leading-dot exclusion still applies at the top level, even
+        // though skills/.system/openai-docs/SKILL.md also matches the
+        // two-level shape structurally.
+        assert!(skill_names("cat /r/skills/.system/openai-docs/SKILL.md").is_empty());
+    }
+
+    #[test]
     fn a_skill_counts_once_per_turn_but_again_in_the_next_turn() {
         let exec = |c: &str| {
             format!(
@@ -578,6 +615,28 @@ mod tests {
         };
         let e = exec("cat /r/skills/review/SKILL.md");
         let ev = feed(&[META, CTX, &e, &e, CTX, &e]);
+        let skills: Vec<&str> = ev
+            .iter()
+            .flat_map(|r| r.skills.iter().map(|s| s.as_str()))
+            .collect();
+        assert_eq!(skills, vec!["review", "review"]);
+    }
+
+    #[test]
+    fn task_started_also_clears_the_turn_skill_dedup() {
+        // turn_context's clear is covered above; task_started is a second,
+        // separate boundary that must also clear the dedup set, or a skill
+        // re-read once per turn across a long session collapses into a
+        // single count for the whole file.
+        let exec = |c: &str| {
+            format!(
+                r#"{{"timestamp":"2026-08-12T04:00:05.000Z","type":"response_item","payload":{{"type":"custom_tool_call","name":"exec","input":"{c}"}}}}"#
+            )
+        };
+        let task_started =
+            r#"{"timestamp":"2026-08-12T04:00:04.000Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let e = exec("cat /r/skills/review/SKILL.md");
+        let ev = feed(&[META, CTX, &e, &e, task_started, &e]);
         let skills: Vec<&str> = ev
             .iter()
             .flat_map(|r| r.skills.iter().map(|s| s.as_str()))
