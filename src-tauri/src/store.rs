@@ -51,10 +51,21 @@ pub struct RawEvent {
     pub tool_errors: u32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct FileEntry {
+    size: u64,
+    mtime_ms: i64,
+    /// Bytes of this file already ingested.
+    offset: u64,
+    /// Parser state at that offset, so an incremental read resumes exactly
+    /// (Codex diffs a cumulative token counter and cannot restart from zero).
+    #[serde(default)]
+    carry: Option<serde_json::Value>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
-    // path -> (size, mtime_ms, byte offset already ingested)
-    files: HashMap<String, (u64, i64, u64)>,
+    files: HashMap<String, FileEntry>,
 }
 
 pub struct Store {
@@ -76,7 +87,8 @@ pub struct Store {
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: capture cwd (project), git branch, full tool list, and subagent flag.
 //   v6: count tool_result blocks + errors (is_error) from user messages.
-const STORE_VERSION: u32 = 6;
+//   v7: per-file parser carry in the manifest (Codex cumulative token deltas).
+const STORE_VERSION: u32 = 7;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -220,23 +232,26 @@ impl Store {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
 
-            let mut offset = match self.manifest.files.get(&key).copied() {
-                Some((psize, pmtime, poff)) => {
-                    if psize == size && pmtime == mtime_ms {
+            let (offset, carry) = match self.manifest.files.get(&key).cloned() {
+                Some(e) => {
+                    if e.size == size && e.mtime_ms == mtime_ms {
                         continue; // unchanged → skip
                     }
-                    if size < poff {
+                    if size < e.offset {
                         // truncated / rewritten (e.g. log compaction): the bytes
                         // we already ingested are gone, so purge this file's
-                        // events and re-read from the start, idempotently.
+                        // events and re-read from the start, idempotently. The
+                        // carried parser state described those bytes, so it goes
+                        // too — otherwise the rescan diffs against a stale baseline.
                         self.purge_source(&key);
-                        0
+                        (0, None)
                     } else {
-                        poff
+                        (e.offset, e.carry)
                     }
                 }
-                None => 0,
+                None => (0, None),
             };
+            let mut offset = offset;
 
             let Ok(mut f) = fs::File::open(path) else { continue };
             if f.seek(SeekFrom::Start(offset)).is_err() {
@@ -252,7 +267,7 @@ impl Store {
                 Some(i) => i + 1,
                 None => 0,
             };
-            let mut state = parser.new_file_state(None);
+            let mut state = parser.new_file_state(carry.as_ref());
             for line in buf[..process_until].split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
@@ -276,9 +291,95 @@ impl Store {
                 }
             }
             offset += process_until as u64;
-            self.manifest.files.insert(key, (size, mtime_ms, offset));
+            self.manifest.files.insert(
+                key,
+                FileEntry {
+                    size,
+                    mtime_ms,
+                    offset,
+                    carry: state.carry(),
+                },
+            );
             dirty = true;
         }
         dirty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::{FileState, LogParser};
+
+    /// A parser whose state is a running line count, exposed via carry(). Lets us
+    /// assert that state survives a split (incremental) read of the same file.
+    struct CountParser;
+    struct CountState {
+        n: u64,
+    }
+
+    impl LogParser for CountParser {
+        fn new_file_state(&self, carry: Option<&serde_json::Value>) -> Box<dyn FileState> {
+            let n = carry.and_then(|v| v.get("n")).and_then(|v| v.as_u64()).unwrap_or(0);
+            Box::new(CountState { n })
+        }
+    }
+
+    impl FileState for CountState {
+        fn parse_line(&mut self, _line: &str) -> Option<RawEvent> {
+            self.n += 1;
+            None
+        }
+        fn carry(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "n": self.n }))
+        }
+    }
+
+    #[test]
+    fn carry_survives_an_incremental_read() {
+        let dir = std::env::temp_dir().join(format!("ts-carry-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("a.jsonl");
+        fs::write(&log, "one\ntwo\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &CountParser);
+        let key = log.to_string_lossy().to_string();
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 2 })));
+
+        // Append two more lines; the second pass must resume from 2, not 0.
+        fs::write(&log, "one\ntwo\nthree\nfour\n").unwrap();
+        store.ingest(&dir, &CountParser);
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 4 })));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncation_clears_carry_and_rereads() {
+        let dir = std::env::temp_dir().join(format!("ts-trunc-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("b.jsonl");
+        fs::write(&log, "one\ntwo\nthree\n").unwrap();
+
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        store.ingest(&dir, &CountParser);
+        let key = log.to_string_lossy().to_string();
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 3 })));
+
+        // Rewrite shorter: the old bytes are gone, so counting restarts at 1.
+        fs::write(&log, "x\n").unwrap();
+        store.ingest(&dir, &CountParser);
+        assert_eq!(store.manifest.files[&key].carry, Some(serde_json::json!({ "n": 1 })));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
