@@ -481,4 +481,23 @@ mod tests {
         assert!(approx(price.cache_read, 0.2e-6));
         assert!(approx(price.cache_create, 2.5e-6));
     }
+
+    // Network-dependent: exercises the *real* loading path (models.dev, live,
+    // over HTTP) to confirm a brand-new model actually resolves to a price —
+    // not just that the matching logic on synthetic JSON works (the tests
+    // above), and not via `Pricing::shared()`, which only reflects the live
+    // table after `reload_shared` has run (app startup / tray refresh) and
+    // otherwise silently serves the 5-entry `ingest_builtin` backstop. Ignored
+    // by default so `cargo test` stays hermetic; run explicitly with:
+    //   cargo test --lib -- --ignored live_load_resolves_new_model --exact
+    #[test]
+    #[ignore]
+    fn live_load_resolves_new_model() {
+        let p = Pricing::load(true).expect("first-ever load always returns a table");
+        let price = p
+            .lookup("gpt-5.6-sol")
+            .expect("gpt-5.6-sol should be priced by the live models.dev table");
+        assert!(price.input > 0.0, "input price should be non-zero");
+        assert!(price.output > 0.0, "output price should be non-zero");
+    }
 }
