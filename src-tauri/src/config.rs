@@ -67,14 +67,48 @@ pub fn skills_from_dirs(dirs: &[PathBuf]) -> HashSet<String> {
     set
 }
 
-/// Add each subdirectory name of `dir` to the set (skills are folders).
+/// Add each subdirectory name of `dir` to the set (skills are folders), and
+/// additionally register nested plugin-scoped skills as `<plugin>:<skill>`
+/// when `<dir>/<plugin>/<skill>/SKILL.md` exists. The `SKILL.md` check is
+/// what tells a real nested skill apart from a skill's own support
+/// directories (`references/`, `scripts/`, `assets/`), which must not become
+/// whitelist entries. This is purely additive on top of the existing
+/// one-level scan: every name the one-level scan registers is still
+/// registered. Directory names beginning with `.` are skipped at both
+/// levels.
 fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for e in entries.flatten() {
-            if e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    set.insert(name.to_string());
-                }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        set.insert(name.clone());
+
+        let Ok(nested_entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for ne in nested_entries.flatten() {
+            let nested_path = ne.path();
+            if !nested_path.is_dir() {
+                continue;
+            }
+            let Some(nested_name) = ne.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if nested_name.starts_with('.') {
+                continue;
+            }
+            if nested_path.join("SKILL.md").is_file() {
+                set.insert(format!("{name}:{nested_name}"));
             }
         }
     }
@@ -97,8 +131,19 @@ impl UserConfig {
         self.mcp_servers.contains(server)
     }
 
-    /// A skill id (may be "plugin:skill") → strip plugin prefix, check dir.
+    /// A skill id (may be "plugin:skill") → user-installed?
+    ///
+    /// Tries the full key first, so a nested/plugin-scoped skill registered
+    /// as `<plugin>:<skill>` (see `scan_skill_dir`) matches on its own name
+    /// rather than colliding with an unrelated top-level skill that happens
+    /// to share the suffix (e.g. `gstack:review` vs. top-level `review`).
+    /// Falls back to the stripped suffix, kept deliberately: it is what lets
+    /// Claude plugin skills that live outside any skills root (e.g. under
+    /// `~/.claude/plugins/cache/**/skills/`) still count.
     pub fn is_user_skill(&self, skill: &str) -> bool {
+        if self.skills.contains(skill) {
+            return true;
+        }
         let key = skill.rsplit(':').next().unwrap_or(skill);
         self.skills.contains(key)
     }
@@ -157,6 +202,107 @@ args = ["@playwright/mcp@latest"]
         assert_eq!(got.len(), 2);
         assert!(got.contains("review"));
         assert!(got.contains("payment-integration"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_skill_with_skill_md_is_registered_as_plugin_colon_skill() {
+        let root = std::env::temp_dir().join(format!("ts-skills-nested-{}", std::process::id()));
+        let skills = root.join("skills");
+        let plugin_skill = skills.join("gstack").join("review");
+        let _ = fs::create_dir_all(&plugin_skill);
+        fs::write(plugin_skill.join("SKILL.md"), "# review").unwrap();
+
+        let got = skills_from_dirs(&[skills]);
+        assert!(got.contains("gstack:review"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_dir_without_skill_md_is_not_registered() {
+        // A skill's own support directory (e.g. `references/`) must not
+        // become a whitelist entry — only a real nested skill, distinguished
+        // by having its own SKILL.md, may.
+        let root =
+            std::env::temp_dir().join(format!("ts-skills-no-skillmd-{}", std::process::id()));
+        let skills = root.join("skills");
+        let skill_dir = skills.join("review");
+        let refs_dir = skill_dir.join("references");
+        let _ = fs::create_dir_all(&refs_dir);
+        fs::write(skill_dir.join("SKILL.md"), "# review").unwrap();
+
+        let got = skills_from_dirs(&[skills]);
+        assert!(got.contains("review"));
+        assert!(!got.contains("review:references"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_registration_is_additive_to_top_level_names() {
+        // Every name a plain one-level scan would register must still be
+        // registered once nested plugin-scoped skills are added too.
+        let root = std::env::temp_dir().join(format!("ts-skills-additive-{}", std::process::id()));
+        let skills = root.join("skills");
+        let _ = fs::create_dir_all(skills.join("review"));
+        let _ = fs::create_dir_all(skills.join("payment-integration"));
+        let plugin_skill = skills.join("gstack").join("plan-eng-review");
+        let _ = fs::create_dir_all(&plugin_skill);
+        fs::write(plugin_skill.join("SKILL.md"), "# plan-eng-review").unwrap();
+
+        let got = skills_from_dirs(&[skills]);
+
+        // Names the one-level scan would have registered are all still here.
+        assert!(got.contains("review"));
+        assert!(got.contains("payment-integration"));
+        assert!(got.contains("gstack"));
+        // Plus the new nested entry, purely additive.
+        assert!(got.contains("gstack:plan-eng-review"));
+        assert_eq!(got.len(), 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_user_skill_matches_full_key_before_falling_back_to_stripped_suffix() {
+        let mut skills = HashSet::new();
+        skills.insert("review".to_string());
+        skills.insert("gstack".to_string());
+        skills.insert("gstack:review".to_string());
+        let cfg = UserConfig {
+            mcp_servers: HashSet::new(),
+            skills: skills.clone(),
+        };
+        // Full key matches its own registered entry, not the unrelated
+        // top-level "review".
+        assert!(cfg.is_user_skill("gstack:review"));
+
+        // Still true even when the unrelated top-level "review" is absent —
+        // proving the match is on the full key, not the stripped collision.
+        skills.remove("review");
+        let cfg2 = UserConfig {
+            mcp_servers: HashSet::new(),
+            skills,
+        };
+        assert!(cfg2.is_user_skill("gstack:review"));
+    }
+
+    #[test]
+    fn dot_prefixed_directories_are_skipped_at_both_levels() {
+        let root = std::env::temp_dir().join(format!("ts-skills-dotskip-{}", std::process::id()));
+        let skills = root.join("skills");
+        let _ = fs::create_dir_all(skills.join(".hidden-top"));
+        let dotted_nested = skills.join("gstack").join(".hidden-nested");
+        let _ = fs::create_dir_all(&dotted_nested);
+        fs::write(dotted_nested.join("SKILL.md"), "# hidden").unwrap();
+
+        let got = skills_from_dirs(&[skills]);
+        assert!(!got.contains(".hidden-top"));
+        assert!(!got.contains("gstack:.hidden-nested"));
+        // The non-dotted plugin dir itself is still registered.
+        assert!(got.contains("gstack"));
 
         let _ = fs::remove_dir_all(&root);
     }
