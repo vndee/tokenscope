@@ -108,7 +108,12 @@ struct Cum {
 }
 
 /// Parser state persisted between incremental reads of one session file.
+// `#[serde(default)]` lets a partial or older persisted payload (missing a
+// field serde would otherwise require) deserialize field-by-field instead of
+// failing wholesale — a wholesale failure loses `prev` and re-adds an entire
+// session's tokens on the next incremental pass.
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 struct Carry {
     session: String,
     model: String,
@@ -189,12 +194,19 @@ impl CodexState {
             self.c.branch = s.to_string();
         }
         // A sub-agent thread records its parent under source.subagent; a normal
-        // session's source is a plain string ("vscode").
-        self.c.sidechain = p
+        // session's source is a plain string ("vscode"). Latch, don't assign:
+        // real logs replay session_meta (a second record with a plain "vscode"
+        // source, observed ~3ms after the first in subagent files) and an
+        // unconditional assignment would flip sidechain back to false on that
+        // replay, misattributing the whole session's tokens to the main loop.
+        if p
             .get("source")
             .and_then(|v| v.as_object())
             .map(|o| o.contains_key("subagent"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            self.c.sidechain = true;
+        }
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
@@ -370,9 +382,68 @@ mod tests {
     fn a_backwards_counter_rebaselines_instead_of_going_negative() {
         let a = tc("2026-08-12T04:00:02.000Z", 5000, 0, 0, 200);
         let b = tc("2026-08-12T04:00:03.000Z", 100, 0, 0, 10);
-        let ev = feed(&[META, CTX, &a, &b]);
-        assert_eq!(ev.len(), 1);
+        let c = tc("2026-08-12T04:00:04.000Z", 150, 0, 0, 30);
+        let ev = feed(&[META, CTX, &a, &b, &c]);
+        // `b` is a decrease: it clamps to a no-op (no event), but must still
+        // rebaseline `prev` to 100/10. An implementation that early-returns on
+        // the decrease *without* updating `prev` would leave the pre-drop high
+        // water mark (5000/200) in place, and `c` (150/30) would then also
+        // clamp to zero and be silently dropped — so `ev.len()` catches it.
+        assert_eq!(ev.len(), 2);
         assert!(ev.iter().all(|e| e.in_tok >= 0.0 && e.out_tok >= 0.0));
+        // `c` must be measured from the rebaselined 100/10, not from 5000/200.
+        assert_eq!(ev[1].in_tok, 50.0);
+        assert_eq!(ev[1].out_tok, 20.0);
+    }
+
+    #[test]
+    fn a_midstream_repeat_still_advances_prev_for_the_next_delta() {
+        // A zero-delta snapshot (exact repeat) must also leave `prev` advanced
+        // (a no-op here since cur == prev already), so a following genuine
+        // delta is measured correctly rather than against a stale baseline.
+        let a = tc("2026-08-12T04:00:02.000Z", 1000, 400, 0, 50);
+        let b = tc("2026-08-12T04:00:03.000Z", 1500, 600, 0, 80);
+        let ev = feed(&[META, CTX, &a, &a, &b]);
+        assert_eq!(ev.len(), 2);
+        // input +500, cached +200 → uncached 300; output +30.
+        assert_eq!(ev[1].in_tok, 300.0);
+        assert_eq!(ev[1].cr, 200.0);
+        assert_eq!(ev[1].out_tok, 30.0);
+    }
+
+    #[test]
+    fn sidechain_latches_across_a_replayed_session_meta() {
+        // Real subagent files replay session_meta: the file opens with a
+        // source.subagent record, then a plain "vscode" record follows a few
+        // ms later (same session_id). That replay must not flip sidechain
+        // back to false, or subagent tokens get misattributed to the main loop.
+        let subagent_meta = r#"{"timestamp":"2026-08-12T04:00:00.000Z","type":"session_meta","payload":{"session_id":"s2","cwd":"/w/proj","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p1"}}},"git":{"branch":"main"}}}"#;
+        let replay_meta = r#"{"timestamp":"2026-08-12T04:00:00.003Z","type":"session_meta","payload":{"session_id":"s2","cwd":"/w/proj","source":"vscode","git":{"branch":"main"}}}"#;
+        let a = tc("2026-08-12T04:00:02.000Z", 100, 0, 0, 10);
+        let ev = feed(&[subagent_meta, replay_meta, CTX, &a]);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].sidechain);
+    }
+
+    #[test]
+    fn carry_with_a_missing_field_still_restores_prev() {
+        // An older/partial persisted Carry (e.g. from before a field was
+        // added, or a hand-edited manifest) must still restore `prev` via
+        // `#[serde(default)]`, not fail deserialization wholesale and reset
+        // the cumulative baseline to zero — which would re-add an entire
+        // session's tokens on the next incremental pass.
+        let saved = serde_json::json!({
+            "session": "s1",
+            "model": "gpt-5.6-sol",
+            "prev": {"input": 1000.0, "cached": 0.0, "cache_write": 0.0, "output": 50.0}
+            // cwd, branch, sidechain deliberately omitted.
+        });
+        let p = CodexParser;
+        let mut st = p.new_file_state(Some(&saved));
+        let b = tc("2026-08-12T04:00:03.000Z", 1500, 0, 0, 70);
+        let ev = st.parse_line(&b).expect("a delta event");
+        assert_eq!(ev.in_tok, 500.0);
+        assert_eq!(ev.out_tok, 20.0);
     }
 
     #[test]
