@@ -72,14 +72,25 @@ pub fn skills_from_dirs(dirs: &[PathBuf]) -> HashSet<String> {
 /// when `<dir>/<plugin>/<skill>/SKILL.md` exists. The `SKILL.md` check is
 /// what tells a real nested skill apart from a skill's own support
 /// directories (`references/`, `scripts/`, `assets/`), which must not become
-/// whitelist entries. This is purely additive on top of the existing
-/// one-level scan: every name the one-level scan registers is still
-/// registered. Directory names beginning with `.` are skipped at both
+/// whitelist entries. Directory names beginning with `.` are skipped at both
 /// levels.
+///
+/// A skill reachable two ways from the same root counts once. Roots commonly
+/// symlink plugin skills in flat (`~/.claude/skills/review -> gstack/review`),
+/// and registering the nested form on top of the flat one counted 31 of 80
+/// installed skills twice on this machine. Only nested skills with no bare
+/// entry of their own are genuinely newly-reachable, and only those are added.
+/// The check is per root, because reachability is: a flat symlink in one root
+/// says nothing about a plugin skill in another.
+///
+/// Two passes rather than one, so the flat names are all known before any
+/// nested name is judged against them — otherwise readdir order would decide
+/// whether a duplicate was caught.
 fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let mut top: Vec<(String, PathBuf)> = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
         if !path.is_dir() {
@@ -91,9 +102,14 @@ fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
         if name.starts_with('.') {
             continue;
         }
+        top.push((name, path));
+    }
+    let flat: HashSet<&str> = top.iter().map(|(n, _)| n.as_str()).collect();
+
+    for (name, path) in &top {
         set.insert(name.clone());
 
-        let Ok(nested_entries) = fs::read_dir(&path) else {
+        let Ok(nested_entries) = fs::read_dir(path) else {
             continue;
         };
         for ne in nested_entries.flatten() {
@@ -104,7 +120,7 @@ fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
             let Some(nested_name) = ne.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if nested_name.starts_with('.') {
+            if nested_name.starts_with('.') || flat.contains(nested_name.as_str()) {
                 continue;
             }
             if nested_path.join("SKILL.md").is_file() {
@@ -261,6 +277,56 @@ args = ["@playwright/mcp@latest"]
         // Plus the new nested entry, purely additive.
         assert!(got.contains("gstack:plan-eng-review"));
         assert_eq!(got.len(), 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_skill_reachable_flat_and_nested_is_registered_once() {
+        // The real ~/.claude/skills symlinks every plugin skill in flat
+        // (review -> gstack/review), so registering the nested form too counted
+        // 31 of 80 skills a second time — 80 installed skills reported as 111,
+        // with not one of them newly reachable.
+        let root = std::env::temp_dir().join(format!("ts-skills-dedup-{}", std::process::id()));
+        let skills = root.join("skills");
+        let plugin = skills.join("gstack");
+        for n in ["review", "ship"] {
+            let d = plugin.join(n);
+            let _ = fs::create_dir_all(&d);
+            fs::write(d.join("SKILL.md"), "# s").unwrap();
+        }
+        // `review` is also reachable flat; `ship` is not.
+        let flat = skills.join("review");
+        let _ = fs::create_dir_all(&flat);
+        fs::write(flat.join("SKILL.md"), "# review").unwrap();
+
+        let got = skills_from_dirs(&[skills]);
+        assert!(got.contains("review"));
+        assert!(!got.contains("gstack:review"), "already reachable as `review`");
+        // The nested skill with no flat entry is what the nested pass is for.
+        assert!(got.contains("gstack:ship"));
+        assert!(got.contains("gstack"));
+        assert_eq!(got.len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_skill_shadowed_in_another_root_is_still_registered() {
+        // Reachability is per root: a flat `review` in one skills dir does not
+        // make `gstack/review` in a *different* dir reachable by its bare name,
+        // so suppressing it there would drop a real entry.
+        let root = std::env::temp_dir().join(format!("ts-skills-xroot-{}", std::process::id()));
+        let a = root.join("a/skills");
+        let b = root.join("b/skills");
+        let _ = fs::create_dir_all(a.join("review"));
+        let nested = b.join("gstack").join("review");
+        let _ = fs::create_dir_all(&nested);
+        fs::write(nested.join("SKILL.md"), "# review").unwrap();
+
+        let got = skills_from_dirs(&[a, b]);
+        assert!(got.contains("review"));
+        assert!(got.contains("gstack:review"));
 
         let _ = fs::remove_dir_all(&root);
     }
