@@ -788,10 +788,18 @@ mod tests {
 
     #[test]
     fn carry_resumes_the_cumulative_across_a_split_read() {
+        // Every field of Carry is asserted here, because every field is set at
+        // the top of the file and Carry is the only thing that carries it past
+        // the first incremental pass — a pass that starts past those lines can
+        // never re-derive them. `sidechain` is the sharpest case: dropping it
+        // would silently re-attribute 59.7% of this machine's Codex tokens from
+        // sub-agents to the main loop, a regression already found once.
         let p = CodexParser;
+        // A sub-agent file, so `sidechain` is true rather than defaulted-false.
+        let meta = r#"{"timestamp":"2026-08-12T04:00:00.000Z","type":"session_meta","payload":{"session_id":"s1","cwd":"/w/proj","source":{"subagent":{"other":"guardian"}},"git":{"branch":"main"}}}"#;
         let a = tc("2026-08-12T04:00:02.000Z", 1000, 0, 0, 50);
         let mut st = p.new_file_state(None);
-        for l in [META, CTX, a.as_str()] {
+        for l in [meta, CTX, a.as_str()] {
             st.parse_line(l);
         }
         let saved = st.carry().expect("codex state must be persistable");
@@ -800,11 +808,23 @@ mod tests {
         let b = tc("2026-08-12T04:00:03.000Z", 1500, 0, 0, 70);
         let mut st2 = p.new_file_state(Some(&saved));
         let ev = st2.parse_line(&b).expect("a delta event");
+        // prev
         assert_eq!(ev.in_tok, 500.0);
         assert_eq!(ev.out_tok, 20.0);
-        // Session and model must survive too, or the event is unattributable.
+        // session, model — without them the event is unattributable.
         assert_eq!(ev.session, "s1");
         assert_eq!(ev.model, "gpt-5.6-sol");
+        // cwd, branch — the project and branch breakdowns.
+        assert_eq!(ev.cwd, "/w/proj");
+        assert_eq!(ev.branch, "main");
+        // sidechain — sub-agent vs main-loop attribution.
+        assert!(ev.sidechain);
+        // replay_until, replay_armed — a fork file's skip must not silently
+        // disarm mid-file; covered end-to-end by
+        // `the_replay_skip_survives_an_incremental_read`, pinned here as fields.
+        let round: Carry = serde_json::from_value(saved).expect("Carry round-trips");
+        assert_eq!(round.replay_until, None, "this file declares no fork");
+        assert!(!round.replay_armed);
     }
 
     #[test]
