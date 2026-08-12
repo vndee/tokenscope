@@ -127,6 +127,10 @@ pub(super) struct CodexParser;
 
 struct CodexState {
     c: Carry,
+    /// Skills already counted in the current turn, so re-reading a SKILL.md
+    /// mid-turn doesn't inflate the count. Deliberately not carried across an
+    /// incremental read: turn boundaries reset it anyway.
+    turn_skills: HashSet<String>,
 }
 
 impl LogParser for CodexParser {
@@ -134,8 +138,36 @@ impl LogParser for CodexParser {
         let c = carry
             .and_then(|v| serde_json::from_value::<Carry>(v.clone()).ok())
             .unwrap_or_default();
-        Box::new(CodexState { c })
+        Box::new(CodexState {
+            c,
+            turn_skills: HashSet::new(),
+        })
     }
+}
+
+/// Every `skills/<name>/SKILL.md` path in a shell command, in order.
+///
+/// Codex has no skill tool call: a skill is invoked by reading its SKILL.md, so
+/// that read is the signal. Requiring the exact `<name>/SKILL.md` tail keeps
+/// out reference files under a skill and nested system paths
+/// (`skills/.system/openai-docs/SKILL.md`), and one command can open several.
+fn skill_names(cmd: &str) -> Vec<String> {
+    const MARK: &str = "skills/";
+    let mut out = Vec::new();
+    let mut rest = cmd;
+    while let Some(i) = rest.find(MARK) {
+        rest = &rest[i + MARK.len()..];
+        let Some(name) = rest.split('/').next() else {
+            continue;
+        };
+        if !name.is_empty() && rest[name.len()..].starts_with("/SKILL.md") {
+            let n = name.to_string();
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 pub(super) fn parser() -> Box<dyn LogParser> {
@@ -242,6 +274,37 @@ impl CodexState {
     }
 }
 
+impl CodexState {
+    fn on_response_item(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
+        let kind = p.get("type").and_then(|v| v.as_str())?;
+        if kind != "function_call" && kind != "custom_tool_call" {
+            return None;
+        }
+        let name = p.get("name").and_then(|v| v.as_str())?;
+        let mut e = self.base(ts_ms);
+        e.tools.push(name.to_string());
+        if let Some(input) = p.get("input").and_then(|v| v.as_str()) {
+            for s in skill_names(input) {
+                if self.turn_skills.insert(s.clone()) {
+                    e.skills.push(s);
+                }
+            }
+        }
+        Some(e)
+    }
+
+    fn on_mcp_call(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
+        let inv = p.get("invocation")?;
+        let server = inv.get("server").and_then(|v| v.as_str())?;
+        let mut e = self.base(ts_ms);
+        e.mcp.push(server.to_string());
+        if let Some(tool) = inv.get("tool").and_then(|v| v.as_str()) {
+            e.tools.push(format!("{server}.{tool}"));
+        }
+        Some(e)
+    }
+}
+
 impl FileState for CodexState {
     fn parse_line(&mut self, line: &str) -> Option<RawEvent> {
         let v: Value = serde_json::from_str(line).ok()?;
@@ -258,8 +321,10 @@ impl FileState for CodexState {
                 if let Some(m) = p.get("model").and_then(|v| v.as_str()) {
                     self.c.model = m.to_string();
                 }
+                self.turn_skills.clear();
                 None
             }
+            "response_item" => self.on_response_item(p, ts_ms),
             "event_msg" => match p.get("type").and_then(|v| v.as_str())? {
                 "thread_settings_applied" => {
                     if let Some(m) = p
@@ -272,6 +337,11 @@ impl FileState for CodexState {
                     None
                 }
                 "token_count" => self.on_token_count(p, ts_ms),
+                "task_started" => {
+                    self.turn_skills.clear();
+                    None
+                }
+                "mcp_tool_call_end" => self.on_mcp_call(p, ts_ms),
                 _ => None,
             },
             _ => None,
@@ -481,5 +551,77 @@ mod tests {
         let ev = feed(&[META, &a]);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].model, "unknown");
+    }
+
+    #[test]
+    fn skill_names_finds_every_skill_md_path_in_one_command() {
+        // A single exec can open several skills at once.
+        let cmd = "sed -n '1,320p' /Users/u/.agents/skills/review-bugbot/SKILL.md && sed -n '1,320p' /Users/u/.agents/skills/review-security/SKILL.md";
+        assert_eq!(skill_names(cmd), vec!["review-bugbot", "review-security"]);
+    }
+
+    #[test]
+    fn skill_names_ignores_non_skill_md_reads() {
+        // A reference file under a skill is not a fresh skill invocation, and a
+        // nested system path is not a <name>/SKILL.md either.
+        assert!(skill_names("cat /r/skills/using-superpowers/references/codex-tools.md").is_empty());
+        assert!(skill_names("cat /r/skills/.system/openai-docs/SKILL.md").is_empty());
+        assert!(skill_names("ls /r/skills/").is_empty());
+    }
+
+    #[test]
+    fn a_skill_counts_once_per_turn_but_again_in_the_next_turn() {
+        let exec = |c: &str| {
+            format!(
+                r#"{{"timestamp":"2026-08-12T04:00:05.000Z","type":"response_item","payload":{{"type":"custom_tool_call","name":"exec","input":"{c}"}}}}"#
+            )
+        };
+        let e = exec("cat /r/skills/review/SKILL.md");
+        let ev = feed(&[META, CTX, &e, &e, CTX, &e]);
+        let skills: Vec<&str> = ev
+            .iter()
+            .flat_map(|r| r.skills.iter().map(|s| s.as_str()))
+            .collect();
+        assert_eq!(skills, vec!["review", "review"]);
+    }
+
+    #[test]
+    fn mcp_tool_call_end_yields_the_server_name() {
+        let m = r#"{"timestamp":"2026-08-12T04:00:06.000Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"github","tool":"get_pr_info"}}}"#;
+        let ev = feed(&[META, CTX, m]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].mcp, vec!["github"]);
+        assert_eq!(ev[0].tools, vec!["github.get_pr_info"]);
+        // A tool call is not usage.
+        assert_eq!(ev[0].in_tok, 0.0);
+        assert_eq!(ev[0].out_tok, 0.0);
+    }
+
+    #[test]
+    fn function_calls_are_recorded_as_tools_not_mcp() {
+        // These are built-in agent tools, not MCP servers.
+        let f = r#"{"timestamp":"2026-08-12T04:00:07.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","namespace":"collaboration"}}"#;
+        let ev = feed(&[META, CTX, f]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].tools, vec!["spawn_agent"]);
+        assert!(ev[0].mcp.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_session_marks_its_events_as_sidechain() {
+        let meta = r#"{"timestamp":"2026-08-12T04:00:00.000Z","type":"session_meta","payload":{"session_id":"s2","cwd":"/w","source":{"subagent":{"other":"guardian"}}}}"#;
+        let a = tc("2026-08-12T04:00:02.000Z", 100, 0, 0, 10);
+        let ev = feed(&[meta, CTX, &a]);
+        assert!(ev[0].sidechain);
+    }
+
+    #[test]
+    fn session_metadata_reaches_the_events() {
+        let a = tc("2026-08-12T04:00:02.000Z", 100, 0, 0, 10);
+        let ev = feed(&[META, CTX, &a]);
+        assert_eq!(ev[0].cwd, "/w/proj");
+        assert_eq!(ev[0].branch, "main");
+        assert_eq!(ev[0].tool_results, 0);
+        assert_eq!(ev[0].tool_errors, 0);
     }
 }
