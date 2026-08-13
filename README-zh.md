@@ -18,6 +18,7 @@
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
 - **只统计用户自己安装的 MCP / Skill**，内置工具与厂商自带的连接器会被过滤（Claude 自己的内置工具与 Anthropic 自带 MCP；Codex 内置的 `codex_apps` 连接器）；插件域 Skill（如 `gstack:review`）两个 Agent 都会计入
+- **按账户展示套餐额度** —— Claude 和 Codex 各自的套餐窗口已经用了多少、几时重置，任意窗口用量超过 80% 时托盘会亮起 `⚠`
 
 ## 数据来源（零侵入，只读）
 
@@ -30,6 +31,10 @@
 | Codex MCP 白名单 | `~/.codex/config.toml` → `[mcp_servers.*]` |
 | Codex Skill 白名单 | `~/.codex/skills/` 与 `~/.agents/skills/` |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI / Codex 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+| Codex 套餐额度 | Codex 会话日志中 `token_count` 行携带的 `rate_limits` |
+| Claude 套餐额度 | 按账户带上 `CLAUDE_CONFIG_DIR` 运行 `claude -p "/usage"` |
+
+套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值。
 
 每个 Skill 白名单目录都按两种规则扫描：顶层任意非 `.` 开头的目录 `<name>/` 都会记为 `<name>`（顶层不要求存在 `SKILL.md`）；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill，这一层才要求 `SKILL.md` 存在）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`（顶层扫描本身也会把 `gstack` 记入）。以 `.` 开头的目录在两层都会被跳过。两个 Agent 的白名单都遵循这一规则。
 

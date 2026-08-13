@@ -18,6 +18,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
 - Cost donut (hover for a single model), year-long activity heatmap
 - **Counts only the MCP servers / Skills you installed yourself** — built-in tools and vendor-bundled connectors are filtered out (Claude's built-in tools and Anthropic's bundled MCP servers; Codex's built-in `codex_apps` connector); plugin-scoped skills (e.g. `gstack:review`) count too, for both agents
+- **Plan usage per account** — how much of each Claude and Codex plan window is spent, with reset times, and a `⚠` on the tray when any window passes 80%
 
 ## Data sources (zero-intrusion, read-only)
 
@@ -30,6 +31,13 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 | Codex MCP whitelist | `~/.codex/config.toml` → `[mcp_servers.*]` |
 | Codex Skill whitelist | `~/.codex/skills/` and `~/.agents/skills/` |
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI / Codex logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
+| Codex plan quota | `rate_limits` on `token_count` lines in the Codex session logs |
+| Claude plan quota | `claude -p "/usage"`, run per account with `CLAUDE_CONFIG_DIR` |
+
+Plan quota never touches a credential: Codex reports it inside the logs already
+being read, and Claude's comes from its own supported CLI. Tokenscope does not
+read the Keychain, any auth file, or any undocumented endpoint. Figures older
+than 30 minutes are dimmed rather than shown as current.
 
 Each Skill whitelist directory is scanned two ways: every non-dot top-level directory `<name>/` registers `<name>` (no `SKILL.md` required at that level), and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill, gated on that `SKILL.md` existing) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review` (as well as `gstack` itself, from the top-level scan). Directories starting with `.` are always skipped, at both levels. This applies to both agents' whitelists.
 
