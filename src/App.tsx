@@ -154,8 +154,16 @@ const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
 // and it changes how they should be read: on a second machine the figures are
 // systematically low, so the 80% tray warning fires late or not at all. Codex
 // rows get no such line — those figures come from the service itself.
-function QuotaBlock({ t, q, agent, busy, onRefresh }:
-  { t: Theme; q: QuotaSnapshot | null; agent: string | null; busy: boolean; onRefresh?: () => void }) {
+//
+// `onPurge` is the manual fallback for the automatic cleanup that follows every
+// check. That cleanup swallows IO errors so a failure can never cost a good
+// reading, which means a persistent failure would be silent — this is the way
+// out by hand. Deliberately placed below the block rather than beside Refresh:
+// it deletes files, and the control people press often should not sit a few
+// pixels from the one that does that.
+function QuotaBlock({ t, q, agent, busy, onRefresh, onPurge, purging }:
+  { t: Theme; q: QuotaSnapshot | null; agent: string | null; busy: boolean;
+    onRefresh?: () => void; onPurge?: () => void; purging?: boolean }) {
   const windows = q && q.windows.length > 0 ? q.windows : null;
   if (!windows && !onRefresh) return null;
   const stale = !!q && isQuotaStale(q.sourceAt);
@@ -204,6 +212,18 @@ function QuotaBlock({ t, q, agent, busy, onRefresh }:
         <div style={{ font: `500 9px/1.45 ${t.mono}`, color: t.faint, marginTop: 5, ...dim }}>
           Claude calls these approximate: they count local sessions on this
           machine only, not other devices or claude.ai.
+        </div>
+      )}
+      {onPurge && (
+        <div data-no-drag="" style={{ marginTop: 5, cursor: "default" }}>
+          <button onClick={onPurge} disabled={purging}
+            title="Each check makes Claude Code write a session log, which Tokenscope deletes right after. This removes any that were left behind."
+            style={{
+              font: `500 9px ${t.mono}`, color: t.faint,
+              background: "none", border: "none", padding: 0,
+              cursor: purging ? "default" : "pointer", textDecoration: "underline",
+              textUnderlineOffset: 2, textDecorationColor: t.gridLine,
+            }}>{purging ? "Cleaning up…" : "Clean up leftover check logs"}</button>
         </div>
       )}
     </div>
@@ -458,6 +478,23 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
     setToast({ msg, ok });
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   };
+
+  // Manual purge of leftover `/usage` check logs. Pressing it is the
+  // authorisation, so there is no confirm step — but it always reports what it
+  // did, including "nothing", since a silent no-op on a maintenance action
+  // reads as a failure. Declared here rather than beside refreshQuota because
+  // it needs showToast.
+  const [purging, setPurging] = useState(false);
+  const purgeQuotaLogs = async () => {
+    if (purging) return;
+    setPurging(true);
+    try {
+      const n = await invoke<number>("purge_quota_logs");
+      showToast(n === 0 ? "No leftover logs" : `Removed ${n} log${n === 1 ? "" : "s"}`, true);
+    } catch { showToast("Cleanup failed", false); }
+    finally { setPurging(false); }
+  };
+
   const captureScreenshot = async () => {
     if (shotBusy) return;
     const el = document.querySelector<HTMLElement>(".om-scroll");
@@ -612,7 +649,9 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
         </div>
         <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
-        <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy} onRefresh={canRefreshQuota ? refreshQuota : undefined} />
+        <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy}
+          onRefresh={canRefreshQuota ? refreshQuota : undefined}
+          onPurge={canRefreshQuota ? purgeQuotaLogs : undefined} purging={purging} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>

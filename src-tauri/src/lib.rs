@@ -822,6 +822,33 @@ async fn refresh_quota(app: tauri::AppHandle) {
     .await;
 }
 
+/// Delete accumulated `/usage` quota-check logs from every Claude account, and
+/// report how many went. Returns the count so the panel can say what it did.
+///
+/// The automatic cleanup after each poll swallows every IO error, because a
+/// cleanup failure must never cost a good quota reading. The price of that
+/// choice is that a persistent failure is silent and unbounded, so this is the
+/// way out by hand. Pressing the control is the authorisation; there is no
+/// confirmation step, but the count is reported back.
+///
+/// Also clears logs from before the scratch directory existed, which the
+/// automatic path cannot see — see `quota::purge_quota_logs` for why that needs
+/// a stricter, content-based match.
+///
+/// On a blocking worker (it walks every project directory of every account) and
+/// rebuilds afterwards, since removing files changes what ingest reports.
+#[tauri::command]
+async fn purge_quota_logs(app: tauri::AppHandle) -> usize {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let n = quota::purge_quota_logs();
+        refresh(&handle);
+        n
+    })
+    .await
+    .unwrap_or(0)
+}
+
 /// Save a full-panel screenshot (a `data:image/png;base64,...` URL captured in
 /// the webview) to the user's Desktop as `Tokenscope <date> at <time>.png`.
 /// DOM rasterization sidesteps macOS Screen Recording permission entirely.
@@ -898,6 +925,7 @@ pub fn run() {
             begin_drag,
             refresh_pricing,
             refresh_quota,
+            purge_quota_logs,
         ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.

@@ -136,6 +136,7 @@ fn user_text(v: &serde_json::Value) -> Option<&str> {
 }
 
 const USAGE_MARKER: &str = "<command-name>/usage</command-name>";
+const CAVEAT_MARKER: &str = "<local-command-caveat>";
 
 /// Is this file one of our `/usage` poll logs?
 ///
@@ -160,6 +161,36 @@ pub fn is_quota_poll_log(text: &str) -> bool {
         }
     }
     saw_usage
+}
+
+/// Is this file a session that ran `/usage` and recorded nothing else?
+///
+/// Stricter than `is_quota_poll_log`, because the manual purge walks project
+/// directories the user does own. On top of "no assistant turn", every user
+/// line must be either the local-command caveat or the `/usage` command echo
+/// itself, and any user line whose content is not a plain string (tool results,
+/// pasted images) disqualifies the file outright.
+///
+/// A session where someone typed `/usage` and then did real work has assistant
+/// lines and is already excluded by the looser test. A session where someone
+/// typed `/usage` and immediately quit is indistinguishable from ours by any
+/// means; this last condition is what confines that irreducible ambiguity to
+/// sessions that recorded no work at all.
+pub fn is_usage_only_session(text: &str) -> bool {
+    if !is_quota_poll_log(text) {
+        return false;
+    }
+    for line in text.lines() {
+        let Some(v) = json_line(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(c) = user_text(&v) else { return false };
+        if !(c.starts_with(CAVEAT_MARKER) || c.starts_with(USAGE_MARKER)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Delete every `.jsonl` file directly inside `dir` that `matches` accepts,
@@ -205,6 +236,37 @@ pub fn cleanup_probe_logs(config_dir: &Path) -> usize {
             .is_some_and(|n| n.ends_with(PROBE_DIR_NAME));
         if is_probe {
             removed += remove_matching(&p, is_quota_poll_log);
+        }
+    }
+    removed
+}
+
+/// Purge accumulated quota-check logs across every Claude account, returning
+/// how many files were removed.
+///
+/// The hand-operated fallback for a `cleanup_probe_logs` that silently fails —
+/// it swallows every IO error by design, so a persistent failure would pile up
+/// files with nothing to say so. This has to reach further than the automatic
+/// path: logs written before the scratch directory existed came from a poller
+/// with an ordinary working directory, so they sit in ordinary project
+/// directories and the basename match will never find them.
+///
+/// It therefore matches on content instead of location, which is why the
+/// predicate is the strict `is_usage_only_session`. Scope is still bounded:
+/// one level inside each `projects/<slug>/`, where Claude writes session logs,
+/// and never into the nested subdirectories it keeps subagent transcripts in.
+pub fn purge_quota_logs() -> usize {
+    let mut removed = 0usize;
+    for (d, a) in crate::agents::discover_all() {
+        if d.id != "claude" {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&a.log_root) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                removed += remove_matching(&p, is_usage_only_session);
+            }
         }
     }
     removed
@@ -461,8 +523,9 @@ mod tests {
             r#"{"type":"queue-operation","operation":"dequeue"}"#.to_string(),
             r#"{"type":"attachment","attachment":{"type":"hook_success"}}"#.to_string(),
             r#"{"type":"attachment","attachment":{"type":"hook_additional_context"}}"#.to_string(),
-            r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: generated while running local commands."}}"#
-                .to_string(),
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"{CAVEAT_MARKER}Caveat: generated while running local commands."}}}}"#
+            ),
             format!(
                 r#"{{"type":"user","message":{{"role":"user","content":"{USAGE_MARKER}\n<command-message>usage</command-message>"}}}}"#
             ),
@@ -567,6 +630,74 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_only_session_is_purgeable() {
+        assert!(is_usage_only_session(&poll_log()));
+    }
+
+    #[test]
+    fn a_session_with_usage_plus_real_work_is_kept() {
+        // Someone typed /usage and then asked for something. Even before the
+        // assistant's reply is written — so the loose test still says "ours" —
+        // the extra user turn has to protect it.
+        let t = format!(
+            "{}\n{}",
+            poll_log(),
+            r#"{"type":"user","message":{"role":"user","content":"now refactor store.rs"}}"#
+        );
+        assert!(is_quota_poll_log(&t), "no assistant line yet: the loose test passes");
+        assert!(!is_usage_only_session(&t), "the strict test must reject it");
+    }
+
+    #[test]
+    fn a_session_with_a_structured_user_turn_is_kept() {
+        // Array content (tool results, pasted images) is real session material.
+        let t = format!(
+            "{}\n{}",
+            poll_log(),
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#
+        );
+        assert!(!is_usage_only_session(&t));
+    }
+
+    #[test]
+    fn the_purge_predicate_still_rejects_what_the_loose_one_does() {
+        let with_assistant = format!(
+            "{}\n{}",
+            poll_log(),
+            r#"{"type":"assistant","message":{"role":"assistant"}}"#
+        );
+        assert!(!is_usage_only_session(&with_assistant));
+        assert!(!is_usage_only_session(
+            r#"{"type":"user","message":{"role":"user","content":"fix the parser"}}"#
+        ));
+        assert!(!is_usage_only_session(&format!("{}\nnot json at all", poll_log())));
+    }
+
+    #[test]
+    fn the_purge_sweeps_ordinary_project_directories_the_probe_match_misses() {
+        // The accumulated logs came from a poller with a normal working
+        // directory, so they are in a directory `cleanup_probe_logs` ignores.
+        let (root, _probe) = probe_tree("purge");
+        let ordinary = root.join("projects").join("-Users-someone-code-myapp");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        let old_poll = write(&ordinary, "old.jsonl", &poll_log());
+        let real = write(
+            &ordinary,
+            "real.jsonl",
+            &format!(
+                "{}\n{}",
+                poll_log(),
+                r#"{"type":"user","message":{"role":"user","content":"now refactor store.rs"}}"#
+            ),
+        );
+        assert_eq!(cleanup_probe_logs(&root), 0, "the probe match cannot see these");
+        assert_eq!(remove_matching(&ordinary, is_usage_only_session), 1);
+        assert!(!old_poll.exists());
+        assert!(real.exists(), "a session with real work must survive");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     #[ignore] // spawns `claude` per account; run deliberately, not in CI
     fn live_fetch_each_claude_account() {
         for (d, a) in crate::agents::discover_all() {
@@ -587,3 +718,4 @@ mod tests {
         }
     }
 }
+
