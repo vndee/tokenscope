@@ -127,6 +127,28 @@ fix. Newest first. Useful as a reference for similar issues.
   (`scripts/gen_icon.py`, 4× supersampled), then ran `pnpm tauri icon` to
   produce every size + `icon.icns` / `icon.ico` with transparent corners.
 
+### 17. `pnpm tauri dev` crashes the installed app — OPEN
+
+- **Symptom**: Running `pnpm tauri dev` while `/Applications/Tokenscope.app` is
+  running kills the installed app: its menu-bar icon disappears. Reproducible
+  and pre-existing; the only current workaround is to quit the installed app
+  first.
+- **Cause**: `tauri_plugin_single_instance` (`lib.rs:880-882`) hands the second
+  launch off to the already-running instance, whose callback calls
+  `show_popover(app)` directly. On macOS `show_popover` ends in
+  `panel.show()` (`lib.rs:699-708`) — an AppKit `NSPanel` call. The
+  single-instance callback carries no main-thread guarantee, and AppKit aborts
+  the process when its UI classes are touched off the main thread. See bug 8 for
+  why the plugin is there in the first place: it is the fix for two menu-bar
+  icons, so it cannot simply be removed.
+- **Likely fix** (not applied): marshal the call, e.g.
+  `app.run_on_main_thread(move || show_popover(&handle))` inside the
+  single-instance callback, and audit the tray-menu call sites
+  (`lib.rs:1099`, `1113`, `1119`) for the same guarantee.
+- **Status**: Open. Filed during the `feat/plan-quota` final review, which
+  touches neither line — recorded here so it is not lost with the review
+  artifact.
+
 ---
 
 ## UI / charts
