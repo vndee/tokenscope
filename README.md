@@ -18,7 +18,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
 - Cost donut (hover for a single model), year-long activity heatmap
 - **Counts only the MCP servers / Skills you installed yourself** — built-in tools and vendor-bundled connectors are filtered out (Claude's built-in tools and Anthropic's bundled MCP servers; Codex's built-in `codex_apps` connector); plugin-scoped skills (e.g. `gstack:review`) count too, for both agents
-- **Plan usage per account** — how much of each Claude and Codex plan window is spent, with reset times, and a `⚠` on the tray when any window passes 80%
+- **Plan usage per account** — how much of each Claude and Codex plan window is spent, with reset times, and a `⚠` on the tray when any window passes 80%, for both agents
 
 ## Data sources (zero-intrusion, read-only)
 
@@ -37,13 +37,23 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 Plan quota never touches a credential: Codex reports it inside the logs already
 being read, and Claude's comes from its own supported CLI. Tokenscope does not
 read the Keychain, any auth file, or any undocumented endpoint. Figures older
-than 30 minutes are dimmed rather than shown as current.
+than 30 minutes are dimmed rather than shown as current, and the tray's `⚠`
+ignores them — so a Claude warning, rechecked hourly, is live for the first half
+of each hour and quiet for the second. The panel always shows the figure with
+its own "as of" label.
 
-Claude's quota is fetched only when you press **Refresh** in the panel's plan
-block — never on a timer. That CLI call makes no API request and consumes no
-plan quota, but Claude Code does write its own ~12 KB session log for the run;
-it is the only thing Tokenscope ever causes to be written under `~/.claude/`,
-and it happens once per click rather than in the background.
+Claude's quota is checked hourly, and whenever you press **Refresh** in the
+panel's plan block. Measured on Claude Code 2.1.229, that CLI call consumes no
+tokens, no cost and no plan quota — the session log it writes contains no
+assistant turn and no `message.usage` block. It does write that log: a ~12 KB
+file under the account's own `projects/`, the only thing Tokenscope ever causes
+to be written under `~/.claude/`. The check runs from a scratch directory of
+Tokenscope's own (`~/Library/Caches/tokenscope/quota-probe`) so the log lands
+somewhere identifiable, and deletes it immediately afterwards — a file is
+verified to hold the `/usage` command and no assistant reply before it is
+removed, and nothing else is ever touched. The steady state is zero accumulated
+files. If any are ever left behind, **Clean up leftover check logs** under the
+plan block removes them and tells you how many.
 
 Each Skill whitelist directory is scanned two ways: every non-dot top-level directory `<name>/` registers `<name>` (no `SKILL.md` required at that level), and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill, gated on that `SKILL.md` existing) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review` (as well as `gstack` itself, from the top-level scan). Directories starting with `.` are always skipped, at both levels. This applies to both agents' whitelists.
 

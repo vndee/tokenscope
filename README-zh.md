@@ -18,7 +18,7 @@
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
 - **只统计用户自己安装的 MCP / Skill**，内置工具与厂商自带的连接器会被过滤（Claude 自己的内置工具与 Anthropic 自带 MCP；Codex 内置的 `codex_apps` 连接器）；插件域 Skill（如 `gstack:review`）两个 Agent 都会计入
-- **按账户展示套餐额度** —— Claude 和 Codex 各自的套餐窗口已经用了多少、几时重置，任意窗口用量超过 80% 时托盘会亮起 `⚠`
+- **按账户展示套餐额度** —— Claude 和 Codex 各自的套餐窗口已经用了多少、几时重置，任意窗口用量超过 80% 时托盘会亮起 `⚠`，两个 Agent 都适用
 
 ## 数据来源（零侵入，只读）
 
@@ -34,12 +34,17 @@
 | Codex 套餐额度 | Codex 会话日志中 `token_count` 行携带的 `rate_limits` |
 | Claude 套餐额度 | 按账户带上 `CLAUDE_CONFIG_DIR` 运行 `claude -p "/usage"` |
 
-套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值。
+套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值，托盘的 `⚠` 也会忽略它们——所以每小时刷新一次的 Claude 告警，在每小时的前半段有效、后半段静默。面板则始终带着自己的 "as of" 标注展示这个数字。
 
-Claude 的额度只有在你点击面板里套餐区块的 **Refresh** 时才会去取，不会定时轮询。这次
-CLI 调用不发起任何 API 请求、不消耗套餐额度，但 Claude Code 自己会为这次运行写入一份约
-12 KB 的会话日志——这是 Tokenscope 唯一会间接导致 `~/.claude/` 下产生写入的地方，且只在
-你点击时发生一次，不会在后台反复发生。
+Claude 的额度每小时自动检查一次，你也可以随时点击面板里套餐区块的 **Refresh** 立即刷新。
+在 Claude Code 2.1.229 上实测：这次 CLI 调用不消耗 token、不产生费用、不消耗套餐额度——
+它写下的会话日志里既没有 assistant 回合，也没有 `message.usage` 块。但它确实会写这份日志：
+一份约 12 KB 的文件，落在该账户自己的 `projects/` 下，这是 Tokenscope 唯一会间接导致
+`~/.claude/` 下产生写入的地方。这次检查会在 Tokenscope 自己的临时目录
+（`~/Library/Caches/tokenscope/quota-probe`）中运行，好让日志落到一个可识别的位置，并在
+调用结束后立刻删除它——删除前会先确认该文件只含 `/usage` 命令、没有任何 assistant 回复，
+其它文件一概不碰。稳定状态下磁盘上不会有任何积累。万一仍有残留，套餐区块下方的
+**Clean up leftover check logs** 会清掉它们，并告诉你删了几个。
 
 每个 Skill 白名单目录都按两种规则扫描：顶层任意非 `.` 开头的目录 `<name>/` 都会记为 `<name>`（顶层不要求存在 `SKILL.md`）；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill，这一层才要求 `SKILL.md` 存在）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`（顶层扫描本身也会把 `gstack` 记入）。以 `.` 开头的目录在两层都会被跳过。两个 Agent 的白名单都遵循这一规则。
 
