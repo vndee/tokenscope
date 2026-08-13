@@ -67,14 +67,31 @@ pub fn claude_binary() -> Option<PathBuf> {
     }
     // Newest versioned native build, e.g. ~/.local/share/claude/versions/2.1.229
     let versions = home.join(".local/share/claude/versions");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(versions)
+    let found: Vec<PathBuf> = std::fs::read_dir(versions)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .collect();
-    found.sort();
-    found.pop()
+    newest_by_version(found)
+}
+
+/// Parse a dotted version-like name (e.g. "2.10.229") into numeric components
+/// so versions compare by magnitude, not lexicographically — "2.10.0" must
+/// outrank "2.9.0", which a plain string sort gets backwards. `None` if any
+/// component is not a plain unsigned integer.
+fn parse_version(name: &str) -> Option<Vec<u64>> {
+    name.split('.').map(|p| p.parse::<u64>().ok()).collect()
+}
+
+/// Pick the newest of a set of version-named paths. A name that does not
+/// parse as a version sorts as `None`, which is lower than every `Some(_)`,
+/// so a stray non-version entry can never be mistaken for the newest build.
+fn newest_by_version(paths: Vec<PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().max_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        parse_version(name)
+    })
 }
 
 /// Run `claude -p "/usage"` for one account and parse the result.
@@ -109,7 +126,12 @@ pub fn fetch_claude(config_dir: &Path) -> Option<QuotaSnapshot> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(_) => return None,
+            Err(_) => {
+                // try_wait itself failed; don't leave the child running.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
     let out = child.wait_with_output().ok()?;
@@ -135,6 +157,17 @@ pub fn cached(account_id: &str) -> Option<QuotaSnapshot> {
     cache().lock().ok()?.get(account_id).cloned()
 }
 
+/// The cache-update decision for one fetch attempt: write only on success.
+/// A failed fetch (`None`) leaves whatever was cached before untouched — a
+/// stale-but-real reading is recoverable, a wrong one is not, because the
+/// user acts on it. An account with nothing cached yet stays absent rather
+/// than gaining a placeholder.
+fn apply_fetch(account_id: &str, result: Option<QuotaSnapshot>) {
+    if let Some(snap) = result {
+        store_cached(account_id, snap);
+    }
+}
+
 /// Refresh every Claude account, one at a time. Sequential on purpose: each run
 /// costs several seconds of CPU, and a background menu-bar app should not spawn
 /// N of them at once. A failed account keeps whatever was cached before.
@@ -148,9 +181,7 @@ pub fn refresh_claude_accounts() {
         }
         // log_root is <data dir>/projects; CLAUDE_CONFIG_DIR wants the data dir.
         let Some(dir) = a.log_root.parent() else { continue };
-        if let Some(snap) = fetch_claude(dir) {
-            store_cached(&a.id, snap);
-        }
+        apply_fetch(&a.id, fetch_claude(dir));
     }
 }
 
@@ -239,6 +270,48 @@ mod tests {
         if let Some(p) = a {
             assert!(p.is_absolute(), "resolved path must be absolute: {p:?}");
         }
+    }
+
+    #[test]
+    fn newest_by_version_orders_numerically_not_lexicographically() {
+        // A plain string sort ranks "2.9.0" above "2.10.0"; this must not.
+        let paths = vec![
+            PathBuf::from("/versions/2.9.0"),
+            PathBuf::from("/versions/2.10.0"),
+            PathBuf::from("/versions/2.2.0"),
+        ];
+        assert_eq!(newest_by_version(paths), Some(PathBuf::from("/versions/2.10.0")));
+    }
+
+    #[test]
+    fn newest_by_version_ranks_unparseable_names_lowest() {
+        let paths = vec![PathBuf::from("/versions/latest"), PathBuf::from("/versions/2.1.0")];
+        assert_eq!(newest_by_version(paths), Some(PathBuf::from("/versions/2.1.0")));
+    }
+
+    #[test]
+    fn apply_fetch_keeps_a_good_cached_reading_on_failure() {
+        let q = parse_usage(REAL, 7).unwrap();
+        store_cached("acct-apply-keep", q);
+        apply_fetch("acct-apply-keep", None);
+        let got = cached("acct-apply-keep").expect("the prior snapshot must remain");
+        assert_eq!(got.fetched_at, 7);
+    }
+
+    #[test]
+    fn apply_fetch_replaces_the_cache_on_success() {
+        let old = parse_usage(REAL, 7).unwrap();
+        store_cached("acct-apply-replace", old);
+        let newer = parse_usage(REAL, 9).unwrap();
+        apply_fetch("acct-apply-replace", Some(newer));
+        let got = cached("acct-apply-replace").unwrap();
+        assert_eq!(got.fetched_at, 9);
+    }
+
+    #[test]
+    fn apply_fetch_leaves_a_never_cached_account_absent_on_failure() {
+        apply_fetch("acct-apply-never", None);
+        assert!(cached("acct-apply-never").is_none());
     }
 
     #[test]
