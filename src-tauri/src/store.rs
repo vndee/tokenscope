@@ -78,6 +78,11 @@ struct Snapshot {
     version: u32,
     events: Vec<RawEvent>,
     manifest: Manifest,
+    /// Newest quota blob across this account's files, by source timestamp.
+    /// Opaque to the store; `parser.rs` deserializes it. `#[serde(default)]` so
+    /// a document written before this field existed still deserializes.
+    #[serde(default)]
+    quota: Option<(i64, serde_json::Value)>,
 }
 
 /// Borrowing twin of `Snapshot`, so saving doesn't clone the event vector.
@@ -86,6 +91,7 @@ struct SnapshotRef<'a> {
     version: u32,
     events: &'a [RawEvent],
     manifest: &'a Manifest,
+    quota: &'a Option<(i64, serde_json::Value)>,
 }
 
 pub struct Store {
@@ -96,6 +102,9 @@ pub struct Store {
     // count its token usage only once.
     index: HashMap<String, usize>,
     manifest: Manifest,
+    /// Newest quota blob across this account's files, by source timestamp.
+    /// Opaque to the store; `parser.rs` deserializes it.
+    pub quota: Option<(i64, serde_json::Value)>,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -110,7 +119,8 @@ pub struct Store {
 //   v7: per-file parser carry in the manifest (Codex cumulative token deltas).
 //   v8: skip the parent transcript a forked Codex rollout replays (it was
 //       counted as fresh usage, at the fork's timestamp).
-const STORE_VERSION: u32 = 8;
+//   v9: capture agent-reported plan quota during ingest.
+const STORE_VERSION: u32 = 9;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -137,6 +147,7 @@ impl Store {
                 events: Vec::new(),
                 index: HashMap::new(),
                 manifest: Manifest::default(),
+                quota: None,
             };
         };
         Self::load_from(&dir, id)
@@ -146,6 +157,7 @@ impl Store {
     fn load_from(dir: &std::path::Path, id: &str) -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
+        let mut quota: Option<(i64, serde_json::Value)> = None;
         // A snapshot that is missing, truncated by a crash mid-write, or written
         // by an older parser is discarded whole, and ingest() does a full
         // rescan. Nothing partial is ever adopted: a manifest without its events
@@ -158,6 +170,7 @@ impl Store {
             if s.version == STORE_VERSION {
                 events = s.events;
                 manifest = s.manifest;
+                quota = s.quota;
             }
         }
         let index = events
@@ -170,6 +183,7 @@ impl Store {
             events,
             index,
             manifest,
+            quota,
         }
     }
 
@@ -195,6 +209,7 @@ impl Store {
             version: STORE_VERSION,
             events: &self.events,
             manifest: &self.manifest,
+            quota: &self.quota,
         };
         if let Ok(t) = serde_json::to_string(&snap) {
             let _ = write_atomic(&dir.join(format!("store-{id}.json")), t.as_bytes());
@@ -319,6 +334,13 @@ impl Store {
                     self.events.push(ev);
                 }
             }
+            if let Some((ts, v)) = state.quota() {
+                if self.quota.as_ref().map(|(prev, _)| ts > *prev).unwrap_or(true) {
+                    self.quota = Some((ts, v));
+                    dirty = true;
+                }
+            }
+
             offset += process_until as u64;
             self.manifest.files.insert(
                 key,
@@ -375,6 +397,7 @@ mod tests {
             events: Vec::new(),
             index: HashMap::new(),
             manifest: Manifest::default(),
+            quota: None,
         };
         store.ingest(&dir, &CountParser);
         let key = log.to_string_lossy().to_string();
@@ -447,6 +470,7 @@ mod tests {
             events: Vec::new(),
             index: HashMap::new(),
             manifest: Manifest::default(),
+            quota: None,
         };
         store.ingest(&dir, &*(crate::agents::codex::DESCRIPTOR.parser)());
 
@@ -499,6 +523,7 @@ mod tests {
             events: vec![codex_shaped_event(1_000)],
             index: HashMap::new(),
             manifest: Manifest::default(),
+            quota: None,
         };
         store.manifest.files.insert(
             "/logs/a.jsonl".to_string(),
@@ -575,6 +600,7 @@ mod tests {
             events: Vec::new(),
             index: HashMap::new(),
             manifest: Manifest::default(),
+            quota: None,
         };
         store.ingest(&dir, &CountParser);
         let key = log.to_string_lossy().to_string();

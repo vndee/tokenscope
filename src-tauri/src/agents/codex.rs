@@ -2,6 +2,7 @@
 // one session per file. See docs/superpowers/specs/2026-08-12-codex-tracking-design.md.
 use super::{AccountSpec, AgentDescriptor, FileState, LogParser};
 use crate::config::{self, UserConfig};
+use crate::model::{QuotaSnapshot, QuotaWindow};
 use crate::store::RawEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,6 +140,8 @@ struct Carry {
     /// without this latch it would re-arm the skip mid-file and swallow the
     /// fork's real usage.
     replay_armed: bool,
+    /// Newest rate_limits seen in this file: (event ts_ms, snapshot).
+    quota: Option<(i64, QuotaSnapshot)>,
 }
 
 pub(super) struct CodexParser;
@@ -233,6 +236,43 @@ fn uuid7_ms(id: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(&hex, 16).ok()
+}
+
+/// One `primary`/`secondary` limit block → a window. `window_minutes` names it:
+/// 10080 is a week, 300 is Codex's 5-hour window; anything else is reported in
+/// hours rather than invented.
+fn quota_window(v: &Value) -> Option<QuotaWindow> {
+    let used = v.get("used_percent").and_then(|x| x.as_f64())?;
+    let mins = v.get("window_minutes").and_then(|x| x.as_u64()).unwrap_or(0);
+    let label = match mins {
+        10080 => "Week".to_string(),
+        300 => "5h".to_string(),
+        0 => "Limit".to_string(),
+        m if m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    };
+    let resets_at = v.get("resets_at").and_then(|x| x.as_i64());
+    Some(QuotaWindow { label, used_percent: used, resets_at, resets_label: String::new() })
+}
+
+/// A `rate_limits` payload → a snapshot. None when it carries no usable window,
+/// so a null or unrecognised shape never overwrites a good earlier reading.
+fn quota_from_rate_limits(v: &Value, source_at: i64) -> Option<QuotaSnapshot> {
+    let mut windows = Vec::new();
+    for key in ["primary", "secondary"] {
+        if let Some(w) = v.get(key).filter(|x| !x.is_null()).and_then(quota_window) {
+            windows.push(w);
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(QuotaSnapshot {
+        plan: v.get("plan_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        windows,
+        fetched_at: source_at,
+        source_at,
+    })
 }
 
 impl CodexState {
@@ -340,6 +380,14 @@ impl CodexState {
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
+        if let Some(rl) = p.get("rate_limits").filter(|v| !v.is_null()) {
+            if let Some(q) = quota_from_rate_limits(rl, ts_ms) {
+                if self.c.quota.as_ref().map(|(prev, _)| ts_ms >= *prev).unwrap_or(true) {
+                    self.c.quota = Some((ts_ms, q));
+                }
+            }
+        }
+
         let t = p.get("info")?.get("total_token_usage")?;
         let cur = Cum {
             input: num(t, "input_tokens"),
@@ -473,6 +521,11 @@ impl FileState for CodexState {
 
     fn carry(&self) -> Option<Value> {
         serde_json::to_value(&self.c).ok()
+    }
+
+    fn quota(&self) -> Option<(i64, Value)> {
+        let (ts, q) = self.c.quota.as_ref()?;
+        Some((*ts, serde_json::to_value(q).ok()?))
     }
 }
 
@@ -977,6 +1030,78 @@ mod tests {
         assert_eq!(ev[0].branch, "main");
         assert_eq!(ev[0].tool_results, 0);
         assert_eq!(ev[0].tool_errors, 0);
+    }
+
+    fn rl(ts: &str, used: f64, window: u64, resets: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"total_tokens":11}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":{window},"resets_at":{resets}}},"secondary":null,"plan_type":"pro"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn rate_limits_become_a_quota_snapshot() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, rl("2026-08-12T04:00:02.000Z", 12.5, 10080, 1787196735).as_str()] {
+            st.parse_line(l);
+        }
+        let (ts, v) = st.quota().expect("a quota snapshot");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.plan, "pro");
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].label, "Week");
+        assert_eq!(q.windows[0].used_percent, 12.5);
+        assert_eq!(q.windows[0].resets_at, Some(1787196735));
+        assert_eq!(ts, 1786507202000); // the event's own timestamp, in ms
+    }
+
+    #[test]
+    fn the_newest_rate_limits_wins_and_a_null_one_does_not_erase_it() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        let null_rl = r#"{"timestamp":"2026-08-12T04:00:09.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":99,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":9,"total_tokens":108}},"rate_limits":null}}"#;
+        for l in [
+            META,
+            CTX,
+            rl("2026-08-12T04:00:02.000Z", 5.0, 10080, 1).as_str(),
+            rl("2026-08-12T04:00:05.000Z", 9.0, 10080, 2).as_str(),
+            null_rl,
+        ] {
+            st.parse_line(l);
+        }
+        let (_, v) = st.quota().expect("a quota snapshot");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.windows[0].used_percent, 9.0);
+    }
+
+    #[test]
+    fn a_secondary_window_is_captured_too() {
+        let two = r#"{"timestamp":"2026-08-12T04:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"total_tokens":11}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0,"window_minutes":300,"resets_at":10},"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":20},"plan_type":"plus"}}}"#;
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, two] {
+            st.parse_line(l);
+        }
+        let (_, v) = st.quota().unwrap();
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.plan, "plus");
+        assert_eq!(q.windows.len(), 2);
+        assert_eq!(q.windows[0].label, "5h");
+        assert_eq!(q.windows[1].label, "Week");
+    }
+
+    #[test]
+    fn quota_survives_a_carry_round_trip() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, rl("2026-08-12T04:00:02.000Z", 4.0, 10080, 7).as_str()] {
+            st.parse_line(l);
+        }
+        let saved = st.carry().unwrap();
+        let st2 = p.new_file_state(Some(&saved));
+        let (_, v) = st2.quota().expect("quota must survive the manifest round-trip");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.windows[0].used_percent, 4.0);
     }
 
 }
