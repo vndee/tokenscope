@@ -2,6 +2,7 @@
 // one session per file. See docs/superpowers/specs/2026-08-12-codex-tracking-design.md.
 use super::{AccountSpec, AgentDescriptor, FileState, LogParser};
 use crate::config::{self, UserConfig};
+use crate::model::{QuotaSnapshot, QuotaWindow};
 use crate::store::RawEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,6 +140,8 @@ struct Carry {
     /// without this latch it would re-arm the skip mid-file and swallow the
     /// fork's real usage.
     replay_armed: bool,
+    /// Newest rate_limits seen in this file: (event ts_ms, snapshot).
+    quota: Option<(i64, QuotaSnapshot)>,
 }
 
 pub(super) struct CodexParser;
@@ -233,6 +236,72 @@ fn uuid7_ms(id: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(&hex, 16).ok()
+}
+
+/// Render a reset time the way Claude's CLI prints one, so a Codex row and a
+/// Claude row in the same panel read identically instead of looking like two
+/// different features: "Aug 20 at 10:32am", and "Aug 20 at 1am" when the minutes
+/// are zero — Claude omits ":00", live output shows both shapes. Local time,
+/// like the CLI's. Formatting here rather than in the frontend keeps one
+/// rendering for both agents and one field for the UI to read.
+///
+/// `secs` is unix **seconds** — Codex's `resets_at` is seconds, not millis;
+/// reading it as millis lands in 1970.
+fn format_resets_label(secs: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone, Timelike};
+    let Some(dt) = Local.timestamp_opt(secs, 0).single() else {
+        return String::new();
+    };
+    let hour12 = match dt.hour() % 12 {
+        0 => 12,
+        h => h,
+    };
+    let suffix = if dt.hour() < 12 { "am" } else { "pm" };
+    // %b is chrono's fixed English abbreviation ("Aug"), matching the CLI.
+    match dt.minute() {
+        0 => format!("{} {} at {hour12}{suffix}", dt.format("%b"), dt.day()),
+        m => format!("{} {} at {hour12}:{m:02}{suffix}", dt.format("%b"), dt.day()),
+    }
+}
+
+/// One `primary`/`secondary` limit block → a window. `window_minutes` names it:
+/// 10080 is a week, 300 is Codex's 5-hour window; anything else is reported in
+/// hours rather than invented.
+fn quota_window(v: &Value) -> Option<QuotaWindow> {
+    let used = v.get("used_percent").and_then(|x| x.as_f64())?;
+    let mins = v.get("window_minutes").and_then(|x| x.as_u64()).unwrap_or(0);
+    let label = match mins {
+        10080 => "Week".to_string(),
+        300 => "5h".to_string(),
+        0 => "Limit".to_string(),
+        m if m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    };
+    // Unlike Claude, Codex gives a machine timestamp, so both fields are filled:
+    // `resets_at` for anything that needs to compute, the label for display.
+    let resets_at = v.get("resets_at").and_then(|x| x.as_i64());
+    let resets_label = resets_at.map(format_resets_label).unwrap_or_default();
+    Some(QuotaWindow { label, used_percent: used, resets_at, resets_label })
+}
+
+/// A `rate_limits` payload → a snapshot. None when it carries no usable window,
+/// so a null or unrecognised shape never overwrites a good earlier reading.
+fn quota_from_rate_limits(v: &Value, source_at: i64) -> Option<QuotaSnapshot> {
+    let mut windows = Vec::new();
+    for key in ["primary", "secondary"] {
+        if let Some(w) = v.get(key).filter(|x| !x.is_null()).and_then(quota_window) {
+            windows.push(w);
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(QuotaSnapshot {
+        plan: v.get("plan_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        windows,
+        fetched_at: source_at,
+        source_at,
+    })
 }
 
 impl CodexState {
@@ -340,6 +409,14 @@ impl CodexState {
     }
 
     fn on_token_count(&mut self, p: &Value, ts_ms: i64) -> Option<RawEvent> {
+        if let Some(rl) = p.get("rate_limits").filter(|v| !v.is_null()) {
+            if let Some(q) = quota_from_rate_limits(rl, ts_ms) {
+                if self.c.quota.as_ref().map(|(prev, _)| ts_ms >= *prev).unwrap_or(true) {
+                    self.c.quota = Some((ts_ms, q));
+                }
+            }
+        }
+
         let t = p.get("info")?.get("total_token_usage")?;
         let cur = Cum {
             input: num(t, "input_tokens"),
@@ -473,6 +550,11 @@ impl FileState for CodexState {
 
     fn carry(&self) -> Option<Value> {
         serde_json::to_value(&self.c).ok()
+    }
+
+    fn quota(&self) -> Option<(i64, Value)> {
+        let (ts, q) = self.c.quota.as_ref()?;
+        Some((*ts, serde_json::to_value(q).ok()?))
     }
 }
 
@@ -979,4 +1061,119 @@ mod tests {
         assert_eq!(ev[0].tool_errors, 0);
     }
 
+    fn rl(ts: &str, used: f64, window: u64, resets: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"total_tokens":11}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":{window},"resets_at":{resets}}},"secondary":null,"plan_type":"pro"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn rate_limits_become_a_quota_snapshot() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, rl("2026-08-12T04:00:02.000Z", 12.5, 10080, 1787196735).as_str()] {
+            st.parse_line(l);
+        }
+        let (ts, v) = st.quota().expect("a quota snapshot");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.plan, "pro");
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].label, "Week");
+        assert_eq!(q.windows[0].used_percent, 12.5);
+        assert_eq!(q.windows[0].resets_at, Some(1787196735));
+        // Both fields are filled: the timestamp for anything that computes, and
+        // a display label so a Codex row reads like a Claude one instead of
+        // showing a bare percentage. (Exact text is asserted TZ-independently
+        // below; here it only has to be present and consistent.)
+        assert_eq!(q.windows[0].resets_label, format_resets_label(1787196735));
+        assert!(!q.windows[0].resets_label.is_empty());
+        assert_eq!(ts, 1786507202000); // the event's own timestamp, in ms
+    }
+
+    /// The expected strings are built from a *local* datetime, so these assert
+    /// the format without depending on the machine's timezone (Asia/Saigon here,
+    /// UTC in CI).
+    #[test]
+    fn a_reset_time_is_rendered_the_way_claudes_cli_prints_one() {
+        use chrono::{Local, TimeZone};
+        let at = Local.with_ymd_and_hms(2026, 8, 20, 10, 32, 15).single().unwrap();
+        assert_eq!(format_resets_label(at.timestamp()), "Aug 20 at 10:32am");
+    }
+
+    #[test]
+    fn a_reset_time_on_the_hour_omits_the_minutes() {
+        // Claude prints "Aug 20 at 1am", never "1:00am" — verified against live
+        // CLI output, which shows both shapes. A Codex row sitting next to a
+        // Claude one in the same panel must not be styled differently.
+        use chrono::{Local, TimeZone};
+        let at = Local.with_ymd_and_hms(2026, 8, 20, 1, 0, 0).single().unwrap();
+        assert_eq!(format_resets_label(at.timestamp()), "Aug 20 at 1am");
+    }
+
+    #[test]
+    fn midnight_and_noon_read_as_12am_and_12pm() {
+        use chrono::{Local, TimeZone};
+        let midnight = Local.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        assert_eq!(format_resets_label(midnight.timestamp()), "Jan 1 at 12am");
+        let noon = Local.with_ymd_and_hms(2026, 12, 31, 12, 5, 0).single().unwrap();
+        assert_eq!(format_resets_label(noon.timestamp()), "Dec 31 at 12:05pm");
+    }
+
+    #[test]
+    fn a_window_without_a_reset_time_gets_an_empty_label() {
+        let v: Value =
+            serde_json::from_str(r#"{"used_percent":3.0,"window_minutes":300}"#).unwrap();
+        let w = quota_window(&v).expect("a window");
+        assert_eq!(w.resets_at, None);
+        assert_eq!(w.resets_label, "");
+    }
+
+    #[test]
+    fn the_newest_rate_limits_wins_and_a_null_one_does_not_erase_it() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        let null_rl = r#"{"timestamp":"2026-08-12T04:00:09.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":99,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":9,"total_tokens":108}},"rate_limits":null}}"#;
+        for l in [
+            META,
+            CTX,
+            rl("2026-08-12T04:00:02.000Z", 5.0, 10080, 1).as_str(),
+            rl("2026-08-12T04:00:05.000Z", 9.0, 10080, 2).as_str(),
+            null_rl,
+        ] {
+            st.parse_line(l);
+        }
+        let (_, v) = st.quota().expect("a quota snapshot");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.windows[0].used_percent, 9.0);
+    }
+
+    #[test]
+    fn a_secondary_window_is_captured_too() {
+        let two = r#"{"timestamp":"2026-08-12T04:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"total_tokens":11}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0,"window_minutes":300,"resets_at":10},"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":20},"plan_type":"plus"}}}"#;
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, two] {
+            st.parse_line(l);
+        }
+        let (_, v) = st.quota().unwrap();
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.plan, "plus");
+        assert_eq!(q.windows.len(), 2);
+        assert_eq!(q.windows[0].label, "5h");
+        assert_eq!(q.windows[1].label, "Week");
+    }
+
+    #[test]
+    fn quota_survives_a_carry_round_trip() {
+        let p = CodexParser;
+        let mut st = p.new_file_state(None);
+        for l in [META, CTX, rl("2026-08-12T04:00:02.000Z", 4.0, 10080, 7).as_str()] {
+            st.parse_line(l);
+        }
+        let saved = st.carry().unwrap();
+        let st2 = p.new_file_state(Some(&saved));
+        let (_, v) = st2.quota().expect("quota must survive the manifest round-trip");
+        let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(q.windows[0].used_percent, 4.0);
+    }
 }

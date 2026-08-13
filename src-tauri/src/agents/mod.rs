@@ -33,6 +33,12 @@ pub trait FileState {
     fn carry(&self) -> Option<serde_json::Value> {
         None
     }
+    /// Newest agent-reported quota seen in this file: (source timestamp ms, a
+    /// serialized `model::QuotaSnapshot`). Opaque here so `store.rs` stays
+    /// agent-agnostic. Default None for agents that report no quota.
+    fn quota(&self) -> Option<(i64, serde_json::Value)> {
+        None
+    }
 }
 
 pub trait LogParser: Send + Sync {

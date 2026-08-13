@@ -4,9 +4,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme,
+  Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme, QuotaSnapshot,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
-  fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod,
+  fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale,
   fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak, weekdayRhythm,
 } from "./data";
 import {
@@ -139,6 +139,96 @@ const SectionRule = ({ t, m = "12px 0 10px" }: { t: Theme; m?: string }) => (
 const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
   <span style={{ font: `600 10px ${t.ui}`, color: t.dim, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{children}</span>
 );
+// Plan quota for the selected account. Hidden entirely when unknown — showing
+// an unknown quota as 0% would read as "plenty left", the most costly possible
+// misreading. A figure older than QUOTA_STALE_MS dims, because a stale quota
+// presented as current is worse than none.
+//
+// `onRefresh` is passed only for a Claude account, whose figure is fetched on
+// demand rather than polled (see the `refresh_quota` command): the block then
+// stays visible even with nothing to show, because otherwise the control that
+// produces the first reading would be unreachable.
+//
+// A Claude account also carries the CLI's own caveat, once under the block
+// rather than per row. Claude Code prints it verbatim next to these numbers,
+// and it changes how they should be read: on a second machine the figures are
+// systematically low, so the 80% tray warning fires late or not at all. Codex
+// rows get no such line — those figures come from the service itself.
+//
+// `onPurge` is the manual fallback for the automatic cleanup that follows every
+// check. That cleanup swallows IO errors so a failure can never cost a good
+// reading, which means a persistent failure would be silent — this is the way
+// out by hand. Deliberately placed below the block rather than beside Refresh:
+// it deletes files, and the control people press often should not sit a few
+// pixels from the one that does that.
+function QuotaBlock({ t, q, agent, busy, onRefresh, onPurge, purging }:
+  { t: Theme; q: QuotaSnapshot | null; agent: string | null; busy: boolean;
+    onRefresh?: () => void; onPurge?: () => void; purging?: boolean }) {
+  const windows = q && q.windows.length > 0 ? q.windows : null;
+  if (!windows && !onRefresh) return null;
+  const stale = !!q && isQuotaStale(q.sourceAt);
+  const mins = q ? Math.max(0, Math.round((Date.now() - q.sourceAt) / 60000)) : 0;
+  const age = mins < 1 ? "just now" : mins < 60 ? `${mins}m ago` : `${Math.round(mins / 60)}h ago`;
+  // The staleness dimming covers the figures, not the control that fixes them.
+  const dim = { opacity: stale ? 0.45 : 1 };
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div data-no-drag="" style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, marginBottom: 7, cursor: "default" }}>
+        <span style={dim}><Label t={t}>Plan usage{q?.plan ? ` · ${q.plan}` : ""}</Label></span>
+        <span style={{ display: "flex", alignItems: "baseline", gap: 7, flex: "0 0 auto" }}>
+          {q && <span style={{ font: `500 9px ${t.mono}`, color: t.faint, ...dim }}>as of {age}</span>}
+          {onRefresh && (
+            <button onClick={onRefresh} disabled={busy}
+              title="Ask the Claude CLI for this account's plan usage — a few seconds per account"
+              style={{
+                font: `600 9.5px ${t.ui}`, color: busy ? t.faint : t.accent,
+                background: "none", border: "none", padding: 0,
+                cursor: busy ? "default" : "pointer", whiteSpace: "nowrap",
+              }}>{busy ? "Checking…" : q ? "Refresh" : "Check now"}</button>
+          )}
+        </span>
+      </div>
+      <div style={dim}>
+        {windows ? windows.map((w) => (
+          <div key={w.label} style={{ marginBottom: 6 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 3 }}>
+              <span>{w.label}</span>
+              <span>
+                <span style={{ color: w.usedPercent >= 80 ? "#e0795f" : t.text, fontWeight: 600 }}>{w.usedPercent}%</span>
+                {w.resetsLabel ? <span style={{ color: t.faint }}> · resets {w.resetsLabel}</span> : null}
+              </span>
+            </div>
+            <div style={{ height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
+              <div style={{ width: `${Math.min(100, Math.max(0, w.usedPercent))}%`, height: "100%", borderRadius: 3, background: w.usedPercent >= 80 ? "#e0795f" : t.accent }} />
+            </div>
+          </div>
+        )) : (
+          <div style={{ font: `500 10px ${t.mono}`, color: t.faint }}>
+            {busy ? "Asking the Claude CLI…" : "Not checked yet"}
+          </div>
+        )}
+      </div>
+      {agent === "claude" && windows && (
+        <div style={{ font: `500 9px/1.45 ${t.mono}`, color: t.faint, marginTop: 5, ...dim }}>
+          Claude calls these approximate: they count local sessions on this
+          machine only, not other devices or claude.ai.
+        </div>
+      )}
+      {onPurge && (
+        <div data-no-drag="" style={{ marginTop: 5, cursor: "default" }}>
+          <button onClick={onPurge} disabled={purging}
+            title="Each check makes Claude Code write a session log, which Tokenscope deletes right after. This removes any that were left behind."
+            style={{
+              font: `500 9px ${t.mono}`, color: t.faint,
+              background: "none", border: "none", padding: 0,
+              cursor: purging ? "default" : "pointer", textDecoration: "underline",
+              textUnderlineOffset: 2, textDecorationColor: t.gridLine,
+            }}>{purging ? "Cleaning up…" : "Clean up leftover check logs"}</button>
+        </div>
+      )}
+    </div>
+  );
+}
 // Tiny per-agent mark on each tab, so a Claude and a Codex account are
 // distinguishable without spending a second row of navigation on it.
 const AgentBadge = ({ t, agent }: { t: Theme; agent: string }) => {
@@ -309,7 +399,7 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
   );
 }
 
-function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean }) {
+function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -363,6 +453,21 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
     color: disabled ? t.faint : t.dim, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.5 : 1,
   });
 
+  // Claude plan quota, fetched on demand. Each account costs ~4.5s of `claude
+  // -p "/usage"` and they run sequentially in Rust, so the control holds an
+  // in-flight state for the whole run rather than letting the panel look frozen.
+  // Only offered for a Claude account inside the Tauri runtime: Codex's quota
+  // comes from its logs and needs no fetch, and the "All" tab has no single
+  // account to fetch for.
+  const [quotaBusy, setQuotaBusy] = useState(false);
+  const canRefreshQuota = quotaAgent === "claude" && typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const refreshQuota = async () => {
+    if (quotaBusy) return;
+    setQuotaBusy(true);
+    try { await invoke("refresh_quota"); } catch {}
+    finally { setQuotaBusy(false); }
+  };
+
   // screenshot capture: rasterize the full panel card to a PNG and hand it to
   // the Rust `save_screenshot` command (browser preview falls back to a download).
   const [shotBusy, setShotBusy] = useState(false);
@@ -373,6 +478,23 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
     setToast({ msg, ok });
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   };
+
+  // Manual purge of leftover `/usage` check logs. Pressing it is the
+  // authorisation, so there is no confirm step — but it always reports what it
+  // did, including "nothing", since a silent no-op on a maintenance action
+  // reads as a failure. Declared here rather than beside refreshQuota because
+  // it needs showToast.
+  const [purging, setPurging] = useState(false);
+  const purgeQuotaLogs = async () => {
+    if (purging) return;
+    setPurging(true);
+    try {
+      const n = await invoke<number>("purge_quota_logs");
+      showToast(n === 0 ? "No leftover logs" : `Removed ${n} log${n === 1 ? "" : "s"}`, true);
+    } catch { showToast("Cleanup failed", false); }
+    finally { setPurging(false); }
+  };
+
   const captureScreenshot = async () => {
     if (shotBusy) return;
     const el = document.querySelector<HTMLElement>(".om-scroll");
@@ -527,6 +649,9 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
         </div>
         <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
+        <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy}
+          onRefresh={canRefreshQuota ? refreshQuota : undefined}
+          onPurge={canRefreshQuota ? purgeQuotaLogs : undefined} purging={purging} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
@@ -853,6 +978,14 @@ export default function App() {
   const selected = activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
   const dash = selected ?? ws.all;
   const effectiveTab = selected ? activeTab : "all";
+  // Per-account plan quota; the aggregate "All" tab has no single quota to show.
+  // With one account there's no real "all" (see tabs above) — that lone account's
+  // quota is the one to show even though effectiveTab reads "all". Its agent
+  // travels with it: Claude's figure is fetched on demand, Codex's is not.
+  const quotaAccount = ws.accounts.length === 1
+    ? ws.accounts[0]
+    : effectiveTab === "all" ? null : ws.accounts.find((a) => a.id === effectiveTab) ?? null;
+  const quota = quotaAccount?.quota ?? null;
 
   // The report to show: the live current period from the workspace, or the
   // on-demand fetched past period. `dash` here reflects the selected account.
@@ -909,6 +1042,8 @@ export default function App() {
       onDrillDay={drillDay}
       onTrendPick={trendPick}
       loading={loadingPeriod}
+      quota={quota}
+      quotaAgent={quotaAccount?.agent ?? null}
     />
   );
 }

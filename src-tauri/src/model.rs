@@ -1,5 +1,5 @@
 // Shared data structures returned to the frontend.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SeriesPoint {
@@ -137,6 +137,9 @@ pub struct AccountData {
     pub label: String, // friendly name (org / display name / email / dir)
     pub email: String, // account email if known (may be empty)
     pub agent: String, // owning CLI ("claude" / "codex") — drives the tab badge
+    /// Plan quota for this account, when known. `None` renders as absence — the
+    /// UI must never show it as zero.
+    pub quota: Option<QuotaSnapshot>,
     pub dash: Dashboard,
 }
 
@@ -149,4 +152,32 @@ pub struct Workspace {
     pub all: Dashboard,
     #[serde(rename = "todayTokens")]
     pub today_tokens: f64,
+}
+
+/// One rolling limit window on a plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    pub label: String, // "5h" / "Week" / "Session" / "Week (all models)"
+    #[serde(rename = "usedPercent")]
+    pub used_percent: f64,
+    /// Unix seconds, when the source gives a machine timestamp — Codex does.
+    /// None for Claude, whose CLI prints only a human string with no year.
+    #[serde(rename = "resetsAt")]
+    pub resets_at: Option<i64>,
+    /// Human reset text for display, e.g. "Aug 20 at 12:59am". Empty if absent.
+    #[serde(rename = "resetsLabel", default)]
+    pub resets_label: String,
+}
+
+/// An account's plan quota as of a point in time. `source_at` is when the data
+/// was true; `fetched_at` is when we observed it. They differ for Codex, whose
+/// figures come from the last logged event and can be days old.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    pub plan: String,
+    pub windows: Vec<QuotaWindow>,
+    #[serde(rename = "fetchedAt")]
+    pub fetched_at: i64,
+    #[serde(rename = "sourceAt")]
+    pub source_at: i64,
 }

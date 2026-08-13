@@ -63,7 +63,32 @@ Current week (Fable): 0% used
 Measured properties:
 
 - **~4.5 s per call** (two runs: 4.4 s, 4.6 s).
-- **Consumes no quota** — it creates no session log under `~/.claude/projects/`.
+- **Consumes no plan quota, but is not free of side effects.** The written log
+  contains no `assistant` line and no `message.usage` block, so no tokens, no
+  cost and no plan quota are consumed. That is the whole of what was measured:
+  whether the CLI makes any network call at all was never observed, so this
+  document does not claim it. It *does* write a session log: one new
+  `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` per call, 12,413 bytes on
+  2026-08-13 with Claude Code 2.1.229. That file carries a fresh `sessionId` and
+  a `<command-name>/usage</command-name>` user line, which Tokenscope ingests
+  like any other log — so a poller that left them behind would both grow the
+  user's data directory and inflate Tokenscope's own session count.
+
+  **Correction.** An earlier revision of this document asserted the opposite
+  ("it creates no session log under `~/.claude/projects/`") as a measured fact.
+  That measurement used `find … -newermt '-3 minutes'`, GNU-relative syntax that
+  BSD `find` on macOS matches nothing for, so it returned an empty result that
+  was read as "nothing was written". The claim above was re-measured with a
+  plain count instead: 549 `.jsonl` files under `~/.claude/projects` before one
+  `claude -p "/usage"`, 550 after, the new file identified with
+  `find … -newer <stamp-file>`. Measure side effects with a method that fails
+  loudly, and re-measure at the end of the branch.
+
+  **Re-measured at the end of the branch**, with the scratch directory and
+  cleanup in place: 1323 `.jsonl` files across both accounts' `projects` trees
+  before a two-account fetch, 1323 after, and both
+  `projects/-Users-vndee-Library-Caches-tokenscope-tokenscope-quota-probe/`
+  directories empty. Plain counts again, not a `find` predicate.
 - **Per-account works**: `CLAUDE_CONFIG_DIR=<dir> claude -p "/usage"` returns that
   account's figures. Confirmed distinct across the two accounts here (default
   session 15% / week 2%; work session 5% / week 16%).
@@ -134,9 +159,45 @@ A poller separate from the ingest loop, because it spawns a process rather than
 reading a file:
 
 - runs `CLAUDE_CONFIG_DIR=<account dir> claude -p "/usage"` per Claude account
-- on panel open, and on a 5-minute timer
+- **once shortly after launch, then every 60 minutes, plus a Refresh control**
+  in the panel's quota block wired to a `refresh_quota` command. The first run
+  cannot wait for the interval: the quota cache is in-memory, so an app started
+  at login would otherwise show no Claude figure and raise no tray warning for
+  its first hour — the exact gap the tick exists to close. Each call writes a
+  12 KB session log into the account's own `projects` directory (see the
+  measured properties above), so the poll runs with its current directory set to
+  `~/Library/Caches/tokenscope/tokenscope-quota-probe` and deletes that log
+  immediately afterwards, per account, whatever the run's outcome. At hourly cadence with
+  cleanup the steady state on disk is zero files, which is what makes polling
+  acceptable at all.
+
+  An earlier revision of this section specified manual-only refresh with no
+  timer. That removed the write amplification but broke the tray warning:
+  `pick_alert` skips a quota older than 30 minutes, so a figure only a click
+  could refresh went quiet between clicks, leaving the 80% alert effectively
+  Codex-only. Hourly restores it. The two intervals stay independent, so a
+  Claude warning is live for the first half of each hour and quiet for the
+  second — a deliberate consequence, not a bug to fix; the panel shows the
+  figure with its honest "as of" label throughout.
+- **the cleanup is conservative to the point of paranoia**, because it unlinks
+  files inside the user's Claude data directory: only a directory directly under
+  `projects/` whose name *ends with* `tokenscope-quota-probe` (Claude's slug algorithm is
+  never reconstructed — no match means do nothing), only `.jsonl` files directly
+  inside it, files only and never directories, and each file must be read and
+  found to contain the `/usage` marker with no `"type":"assistant"` line before
+  it goes. Every IO error is swallowed: a failed cleanup must never cost a good
+  reading.
+- **a manual purge** under the plan block covers the case where that silent
+  best-effort cleanup persistently fails, and also the logs written before the
+  scratch directory existed — those sit in ordinary project directories the
+  basename match cannot see. It therefore matches on content with a stricter
+  predicate (`/usage` present, no assistant line, *and* no user line other than
+  the caveat and the `/usage` echo), and reports how many files it removed.
 - sequentially, not in parallel — N accounts × 4.5 s of CPU at once is rude on a
-  background menu-bar app
+  background menu-bar app. The control therefore holds a disabled, in-flight
+  state ("Checking…") for the whole run rather than letting the panel look frozen.
+- the cache is in-memory, so a Claude account shows no quota until the first
+  poll or manual refresh of that app session
 - caches the parsed result; a failed run keeps the previous snapshot and marks it
   stale rather than blanking the display
 - `source_at` == `fetched_at`, since the CLI reports live figures
@@ -207,17 +268,34 @@ window is high, since the label has no room for it.
 - Staleness: a snapshot older than the threshold dims and does not trigger the
   tray warning.
 - Tray selection: highest percentage across accounts wins; stale entries excluded.
+- The poll-log identification predicates, as free functions rather than inlined
+  in the delete loop: a genuine poll log, one with an assistant line, one with
+  no `/usage` marker, one with an unparseable line, a non-`.jsonl` file, a
+  sibling project directory, a missing directory (a silent no-op), and — for the
+  stricter purge predicate — a session with `/usage` *plus* real work, which
+  must be kept.
 - Manual: compare the panel against `claude -p "/usage"` run by hand for both
-  accounts, and against the Codex figure in the newest rollout file.
+  accounts, and against the Codex figure in the newest rollout file. Count
+  `.jsonl` files under both accounts' `projects` trees before and after a fetch
+  (a plain count, never a `find` predicate) and confirm the total is unchanged.
 
 ## Risks
 
 - **The `/usage` output format is not a contract.** A Claude Code release can
   change it. Mitigated by fail-soft parsing and format-locking tests, not
   eliminated.
-- **Spawning a process every 5 minutes** is heavier than this app's existing
-  work. Sequential execution and the 5-minute floor keep it modest, but it is a
-  real change in the app's resource profile.
+- **Spawning a process on a timer** is heavier than this app's existing work.
+  Sequential execution and the 60-minute interval keep it modest, but it is a
+  real change in the app's resource profile. (An earlier revision proposed 5
+  minutes; at ~288 calls/day/account the session logs it wrote dominated
+  Tokenscope's own numbers — 16 of 18 sessions in one day — which is what
+  forced both the cleanup and the slower cadence.)
+- **The cleanup deletes files inside the user's data directory.** Every guard
+  above exists to bound that: the scratch-directory match, the `.jsonl`
+  restriction, files-only, and the read-and-verify before each unlink. The
+  residual risk is a `/usage`-only session a user started by hand in the
+  scratch directory, which nothing can distinguish from ours — and which
+  nobody can start, because it is an application cache directory.
 - **`claude` must be locatable from the app's environment.** A GUI app launched
   at login does not inherit a shell `PATH`, so resolution is deliberate and
   ordered: `PATH` first, then `~/.local/bin/claude` (the native install's

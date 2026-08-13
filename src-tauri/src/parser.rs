@@ -287,7 +287,12 @@ fn account_events(
     a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
-) -> (Vec<Event>, HashSet<String>, HashSet<String>) {
+) -> (
+    Vec<Event>,
+    HashSet<String>,
+    HashSet<String>,
+    Option<crate::model::QuotaSnapshot>,
+) {
     let mut store = Store::load(&a.id);
     let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
     if store.prune_before(cutoff) {
@@ -313,7 +318,22 @@ fn account_events(
             e
         })
         .collect();
-    (events, cfg.mcp_servers, cfg.skills)
+    // Codex reports quota in its logs; Claude's arrives from the poller cache.
+    let quota = match d.id {
+        "claude" => crate::quota::cached(&a.id),
+        _ => store
+            .quota
+            .as_ref()
+            .and_then(|(ts, v)| {
+                serde_json::from_value::<crate::model::QuotaSnapshot>(v.clone())
+                    .ok()
+                    .map(|mut q| {
+                        q.source_at = *ts;
+                        q
+                    })
+            }),
+    };
+    (events, cfg.mcp_servers, cfg.skills, quota)
 }
 
 /// Build a per-account dashboard for every discovered Claude account, plus an
@@ -338,7 +358,7 @@ pub fn build_workspace() -> Workspace {
     let mut all_skills: HashSet<String> = HashSet::new();
 
     for (d, a) in crate::agents::discover_all() {
-        let (events, servers, skills) = account_events(d, &a, &pricing, cutoff);
+        let (events, servers, skills, quota) = account_events(d, &a, &pricing, cutoff);
         let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
         all_servers.extend(servers);
         all_skills.extend(skills);
@@ -348,6 +368,7 @@ pub fn build_workspace() -> Workspace {
             label: a.label,
             email: a.email,
             agent: a.agent.to_string(),
+            quota,
             dash,
         });
     }
@@ -381,7 +402,7 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk) = account_events(d, &a, &pricing, cutoff);
+        let (ev, srv, sk, _) = account_events(d, &a, &pricing, cutoff);
         events.extend(ev);
         servers.extend(srv);
         skills.extend(sk);
@@ -500,14 +521,21 @@ impl Agg {
         self.savings += e.savings;
         self.tool_results += e.tool_results;
         self.tool_errors += e.tool_errors;
-        if !e.session.is_empty() {
-            self.sessions.insert(e.session.clone());
-        }
         // An empty model marks an event that is not an LLM request: Claude's
         // slash-command events and Codex's tool/MCP/skill records. Only real API
         // turns may inflate the request count or the model split — a Codex
         // session emits roughly twice as many tool records as turns.
+        //
+        // `sessions` is gated the same way, and for the same reason: a session
+        // that never made a request did no work, so counting it fabricates
+        // activity. Concretely, `claude -p "/usage"` writes a whole session log
+        // containing only a slash-command line, and without this guard every
+        // quota fetch — which Tokenscope itself triggers — added one phantom
+        // session to the app's own headline metric.
         if !e.model.is_empty() {
+            if !e.session.is_empty() {
+                self.sessions.insert(e.session.clone());
+            }
             self.requests += 1;
             let tok = e.input + e.cache + e.output;
             // model totals keep all token types so shares sum to Total tokens
@@ -913,6 +941,53 @@ fn build_heatmap(events: &[Event], today: chrono::NaiveDate) -> Vec<HeatDay> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare Event for Agg tests. An empty `model` is the store's marker for a
+    /// record that is not an LLM request (Claude's slash-command lines, Codex's
+    /// tool/MCP/skill records).
+    fn ev(session: &str, model: &str) -> Event {
+        Event {
+            ts: Local::now(),
+            session: session.to_string(),
+            model: model.to_string(),
+            input: 0.0,
+            cache: 0.0,
+            output: 0.0,
+            cost: 0.0,
+            savings: 0.0,
+            priced: false,
+            project: String::new(),
+            branch: String::new(),
+            account: String::new(),
+            tools: Vec::new(),
+            sidechain: false,
+            tool_results: 0,
+            tool_errors: 0,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_session_that_made_no_request_is_not_counted() {
+        // `claude -p "/usage"` writes a whole session log whose only content is
+        // the slash-command line: a fresh sessionId, no assistant message, no
+        // model. Counting it lets a quota fetch inflate the app's own metric.
+        let mut agg = Agg::default();
+        agg.add(&ev("usage-poll-session", ""));
+        assert_eq!(agg.sessions.len(), 0);
+        assert_eq!(agg.requests, 0);
+    }
+
+    #[test]
+    fn a_session_counts_once_a_real_request_lands_in_it() {
+        let mut agg = Agg::default();
+        agg.add(&ev("real-session", "")); // a slash command…
+        agg.add(&ev("real-session", "claude-opus-5")); // …then actual work
+        agg.add(&ev("real-session", "claude-opus-5"));
+        assert_eq!(agg.sessions.len(), 1);
+        assert_eq!(agg.requests, 2);
+    }
 
     #[test]
     fn codex_models_are_attributed_to_openai() {
