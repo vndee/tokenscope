@@ -148,8 +148,14 @@ const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
 // demand rather than polled (see the `refresh_quota` command): the block then
 // stays visible even with nothing to show, because otherwise the control that
 // produces the first reading would be unreachable.
-function QuotaBlock({ t, q, busy, onRefresh }:
-  { t: Theme; q: QuotaSnapshot | null; busy: boolean; onRefresh?: () => void }) {
+//
+// A Claude account also carries the CLI's own caveat, once under the block
+// rather than per row. Claude Code prints it verbatim next to these numbers,
+// and it changes how they should be read: on a second machine the figures are
+// systematically low, so the 80% tray warning fires late or not at all. Codex
+// rows get no such line — those figures come from the service itself.
+function QuotaBlock({ t, q, agent, busy, onRefresh }:
+  { t: Theme; q: QuotaSnapshot | null; agent: string | null; busy: boolean; onRefresh?: () => void }) {
   const windows = q && q.windows.length > 0 ? q.windows : null;
   if (!windows && !onRefresh) return null;
   const stale = !!q && isQuotaStale(q.sourceAt);
@@ -194,6 +200,12 @@ function QuotaBlock({ t, q, busy, onRefresh }:
           </div>
         )}
       </div>
+      {agent === "claude" && windows && (
+        <div style={{ font: `500 9px/1.45 ${t.mono}`, color: t.faint, marginTop: 5, ...dim }}>
+          Claude calls these approximate: they count local sessions on this
+          machine only, not other devices or claude.ai.
+        </div>
+      )}
     </div>
   );
 }
@@ -600,7 +612,7 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
         </div>
         <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
-        <QuotaBlock t={t} q={quota} busy={quotaBusy} onRefresh={canRefreshQuota ? refreshQuota : undefined} />
+        <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy} onRefresh={canRefreshQuota ? refreshQuota : undefined} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
