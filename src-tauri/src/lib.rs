@@ -67,34 +67,46 @@ fn pick_alert(
     best
 }
 
+/// Sets the tray's title and tooltip from `ws`: the combined today total,
+/// plus a `pick_alert` warning when some window is nearly spent. Shared by
+/// the 30s background refresh and the panel's on-open fetch (`get_workspace`)
+/// so the two paths can never drift out of sync with each other again — they
+/// previously duplicated this logic, and the on-open path fell behind when
+/// the alert was added, silently clearing the warning every time the popover
+/// opened (the app's primary interaction).
+fn update_tray(app: &tauri::AppHandle, ws: &Workspace) {
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    let label = fmt_tokens_m(ws.today_tokens);
+    let pairs: Vec<(String, Option<model::QuotaSnapshot>)> = ws
+        .accounts
+        .iter()
+        .map(|a| (a.label.clone(), a.quota.clone()))
+        .collect();
+    let alert = pick_alert(&pairs, now_ms());
+    // macOS renders set_title as plain text and controls its colour, so the
+    // warning is a marker glyph rather than a recolour. Windows makes
+    // set_title a no-op, which is why the tooltip carries the detail.
+    let title = match &alert {
+        Some(_) => format!("{label} ⚠"),
+        None => label.clone(),
+    };
+    let tip = match &alert {
+        Some((acct, win, pct)) => {
+            format!("Tokenscope · today {label}\n{acct}: {win} {pct:.0}% used")
+        }
+        None => format!("Tokenscope · today {label}"),
+    };
+    let _ = tray.set_title(Some(title));
+    let _ = tray.set_tooltip(Some(tip));
+}
+
 /// Rebuild the dashboard (incremental), update the tray's token count, and push
 /// the fresh data to the UI so an open popover updates live.
 fn refresh(app: &tauri::AppHandle) {
     let ws = parser::build_workspace();
-    if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(ws.today_tokens);
-        let pairs: Vec<(String, Option<model::QuotaSnapshot>)> = ws
-            .accounts
-            .iter()
-            .map(|a| (a.label.clone(), a.quota.clone()))
-            .collect();
-        let alert = pick_alert(&pairs, now_ms());
-        // macOS renders set_title as plain text and controls its colour, so the
-        // warning is a marker glyph rather than a recolour. Windows makes
-        // set_title a no-op, which is why the tooltip carries the detail.
-        let title = match &alert {
-            Some(_) => format!("{label} ⚠"),
-            None => label.clone(),
-        };
-        let tip = match &alert {
-            Some((acct, win, pct)) => {
-                format!("Tokenscope · today {label}\n{acct}: {win} {pct:.0}% used")
-            }
-            None => format!("Tokenscope · today {label}"),
-        };
-        let _ = tray.set_title(Some(title));
-        let _ = tray.set_tooltip(Some(tip));
-    }
+    update_tray(app, &ws);
     // Milestones track combined usage (the aggregate "All" dashboard).
     check_milestones(app, &ws.all);
     let _ = app.emit("dashboard-updated", &ws);
@@ -718,16 +730,11 @@ async fn get_workspace(app: tauri::AppHandle) -> Workspace {
     let ws = tauri::async_runtime::spawn_blocking(parser::build_workspace)
         .await
         .unwrap_or_else(|_| parser::build_workspace());
-    // Sync the tray count to this freshly-fetched value. The panel refetches the
-    // instant it opens, while the tray otherwise only refreshes every 30s — so
-    // without this the two could disagree for up to 30s during heavy usage.
-    if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(ws.today_tokens);
-        let _ = tray.set_title(Some(label.clone()));
-        // Mirror refresh(): keep the tooltip in sync for Windows, where the
-        // title isn't shown next to the icon.
-        let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
-    }
+    // Sync the tray to this freshly-fetched value via the same alert-aware
+    // path as refresh() (update_tray). The panel refetches the instant it
+    // opens, while the tray otherwise only refreshes every 30s — so without
+    // this the two could disagree for up to 30s during heavy usage.
+    update_tray(&app, &ws);
     check_milestones(&app, &ws.all);
     ws
 }
@@ -1267,10 +1274,14 @@ mod tests {
     #[test]
     fn the_highest_window_across_accounts_drives_the_alert() {
         let now = now_ms();
-        let a = snap(now, &[("Session", 20.0), ("Week", 85.0)]);
-        let b = snap(now, &[("Week", 40.0)]);
+        // The winner (85.0) sits on the *later* account, and account "work"
+        // also has a second, lower window (84.0) — so this fails both if the
+        // scan stops at the first account above threshold and if it just picks
+        // the first window instead of the true max.
+        let a = snap(now, &[("Session", 82.0), ("Week", 84.0)]);
+        let b = snap(now, &[("Week", 85.0)]);
         let got = pick_alert(&[("work".to_string(), Some(a)), ("home".to_string(), Some(b))], now);
-        assert_eq!(got, Some(("work".into(), "Week".into(), 85.0)));
+        assert_eq!(got, Some(("home".into(), "Week".into(), 85.0)));
     }
 
     #[test]
@@ -1278,6 +1289,16 @@ mod tests {
         let now = now_ms();
         let a = snap(now, &[("Week", 79.9)]);
         assert!(pick_alert(&[("work".to_string(), Some(a))], now).is_none());
+    }
+
+    #[test]
+    fn the_threshold_value_itself_alerts() {
+        let now = now_ms();
+        // Pins the comparison as inclusive (>= QUOTA_WARN_PERCENT), the other
+        // side of nothing_below_the_threshold_alerts.
+        let a = snap(now, &[("Week", 80.0)]);
+        let got = pick_alert(&[("work".to_string(), Some(a))], now);
+        assert_eq!(got, Some(("work".into(), "Week".into(), 80.0)));
     }
 
     #[test]
@@ -1289,8 +1310,23 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_exactly_at_the_staleness_boundary_still_alerts() {
+        let now = now_ms();
+        // Exactly 30 minutes old — pins staleness as ">", not ">=", the other
+        // side of a_stale_snapshot_never_alerts.
+        let at_boundary = snap(now - 30 * 60 * 1000, &[("Week", 99.0)]);
+        let got = pick_alert(&[("work".to_string(), Some(at_boundary))], now);
+        assert_eq!(got, Some(("work".into(), "Week".into(), 99.0)));
+    }
+
+    #[test]
     fn accounts_without_quota_are_skipped() {
         let now = now_ms();
-        assert!(pick_alert(&[("work".to_string(), None)], now).is_none());
+        // Paired with a genuinely high account so a bug that coerces the
+        // quota-less account to a phantom 0%-used window (rather than
+        // skipping it outright) would still be caught by the winner below.
+        let b = snap(now, &[("Week", 85.0)]);
+        let got = pick_alert(&[("work".to_string(), None), ("home".to_string(), Some(b))], now);
+        assert_eq!(got, Some(("home".into(), "Week".into(), 85.0)));
     }
 }
