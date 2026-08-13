@@ -801,13 +801,12 @@ fn refresh_pricing(app: tauri::AppHandle) {
 
 /// Refresh every Claude account's plan quota, on the user's explicit request.
 ///
-/// Deliberately manual, with no timer anywhere: `claude -p "/usage"` writes a
-/// ~12 KB session log into that account's own `projects` directory (measured on
-/// Claude Code 2.1.229), which Tokenscope then watches, ingests and reports. A
-/// background poll would therefore write into the user's data directory and
-/// stir the app's own numbers on a schedule nobody asked for; a click does it
-/// once, when the figure is actually being looked at. (Codex needs none of
-/// this — its quota arrives inside the logs already being read.)
+/// The same work the hourly tick in `run()` does, on demand: `claude -p
+/// "/usage"` per account, each run's own ~12 KB session log removed immediately
+/// afterwards (see `quota::cleanup_probe_logs`). The button stays because an
+/// hour is a long time to wait for a figure you are looking at right now.
+/// (Codex needs none of this — its quota arrives inside the logs already being
+/// read.)
 ///
 /// Runs on a blocking worker: a fetch costs ~4.5 s per account and they run
 /// sequentially, so this must never touch the main thread. Resolves only once
@@ -1159,10 +1158,12 @@ pub fn run() {
             // Filesystem watcher: reflect a log write within ~1s instead of
             // waiting up to the 30s poll (PRD wants <=5s). Writes land in each
             // account's <config-dir>/projects; our own cache lives elsewhere, so
-            // ingest never self-triggers. The one exception is a manual quota
-            // refresh: `claude -p "/usage"` writes its own session log into the
-            // watched tree, costing one extra rebuild per click — bounded, never
-            // a loop, since build_workspace itself spawns nothing. Debounced so
+            // ingest never self-triggers. The one exception is a quota refresh:
+            // `claude -p "/usage"` writes its own session log into the watched
+            // tree and quota::fetch_claude deletes it again, so both events land
+            // here — bounded at one extra rebuild per refresh (the debounce
+            // below coalesces the pair), never a loop, since build_workspace
+            // itself spawns nothing. Debounced so
             // a burst of writes coalesces
             // into one rebuild; the 30s poll above stays as a fallback (and also
             // picks up any account added after startup). (build_workspace
@@ -1204,9 +1205,29 @@ pub fn run() {
                 });
             }
 
-            // NOTE: Claude plan quota is fetched only on demand, from the
-            // panel's Refresh control (`refresh_quota` below). There is
-            // deliberately no timer here — see that command for why.
+            // Claude plan quota, on a slow tick alongside the panel's manual
+            // Refresh control (`refresh_quota` below). Hourly, not minutes: a
+            // fetch is a process spawn costing ~4.5s of CPU per account, and
+            // each one makes Claude Code write a session log that
+            // `quota::fetch_claude` then deletes — at this cadence the steady
+            // state on disk is zero files. The tick exists so the tray's 80%
+            // warning works for Claude at all: pick_alert ignores a quota older
+            // than 30 minutes, so a manually-refreshed figure went quiet
+            // between clicks. Those two numbers are deliberately left
+            // independent, which means a Claude warning is live for the first
+            // half of each hour and quiet for the second; the panel still shows
+            // the figure with its honest "as of" label throughout.
+            //
+            // Sleeps first so it never competes with startup, and runs on its
+            // own thread because refresh_claude_accounts blocks for seconds.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(60 * 60));
+                    quota::refresh_claude_accounts();
+                    refresh(&handle);
+                });
+            }
 
             Ok(())
         })
