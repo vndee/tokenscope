@@ -94,15 +94,151 @@ fn newest_by_version(paths: Vec<PathBuf>) -> Option<PathBuf> {
     })
 }
 
+/// Basename of the app-owned scratch directory the `/usage` poll runs in.
+///
+/// Claude Code names each session log's parent directory after the process's
+/// current directory, so running the poll from here makes its log land in
+/// `<account>/projects/<slug ending in this name>/` — a directory nobody but
+/// Tokenscope could have caused, since nobody runs `claude` by hand from
+/// another application's cache. That is what makes the cleanup in
+/// `cleanup_probe_logs` safe to point at the user's own data directory.
+const PROBE_DIR_NAME: &str = "quota-probe";
+
+/// The scratch directory the poll runs in, created if absent. `None` if the
+/// platform cache directory is unavailable, in which case the poll simply runs
+/// in whatever directory the app was launched from — a lost cleanup is
+/// preferable to a lost quota reading.
+fn probe_dir() -> Option<PathBuf> {
+    let d = dirs::cache_dir()?.join("tokenscope").join(PROBE_DIR_NAME);
+    std::fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
+/// Read one JSONL line as a JSON object. `None` for a blank line or anything
+/// that does not parse — callers treat "cannot read" as "unknown content" and
+/// therefore as a reason to keep a file, never to delete it.
+fn json_line(line: &str) -> Option<serde_json::Value> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    serde_json::from_str(line).ok()
+}
+
+/// The text of a `type: "user"` line's message, when it is a plain string.
+/// A user line whose content is an array (tool results, images, …) yields
+/// `None`: that is real session material, not a slash-command echo.
+fn user_text(v: &serde_json::Value) -> Option<&str> {
+    if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    v.get("message")?.get("content")?.as_str()
+}
+
+const USAGE_MARKER: &str = "<command-name>/usage</command-name>";
+
+/// Is this file one of our `/usage` poll logs?
+///
+/// True only when the log records the `/usage` command and no assistant turn.
+/// Everything else — including a line that fails to parse as JSON — is false,
+/// because this predicate gates deleting a file inside the user's Claude data
+/// directory and the only acceptable error is keeping a file we wrote.
+pub fn is_quota_poll_log(text: &str) -> bool {
+    let mut saw_usage = false;
+    for line in text.lines() {
+        let Some(v) = json_line(line) else {
+            if line.trim().is_empty() {
+                continue;
+            }
+            return false;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+            return false;
+        }
+        if user_text(&v).is_some_and(|c| c.contains(USAGE_MARKER)) {
+            saw_usage = true;
+        }
+    }
+    saw_usage
+}
+
+/// Delete every `.jsonl` file directly inside `dir` that `matches` accepts,
+/// returning how many were removed.
+///
+/// Files only, never directories, never recursive. Every IO error — the
+/// directory being unreadable, a file being unreadable, the unlink failing —
+/// is swallowed: cleanup is housekeeping and must never cost a caller its
+/// result.
+fn remove_matching(dir: &Path, matches: fn(&str) -> bool) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() || p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        if matches(&text) && std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Remove the poll's own session logs from one account's `projects` tree.
+///
+/// Deliberately narrow: only a directory directly under `projects/` whose name
+/// *ends with* `PROBE_DIR_NAME`, and within it only `.jsonl` files that pass
+/// `is_quota_poll_log`. Claude's path-slug algorithm is never reconstructed —
+/// if no such directory exists this does nothing at all.
+pub fn cleanup_probe_logs(config_dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(config_dir.join("projects")) else { return 0 };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let is_probe = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(PROBE_DIR_NAME));
+        if is_probe {
+            removed += remove_matching(&p, is_quota_poll_log);
+        }
+    }
+    removed
+}
+
 /// Run `claude -p "/usage"` for one account and parse the result.
 ///
 /// `config_dir` is the account's data directory, passed as `CLAUDE_CONFIG_DIR`
 /// so each account reports its own figures. Returns None on any failure —
 /// missing binary, timeout, non-zero exit, or unparseable output — so a bad run
 /// never replaces a good cached reading with a wrong one.
+///
+/// The run's own session log is deleted immediately afterwards, per account and
+/// whatever the outcome: a run that timed out or exited non-zero can still have
+/// written one, and deferring the sweep to the end of the batch would leave
+/// this account's log behind if a later account wedged or the app were killed.
 pub fn fetch_claude(config_dir: &Path) -> Option<QuotaSnapshot> {
+    let out = run_usage(config_dir);
+    cleanup_probe_logs(config_dir);
+    parse_usage(&out?, crate::now_ms())
+}
+
+/// Spawn `claude -p "/usage"` for one account and return its stdout.
+///
+/// Runs with its current directory set to the app's scratch directory so the
+/// session log Claude Code writes lands somewhere `cleanup_probe_logs` can
+/// identify without guessing.
+fn run_usage(config_dir: &Path) -> Option<String> {
     let bin = claude_binary()?;
-    let mut child = std::process::Command::new(bin)
+    let mut cmd = std::process::Command::new(bin);
+    if let Some(probe) = probe_dir() {
+        cmd.current_dir(probe);
+    }
+    let mut child = cmd
         .env("CLAUDE_CONFIG_DIR", config_dir)
         .arg("-p")
         .arg("/usage")
@@ -138,7 +274,7 @@ pub fn fetch_claude(config_dir: &Path) -> Option<QuotaSnapshot> {
     if !out.status.success() {
         return None;
     }
-    parse_usage(&String::from_utf8_lossy(out.stdout.as_slice()), crate::now_ms())
+    Some(String::from_utf8_lossy(out.stdout.as_slice()).into_owned())
 }
 
 static CACHE: OnceLock<Mutex<HashMap<String, QuotaSnapshot>>> = OnceLock::new();
@@ -312,6 +448,122 @@ mod tests {
     fn apply_fetch_leaves_a_never_cached_account_absent_on_failure() {
         apply_fetch("acct-apply-never", None);
         assert!(cached("acct-apply-never").is_none());
+    }
+
+    /// A verbatim-shaped `/usage` poll log: two queue-operation lines, two
+    /// hook attachments, the local-command caveat, the `/usage` command echo,
+    /// the command's stdout as a system line, and the last-prompt pointer.
+    /// Eight lines, no assistant turn — exactly what `claude -p "/usage"`
+    /// leaves behind.
+    fn poll_log() -> String {
+        [
+            r#"{"type":"queue-operation","operation":"enqueue","content":"/usage"}"#.to_string(),
+            r#"{"type":"queue-operation","operation":"dequeue"}"#.to_string(),
+            r#"{"type":"attachment","attachment":{"type":"hook_success"}}"#.to_string(),
+            r#"{"type":"attachment","attachment":{"type":"hook_additional_context"}}"#.to_string(),
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: generated while running local commands."}}"#
+                .to_string(),
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"{USAGE_MARKER}\n<command-message>usage</command-message>"}}}}"#
+            ),
+            r#"{"type":"system","subtype":"local_command","content":"Current session: 15% used"}"#
+                .to_string(),
+            r#"{"type":"last-prompt","leafUuid":"x"}"#.to_string(),
+        ]
+        .join("\n")
+    }
+
+    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// A scratch `projects` tree with one probe-suffixed directory, named the
+    /// way Claude slugs our cache path.
+    fn probe_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("tokenscope-quota-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let probe = root
+            .join("projects")
+            .join(format!("-Users-someone-Library-Caches-tokenscope-{PROBE_DIR_NAME}"));
+        std::fs::create_dir_all(&probe).unwrap();
+        (root, probe)
+    }
+
+    #[test]
+    fn a_genuine_poll_log_is_identified() {
+        assert!(is_quota_poll_log(&poll_log()));
+    }
+
+    #[test]
+    fn a_log_with_an_assistant_line_is_not_ours() {
+        let mut t = poll_log();
+        t.push_str("\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\"}}");
+        assert!(!is_quota_poll_log(&t));
+    }
+
+    #[test]
+    fn a_log_without_the_usage_marker_is_not_ours() {
+        let t = r#"{"type":"user","message":{"role":"user","content":"fix the parser"}}"#;
+        assert!(!is_quota_poll_log(t));
+    }
+
+    #[test]
+    fn an_unreadable_line_makes_a_log_not_ours() {
+        // Half-written or truncated: we cannot rule out a real turn, so keep it.
+        let t = format!("{}\nnot json at all", poll_log());
+        assert!(!is_quota_poll_log(&t));
+    }
+
+    #[test]
+    fn cleanup_removes_only_our_own_poll_logs() {
+        let (root, probe) = probe_tree("cleanup");
+        let ours = write(&probe, "ours.jsonl", &poll_log());
+        let with_assistant = write(
+            &probe,
+            "real.jsonl",
+            &format!(
+                "{}\n{}",
+                poll_log(),
+                r#"{"type":"assistant","message":{"role":"assistant"}}"#
+            ),
+        );
+        let no_marker = write(
+            &probe,
+            "other.jsonl",
+            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#,
+        );
+        let not_jsonl = write(&probe, "notes.json", &poll_log());
+
+        assert_eq!(cleanup_probe_logs(&root), 1);
+        assert!(!ours.exists(), "the poll log must be gone");
+        assert!(with_assistant.exists(), "a log with an assistant turn must stay");
+        assert!(no_marker.exists(), "a log without the marker must stay");
+        assert!(not_jsonl.exists(), "a non-.jsonl file must be ignored");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_never_touches_a_directory_that_is_not_the_probe() {
+        let (root, _probe) = probe_tree("scope");
+        let other = root.join("projects").join("-Users-someone-code-myapp");
+        std::fs::create_dir_all(&other).unwrap();
+        let untouched = write(&other, "session.jsonl", &poll_log());
+        assert_eq!(cleanup_probe_logs(&root), 0);
+        assert!(untouched.exists(), "only the probe directory is in scope");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_on_a_missing_directory_is_a_silent_no_op() {
+        let missing = std::env::temp_dir().join("tokenscope-quota-test-does-not-exist");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(cleanup_probe_logs(&missing), 0);
+        // Also the case where projects/ exists but holds no probe directory.
+        let (root, _) = probe_tree("empty");
+        assert_eq!(cleanup_probe_logs(&root), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
