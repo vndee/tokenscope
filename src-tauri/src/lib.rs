@@ -29,7 +29,7 @@ use tauri_plugin_positioner::{Position, WindowExt};
 #[cfg(target_os = "macos")]
 use tauri_nspanel::{ManagerExt as _, WebviewWindowExt as _};
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
