@@ -799,6 +799,30 @@ fn refresh_pricing(app: tauri::AppHandle) {
     refresh_pricing_bg(&app);
 }
 
+/// Refresh every Claude account's plan quota, on the user's explicit request.
+///
+/// Deliberately manual, with no timer anywhere: `claude -p "/usage"` writes a
+/// ~12 KB session log into that account's own `projects` directory (measured on
+/// Claude Code 2.1.229), which Tokenscope then watches, ingests and reports. A
+/// background poll would therefore write into the user's data directory and
+/// stir the app's own numbers on a schedule nobody asked for; a click does it
+/// once, when the figure is actually being looked at. (Codex needs none of
+/// this — its quota arrives inside the logs already being read.)
+///
+/// Runs on a blocking worker: a fetch costs ~4.5 s per account and they run
+/// sequentially, so this must never touch the main thread. Resolves only once
+/// the workspace has been rebuilt and pushed, so the caller can hold an
+/// in-flight state for the whole operation.
+#[tauri::command]
+async fn refresh_quota(app: tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        quota::refresh_claude_accounts();
+        refresh(&handle);
+    })
+    .await;
+}
+
 /// Save a full-panel screenshot (a `data:image/png;base64,...` URL captured in
 /// the webview) to the user's Desktop as `Tokenscope <date> at <time>.png`.
 /// DOM rasterization sidesteps macOS Screen Recording permission entirely.
@@ -874,6 +898,7 @@ pub fn run() {
             save_screenshot,
             begin_drag,
             refresh_pricing,
+            refresh_quota,
         ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.
@@ -1134,7 +1159,11 @@ pub fn run() {
             // Filesystem watcher: reflect a log write within ~1s instead of
             // waiting up to the 30s poll (PRD wants <=5s). Writes land in each
             // account's <config-dir>/projects; our own cache lives elsewhere, so
-            // this never self-triggers. Debounced so a burst of writes coalesces
+            // ingest never self-triggers. The one exception is a manual quota
+            // refresh: `claude -p "/usage"` writes its own session log into the
+            // watched tree, costing one extra rebuild per click — bounded, never
+            // a loop, since build_workspace itself spawns nothing. Debounced so
+            // a burst of writes coalesces
             // into one rebuild; the 30s poll above stays as a fallback (and also
             // picks up any account added after startup). (build_workspace
             // serializes on BUILD_LOCK, so this and the poll can't race the cache.)
@@ -1175,18 +1204,9 @@ pub fn run() {
                 });
             }
 
-            // Claude quota poller. Spawning `claude -p "/usage"` costs several
-            // seconds per account, so this runs far slower than the 30s
-            // dashboard poll and never on the main thread. The first pass is
-            // immediate so the panel has data soon after launch.
-            {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || loop {
-                    quota::refresh_claude_accounts();
-                    refresh(&handle);
-                    std::thread::sleep(Duration::from_secs(300));
-                });
-            }
+            // NOTE: Claude plan quota is fetched only on demand, from the
+            // panel's Refresh control (`refresh_quota` below). There is
+            // deliberately no timer here — see that command for why.
 
             Ok(())
         })

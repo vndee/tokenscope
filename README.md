@@ -39,6 +39,12 @@ being read, and Claude's comes from its own supported CLI. Tokenscope does not
 read the Keychain, any auth file, or any undocumented endpoint. Figures older
 than 30 minutes are dimmed rather than shown as current.
 
+Claude's quota is fetched only when you press **Refresh** in the panel's plan
+block — never on a timer. That CLI call makes no API request and consumes no
+plan quota, but Claude Code does write its own ~12 KB session log for the run;
+it is the only thing Tokenscope ever causes to be written under `~/.claude/`,
+and it happens once per click rather than in the background.
+
 Each Skill whitelist directory is scanned two ways: every non-dot top-level directory `<name>/` registers `<name>` (no `SKILL.md` required at that level), and a nested `<plugin>/<name>/SKILL.md` additionally registers `<plugin>:<name>` (a plugin-scoped skill, gated on that `SKILL.md` existing) — so `~/.claude/skills/gstack/review/SKILL.md` and `~/.codex/skills/gstack/review/SKILL.md` both count as `gstack:review` (as well as `gstack` itself, from the top-level scan). Directories starting with `.` are always skipped, at both levels. This applies to both agents' whitelists.
 
 ### Key processing

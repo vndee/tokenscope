@@ -36,6 +36,11 @@
 
 套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值。
 
+Claude 的额度只有在你点击面板里套餐区块的 **Refresh** 时才会去取，不会定时轮询。这次
+CLI 调用不发起任何 API 请求、不消耗套餐额度，但 Claude Code 自己会为这次运行写入一份约
+12 KB 的会话日志——这是 Tokenscope 唯一会间接导致 `~/.claude/` 下产生写入的地方，且只在
+你点击时发生一次，不会在后台反复发生。
+
 每个 Skill 白名单目录都按两种规则扫描：顶层任意非 `.` 开头的目录 `<name>/` 都会记为 `<name>`（顶层不要求存在 `SKILL.md`）；嵌套的 `<plugin>/<name>/SKILL.md` 则额外记为 `<plugin>:<name>`（插件域 Skill，这一层才要求 `SKILL.md` 存在）——因此 `~/.claude/skills/gstack/review/SKILL.md` 与 `~/.codex/skills/gstack/review/SKILL.md` 都会计为 `gstack:review`（顶层扫描本身也会把 `gstack` 记入）。以 `.` 开头的目录在两层都会被跳过。两个 Agent 的白名单都遵循这一规则。
 
 ### 关键处理

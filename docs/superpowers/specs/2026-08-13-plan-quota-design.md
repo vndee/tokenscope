@@ -63,7 +63,25 @@ Current week (Fable): 0% used
 Measured properties:
 
 - **~4.5 s per call** (two runs: 4.4 s, 4.6 s).
-- **Consumes no quota** — it creates no session log under `~/.claude/projects/`.
+- **Consumes no plan quota, but is not free of side effects.** The run makes no
+  API request — the written log contains no `assistant` line and no
+  `message.usage` block, so no tokens, no cost and no plan quota are consumed.
+  It *does* write a session log: one new `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`
+  per call, 12,413 bytes on 2026-08-13 with Claude Code 2.1.229. That file
+  carries a fresh `sessionId` and a `<command-name>/usage</command-name>` user
+  line, which Tokenscope ingests like any other log — so an unattended poller
+  would both grow the user's data directory and inflate Tokenscope's own
+  session count.
+
+  **Correction.** An earlier revision of this document asserted the opposite
+  ("it creates no session log under `~/.claude/projects/`") as a measured fact.
+  That measurement used `find … -newermt '-3 minutes'`, GNU-relative syntax that
+  BSD `find` on macOS matches nothing for, so it returned an empty result that
+  was read as "nothing was written". The claim above was re-measured with a
+  plain count instead: 549 `.jsonl` files under `~/.claude/projects` before one
+  `claude -p "/usage"`, 550 after, the new file identified with
+  `find … -newer <stamp-file>`. Measure side effects with a method that fails
+  loudly, and re-measure at the end of the branch.
 - **Per-account works**: `CLAUDE_CONFIG_DIR=<dir> claude -p "/usage"` returns that
   account's figures. Confirmed distinct across the two accounts here (default
   session 15% / week 2%; work session 5% / week 16%).
@@ -134,9 +152,18 @@ A poller separate from the ingest loop, because it spawns a process rather than
 reading a file:
 
 - runs `CLAUDE_CONFIG_DIR=<account dir> claude -p "/usage"` per Claude account
-- on panel open, and on a 5-minute timer
+- **only when the user asks for it** — a Refresh control in the panel's quota
+  block, wired to a `refresh_quota` command. No timer, and not on panel open
+  either. Each call writes a 12 KB session log into the account's own
+  `projects` directory (see the measured properties above), so an unattended
+  poll would write into the user's data directory and inflate Tokenscope's own
+  session count on a schedule nobody asked for. A click pays that cost once,
+  when the figure is actually being read.
 - sequentially, not in parallel — N accounts × 4.5 s of CPU at once is rude on a
-  background menu-bar app
+  background menu-bar app. The control therefore holds a disabled, in-flight
+  state ("Checking…") for the whole run rather than letting the panel look frozen.
+- the cache is in-memory, so a Claude account shows no quota until the first
+  manual refresh of that app session
 - caches the parsed result; a failed run keeps the previous snapshot and marks it
   stale rather than blanking the display
 - `source_at` == `fetched_at`, since the CLI reports live figures
