@@ -4,9 +4,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme,
+  Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme, QuotaSnapshot,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
-  fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod,
+  fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale,
   fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak, weekdayRhythm,
 } from "./data";
 import {
@@ -139,6 +139,38 @@ const SectionRule = ({ t, m = "12px 0 10px" }: { t: Theme; m?: string }) => (
 const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
   <span style={{ font: `600 10px ${t.ui}`, color: t.dim, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{children}</span>
 );
+// Plan quota for the selected account. Hidden entirely when unknown — showing
+// an unknown quota as 0% would read as "plenty left", the most costly possible
+// misreading. A figure older than QUOTA_STALE_MS dims, because a stale quota
+// presented as current is worse than none.
+function QuotaBlock({ t, q }: { t: Theme; q: QuotaSnapshot | null }) {
+  if (!q || q.windows.length === 0) return null;
+  const stale = isQuotaStale(q.sourceAt);
+  const mins = Math.max(0, Math.round((Date.now() - q.sourceAt) / 60000));
+  const age = mins < 1 ? "just now" : mins < 60 ? `${mins}m ago` : `${Math.round(mins / 60)}h ago`;
+  return (
+    <div style={{ opacity: stale ? 0.45 : 1, marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+        <Label t={t}>Plan usage{q.plan ? ` · ${q.plan}` : ""}</Label>
+        <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>as of {age}</span>
+      </div>
+      {q.windows.map((w) => (
+        <div key={w.label} style={{ marginBottom: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 3 }}>
+            <span>{w.label}</span>
+            <span>
+              <span style={{ color: w.usedPercent >= 80 ? "#e0795f" : t.text, fontWeight: 600 }}>{w.usedPercent}%</span>
+              {w.resetsLabel ? <span style={{ color: t.faint }}> · resets {w.resetsLabel}</span> : null}
+            </span>
+          </div>
+          <div style={{ height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
+            <div style={{ width: `${Math.min(100, Math.max(0, w.usedPercent))}%`, height: "100%", borderRadius: 3, background: w.usedPercent >= 80 ? "#e0795f" : t.accent }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 // Tiny per-agent mark on each tab, so a Claude and a Codex account are
 // distinguishable without spending a second row of navigation on it.
 const AgentBadge = ({ t, agent }: { t: Theme; agent: string }) => {
@@ -309,7 +341,7 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
   );
 }
 
-function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean }) {
+function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -527,6 +559,7 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
           <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
         </div>
         <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
+        <QuotaBlock t={t} q={quota} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
@@ -853,6 +886,12 @@ export default function App() {
   const selected = activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
   const dash = selected ?? ws.all;
   const effectiveTab = selected ? activeTab : "all";
+  // Per-account plan quota; the aggregate "All" tab has no single quota to show.
+  // With one account there's no real "all" (see tabs above) — that lone account's
+  // quota is the one to show even though effectiveTab reads "all".
+  const quota = ws.accounts.length === 1
+    ? ws.accounts[0].quota
+    : effectiveTab === "all" ? null : ws.accounts.find((a) => a.id === effectiveTab)?.quota ?? null;
 
   // The report to show: the live current period from the workspace, or the
   // on-demand fetched past period. `dash` here reflects the selected account.
@@ -909,6 +948,7 @@ export default function App() {
       onDrillDay={drillDay}
       onTrendPick={trendPick}
       loading={loadingPeriod}
+      quota={quota}
     />
   );
 }
