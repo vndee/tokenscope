@@ -42,14 +42,14 @@ ignores them — so a Claude warning, rechecked hourly, is live for the first ha
 of each hour and quiet for the second. The panel always shows the figure with
 its own "as of" label.
 
-Claude's quota is checked hourly, and whenever you press **Refresh** in the
-panel's plan block. Measured on Claude Code 2.1.229, that CLI call consumes no
+Claude's quota is checked shortly after launch, hourly after that, and whenever
+you press **Refresh** in the panel's plan block. Measured on Claude Code 2.1.229, that CLI call consumes no
 tokens, no cost and no plan quota — the session log it writes contains no
 assistant turn and no `message.usage` block. It does write that log: a ~12 KB
 file under the account's own `projects/`, the only thing Tokenscope ever causes
 to be written under `~/.claude/`. The check runs from a scratch directory of
-Tokenscope's own (`~/Library/Caches/tokenscope/quota-probe`) so the log lands
-somewhere identifiable, and deletes it immediately afterwards — a file is
+Tokenscope's own (`~/Library/Caches/tokenscope/tokenscope-quota-probe`) so the
+log lands somewhere identifiable, and deletes it immediately afterwards — a file is
 verified to hold the `/usage` command and no assistant reply before it is
 removed, and nothing else is ever touched. The steady state is zero accumulated
 files. If any are ever left behind, **Clean up leftover check logs** under the

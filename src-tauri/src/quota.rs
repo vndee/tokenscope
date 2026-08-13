@@ -102,7 +102,14 @@ fn newest_by_version(paths: Vec<PathBuf>) -> Option<PathBuf> {
 /// Tokenscope could have caused, since nobody runs `claude` by hand from
 /// another application's cache. That is what makes the cleanup in
 /// `cleanup_probe_logs` safe to point at the user's own data directory.
-const PROBE_DIR_NAME: &str = "quota-probe";
+///
+/// The name carries the app's own name even though the directory already sits
+/// under `<cache>/tokenscope/`, because only the basename is matched, and it is
+/// matched as a *suffix*. A bare "quota-probe" is a name a developer could
+/// plausibly give a real project, and any project path ending in it would fall
+/// inside the cleanup's scope. Nothing here is meant to be load-bearing alone,
+/// but this is the outermost guard and it costs nothing to make it exact.
+const PROBE_DIR_NAME: &str = "tokenscope-quota-probe";
 
 /// The scratch directory the poll runs in, created if absent. `None` if the
 /// platform cache directory is unavailable, in which case the poll simply runs
@@ -615,6 +622,57 @@ mod tests {
         let untouched = write(&other, "session.jsonl", &poll_log());
         assert_eq!(cleanup_probe_logs(&root), 0);
         assert!(untouched.exists(), "only the probe directory is in scope");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_probe_name_is_specific_enough_that_a_users_own_project_cannot_match() {
+        // The match is a *suffix* on the directory name, so the basename has to
+        // be one nobody would give a real project. A user with a project called
+        // "quota-probe" — or anything ending in it — must stay out of scope.
+        assert!(PROBE_DIR_NAME.contains("tokenscope"), "the name must be app-specific");
+        let (root, _probe) = probe_tree("plausible");
+        let mine = root.join("projects").join("-Users-someone-code-quota-probe");
+        std::fs::create_dir_all(&mine).unwrap();
+        let untouched = write(&mine, "session.jsonl", &poll_log());
+        assert_eq!(cleanup_probe_logs(&root), 0);
+        assert!(untouched.exists(), "a user's own quota-probe project is not ours");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_probe_directory_slug_still_matches_after_the_rename() {
+        // probe_tree names its directory the way Claude slugs the real cache
+        // path, so this fails loudly if the constant and the match drift apart.
+        let (root, probe) = probe_tree("rename");
+        assert!(probe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(PROBE_DIR_NAME)));
+        let ours = write(&probe, "ours.jsonl", &poll_log());
+        assert_eq!(cleanup_probe_logs(&root), 1);
+        assert!(!ours.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_previous_probe_name_is_still_reached_by_the_new_match() {
+        // The scratch directory has always lived at <cache>/tokenscope/<name>,
+        // so the old bare "quota-probe" slugged to a name ending in
+        // "tokenscope-quota-probe" — which is the new constant. Anything left
+        // behind by a build that used the old name is therefore still cleaned
+        // up automatically, on any machine. Asserted rather than assumed,
+        // because it is a coincidence of the parent directory's name and would
+        // stop holding if the cache layout changed.
+        let root = std::env::temp_dir().join("tokenscope-quota-test-oldname");
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root
+            .join("projects")
+            .join("-Users-someone-Library-Caches-tokenscope-quota-probe");
+        std::fs::create_dir_all(&old).unwrap();
+        let leftover = write(&old, "leftover.jsonl", &poll_log());
+        assert_eq!(cleanup_probe_logs(&root), 1);
+        assert!(!leftover.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

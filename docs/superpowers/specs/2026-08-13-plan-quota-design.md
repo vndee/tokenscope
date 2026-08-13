@@ -85,10 +85,10 @@ Measured properties:
   loudly, and re-measure at the end of the branch.
 
   **Re-measured at the end of the branch**, with the scratch directory and
-  cleanup in place: 1321 `.jsonl` files across both accounts' `projects` trees
-  before a two-account fetch, 1321 after, and both
-  `projects/-Users-vndee-Library-Caches-tokenscope-quota-probe/` directories
-  empty. Plain counts again, not a `find` predicate.
+  cleanup in place: 1323 `.jsonl` files across both accounts' `projects` trees
+  before a two-account fetch, 1323 after, and both
+  `projects/-Users-vndee-Library-Caches-tokenscope-tokenscope-quota-probe/`
+  directories empty. Plain counts again, not a `find` predicate.
 - **Per-account works**: `CLAUDE_CONFIG_DIR=<dir> claude -p "/usage"` returns that
   account's figures. Confirmed distinct across the two accounts here (default
   session 15% / week 2%; work session 5% / week 16%).
@@ -159,12 +159,15 @@ A poller separate from the ingest loop, because it spawns a process rather than
 reading a file:
 
 - runs `CLAUDE_CONFIG_DIR=<account dir> claude -p "/usage"` per Claude account
-- **every 60 minutes, plus a Refresh control** in the panel's quota block wired
-  to a `refresh_quota` command. Each call writes a 12 KB session log into the
-  account's own `projects` directory (see the measured properties above), so the
-  poll runs with its current directory set to
-  `~/Library/Caches/tokenscope/quota-probe` and deletes that log immediately
-  afterwards, per account, whatever the run's outcome. At hourly cadence with
+- **once shortly after launch, then every 60 minutes, plus a Refresh control**
+  in the panel's quota block wired to a `refresh_quota` command. The first run
+  cannot wait for the interval: the quota cache is in-memory, so an app started
+  at login would otherwise show no Claude figure and raise no tray warning for
+  its first hour — the exact gap the tick exists to close. Each call writes a
+  12 KB session log into the account's own `projects` directory (see the
+  measured properties above), so the poll runs with its current directory set to
+  `~/Library/Caches/tokenscope/tokenscope-quota-probe` and deletes that log
+  immediately afterwards, per account, whatever the run's outcome. At hourly cadence with
   cleanup the steady state on disk is zero files, which is what makes polling
   acceptable at all.
 
@@ -178,7 +181,7 @@ reading a file:
   figure with its honest "as of" label throughout.
 - **the cleanup is conservative to the point of paranoia**, because it unlinks
   files inside the user's Claude data directory: only a directory directly under
-  `projects/` whose name *ends with* `quota-probe` (Claude's slug algorithm is
+  `projects/` whose name *ends with* `tokenscope-quota-probe` (Claude's slug algorithm is
   never reconstructed — no match means do nothing), only `.jsonl` files directly
   inside it, files only and never directories, and each file must be read and
   found to contain the `/usage` marker with no `"type":"assistant"` line before

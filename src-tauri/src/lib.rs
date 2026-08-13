@@ -1246,14 +1246,22 @@ pub fn run() {
             // half of each hour and quiet for the second; the panel still shows
             // the figure with its honest "as of" label throughout.
             //
-            // Sleeps first so it never competes with startup, and runs on its
-            // own thread because refresh_claude_accounts blocks for seconds.
+            // Fetches once shortly after launch, then hourly. The first run
+            // cannot wait for the interval: the quota cache is in-memory, so an
+            // app started at login would show no Claude figure and raise no
+            // tray warning for a whole hour — exactly the gap this tick exists
+            // to close. The short delay only keeps it clear of the startup
+            // burst; it runs on its own thread because refresh_claude_accounts
+            // blocks for seconds per account.
             {
                 let handle = app.handle().clone();
-                std::thread::spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(60 * 60));
-                    quota::refresh_claude_accounts();
-                    refresh(&handle);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(5));
+                    loop {
+                        quota::refresh_claude_accounts();
+                        refresh(&handle);
+                        std::thread::sleep(Duration::from_secs(60 * 60));
+                    }
                 });
             }
 

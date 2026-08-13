@@ -36,12 +36,13 @@
 
 套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值，托盘的 `⚠` 也会忽略它们——所以每小时刷新一次的 Claude 告警，在每小时的前半段有效、后半段静默。面板则始终带着自己的 "as of" 标注展示这个数字。
 
-Claude 的额度每小时自动检查一次，你也可以随时点击面板里套餐区块的 **Refresh** 立即刷新。
+Claude 的额度会在启动后不久检查一次，此后每小时自动检查一次，你也可以随时点击面板里套餐区块的
+**Refresh** 立即刷新。
 在 Claude Code 2.1.229 上实测：这次 CLI 调用不消耗 token、不产生费用、不消耗套餐额度——
 它写下的会话日志里既没有 assistant 回合，也没有 `message.usage` 块。但它确实会写这份日志：
 一份约 12 KB 的文件，落在该账户自己的 `projects/` 下，这是 Tokenscope 唯一会间接导致
 `~/.claude/` 下产生写入的地方。这次检查会在 Tokenscope 自己的临时目录
-（`~/Library/Caches/tokenscope/quota-probe`）中运行，好让日志落到一个可识别的位置，并在
+（`~/Library/Caches/tokenscope/tokenscope-quota-probe`）中运行，好让日志落到一个可识别的位置，并在
 调用结束后立刻删除它——删除前会先确认该文件只含 `/usage` 命令、没有任何 assistant 回复，
 其它文件一概不碰。稳定状态下磁盘上不会有任何积累。万一仍有残留，套餐区块下方的
 **Clean up leftover check logs** 会清掉它们，并告诉你删了几个。
