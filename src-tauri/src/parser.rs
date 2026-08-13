@@ -287,7 +287,12 @@ fn account_events(
     a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
-) -> (Vec<Event>, HashSet<String>, HashSet<String>) {
+) -> (
+    Vec<Event>,
+    HashSet<String>,
+    HashSet<String>,
+    Option<crate::model::QuotaSnapshot>,
+) {
     let mut store = Store::load(&a.id);
     let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
     if store.prune_before(cutoff) {
@@ -313,7 +318,22 @@ fn account_events(
             e
         })
         .collect();
-    (events, cfg.mcp_servers, cfg.skills)
+    // Codex reports quota in its logs; Claude's arrives from the poller cache.
+    let quota = match d.id {
+        "claude" => crate::quota::cached(&a.id),
+        _ => store
+            .quota
+            .as_ref()
+            .and_then(|(ts, v)| {
+                serde_json::from_value::<crate::model::QuotaSnapshot>(v.clone())
+                    .ok()
+                    .map(|mut q| {
+                        q.source_at = *ts;
+                        q
+                    })
+            }),
+    };
+    (events, cfg.mcp_servers, cfg.skills, quota)
 }
 
 /// Build a per-account dashboard for every discovered Claude account, plus an
@@ -338,7 +358,7 @@ pub fn build_workspace() -> Workspace {
     let mut all_skills: HashSet<String> = HashSet::new();
 
     for (d, a) in crate::agents::discover_all() {
-        let (events, servers, skills) = account_events(d, &a, &pricing, cutoff);
+        let (events, servers, skills, quota) = account_events(d, &a, &pricing, cutoff);
         let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
         all_servers.extend(servers);
         all_skills.extend(skills);
@@ -348,6 +368,7 @@ pub fn build_workspace() -> Workspace {
             label: a.label,
             email: a.email,
             agent: a.agent.to_string(),
+            quota,
             dash,
         });
     }
@@ -381,7 +402,7 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk) = account_events(d, &a, &pricing, cutoff);
+        let (ev, srv, sk, _) = account_events(d, &a, &pricing, cutoff);
         events.extend(ev);
         servers.extend(srv);
         skills.extend(sk);

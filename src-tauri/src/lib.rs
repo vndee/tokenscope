@@ -1123,6 +1123,19 @@ pub fn run() {
                 });
             }
 
+            // Claude quota poller. Spawning `claude -p "/usage"` costs several
+            // seconds per account, so this runs far slower than the 30s
+            // dashboard poll and never on the main thread. The first pass is
+            // immediate so the panel has data soon after launch.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    quota::refresh_claude_accounts();
+                    refresh(&handle);
+                    std::thread::sleep(Duration::from_secs(300));
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

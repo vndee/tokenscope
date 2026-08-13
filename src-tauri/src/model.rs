@@ -137,6 +137,9 @@ pub struct AccountData {
     pub label: String, // friendly name (org / display name / email / dir)
     pub email: String, // account email if known (may be empty)
     pub agent: String, // owning CLI ("claude" / "codex") — drives the tab badge
+    /// Plan quota for this account, when known. `None` renders as absence — the
+    /// UI must never show it as zero.
+    pub quota: Option<QuotaSnapshot>,
     pub dash: Dashboard,
 }
 
