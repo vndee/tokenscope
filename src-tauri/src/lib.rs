@@ -36,19 +36,64 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Quota at or above this share of a window is worth surfacing on the tray.
+const QUOTA_WARN_PERCENT: f64 = 80.0;
+/// Matches the UI's staleness rule: a figure older than this never alerts,
+/// because the user would act on a number that is no longer true.
+const QUOTA_STALE_MS: i64 = 30 * 60 * 1000;
+
+/// The single most urgent quota across every account and window: (account
+/// label, window label, percent). None when nothing is high, or everything
+/// high is stale.
+fn pick_alert(
+    accounts: &[(String, Option<model::QuotaSnapshot>)],
+    now: i64,
+) -> Option<(String, String, f64)> {
+    let mut best: Option<(String, String, f64)> = None;
+    for (label, q) in accounts {
+        let Some(q) = q else { continue };
+        if now - q.source_at > QUOTA_STALE_MS {
+            continue;
+        }
+        for w in &q.windows {
+            if w.used_percent < QUOTA_WARN_PERCENT {
+                continue;
+            }
+            if best.as_ref().map(|(_, _, p)| w.used_percent > *p).unwrap_or(true) {
+                best = Some((label.clone(), w.label.clone(), w.used_percent));
+            }
+        }
+    }
+    best
+}
+
 /// Rebuild the dashboard (incremental), update the tray's token count, and push
 /// the fresh data to the UI so an open popover updates live.
 fn refresh(app: &tauri::AppHandle) {
     let ws = parser::build_workspace();
     if let Some(tray) = app.tray_by_id("main") {
-        // Combined today total across every account.
         let label = fmt_tokens_m(ws.today_tokens);
-        // macOS shows the label next to the menu-bar icon (set_title). Windows'
-        // taskbar tray has no equivalent — set_title is a no-op there — so we
-        // surface the same number through the hover tooltip instead, the only
-        // text channel Shell_NotifyIcon exposes for a tray icon.
-        let _ = tray.set_title(Some(label.clone()));
-        let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
+        let pairs: Vec<(String, Option<model::QuotaSnapshot>)> = ws
+            .accounts
+            .iter()
+            .map(|a| (a.label.clone(), a.quota.clone()))
+            .collect();
+        let alert = pick_alert(&pairs, now_ms());
+        // macOS renders set_title as plain text and controls its colour, so the
+        // warning is a marker glyph rather than a recolour. Windows makes
+        // set_title a no-op, which is why the tooltip carries the detail.
+        let title = match &alert {
+            Some(_) => format!("{label} ⚠"),
+            None => label.clone(),
+        };
+        let tip = match &alert {
+            Some((acct, win, pct)) => {
+                format!("Tokenscope · today {label}\n{acct}: {win} {pct:.0}% used")
+            }
+            None => format!("Tokenscope · today {label}"),
+        };
+        let _ = tray.set_title(Some(title));
+        let _ = tray.set_tooltip(Some(tip));
     }
     // Milestones track combined usage (the aggregate "All" dashboard).
     check_milestones(app, &ws.all);
@@ -1200,5 +1245,52 @@ mod tests {
         let prev = ms("2026-W24", 2, "2026-06", 3);
         // New week (id changed), month unchanged and flat → no fire.
         assert!(!milestone_fire(Some(&prev), &ms("2026-W25", 0, "2026-06", 3)));
+    }
+
+    fn snap(source_at: i64, pcts: &[(&str, f64)]) -> model::QuotaSnapshot {
+        model::QuotaSnapshot {
+            plan: "pro".into(),
+            windows: pcts
+                .iter()
+                .map(|(l, p)| model::QuotaWindow {
+                    label: (*l).into(),
+                    used_percent: *p,
+                    resets_at: None,
+                    resets_label: String::new(),
+                })
+                .collect(),
+            fetched_at: source_at,
+            source_at,
+        }
+    }
+
+    #[test]
+    fn the_highest_window_across_accounts_drives_the_alert() {
+        let now = now_ms();
+        let a = snap(now, &[("Session", 20.0), ("Week", 85.0)]);
+        let b = snap(now, &[("Week", 40.0)]);
+        let got = pick_alert(&[("work".to_string(), Some(a)), ("home".to_string(), Some(b))], now);
+        assert_eq!(got, Some(("work".into(), "Week".into(), 85.0)));
+    }
+
+    #[test]
+    fn nothing_below_the_threshold_alerts() {
+        let now = now_ms();
+        let a = snap(now, &[("Week", 79.9)]);
+        assert!(pick_alert(&[("work".to_string(), Some(a))], now).is_none());
+    }
+
+    #[test]
+    fn a_stale_snapshot_never_alerts() {
+        let now = now_ms();
+        // 31 minutes old — past the staleness threshold even though it is high.
+        let old = snap(now - 31 * 60 * 1000, &[("Week", 99.0)]);
+        assert!(pick_alert(&[("work".to_string(), Some(old))], now).is_none());
+    }
+
+    #[test]
+    fn accounts_without_quota_are_skipped() {
+        let now = now_ms();
+        assert!(pick_alert(&[("work".to_string(), None)], now).is_none());
     }
 }
