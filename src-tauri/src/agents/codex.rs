@@ -238,6 +238,32 @@ fn uuid7_ms(id: &str) -> Option<u64> {
     u64::from_str_radix(&hex, 16).ok()
 }
 
+/// Render a reset time the way Claude's CLI prints one, so a Codex row and a
+/// Claude row in the same panel read identically instead of looking like two
+/// different features: "Aug 20 at 10:32am", and "Aug 20 at 1am" when the minutes
+/// are zero — Claude omits ":00", live output shows both shapes. Local time,
+/// like the CLI's. Formatting here rather than in the frontend keeps one
+/// rendering for both agents and one field for the UI to read.
+///
+/// `secs` is unix **seconds** — Codex's `resets_at` is seconds, not millis;
+/// reading it as millis lands in 1970.
+fn format_resets_label(secs: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone, Timelike};
+    let Some(dt) = Local.timestamp_opt(secs, 0).single() else {
+        return String::new();
+    };
+    let hour12 = match dt.hour() % 12 {
+        0 => 12,
+        h => h,
+    };
+    let suffix = if dt.hour() < 12 { "am" } else { "pm" };
+    // %b is chrono's fixed English abbreviation ("Aug"), matching the CLI.
+    match dt.minute() {
+        0 => format!("{} {} at {hour12}{suffix}", dt.format("%b"), dt.day()),
+        m => format!("{} {} at {hour12}:{m:02}{suffix}", dt.format("%b"), dt.day()),
+    }
+}
+
 /// One `primary`/`secondary` limit block → a window. `window_minutes` names it:
 /// 10080 is a week, 300 is Codex's 5-hour window; anything else is reported in
 /// hours rather than invented.
@@ -251,8 +277,11 @@ fn quota_window(v: &Value) -> Option<QuotaWindow> {
         m if m % 60 == 0 => format!("{}h", m / 60),
         m => format!("{m}m"),
     };
+    // Unlike Claude, Codex gives a machine timestamp, so both fields are filled:
+    // `resets_at` for anything that needs to compute, the label for display.
     let resets_at = v.get("resets_at").and_then(|x| x.as_i64());
-    Some(QuotaWindow { label, used_percent: used, resets_at, resets_label: String::new() })
+    let resets_label = resets_at.map(format_resets_label).unwrap_or_default();
+    Some(QuotaWindow { label, used_percent: used, resets_at, resets_label })
 }
 
 /// A `rate_limits` payload → a snapshot. None when it carries no usable window,
@@ -1052,7 +1081,51 @@ mod tests {
         assert_eq!(q.windows[0].label, "Week");
         assert_eq!(q.windows[0].used_percent, 12.5);
         assert_eq!(q.windows[0].resets_at, Some(1787196735));
+        // Both fields are filled: the timestamp for anything that computes, and
+        // a display label so a Codex row reads like a Claude one instead of
+        // showing a bare percentage. (Exact text is asserted TZ-independently
+        // below; here it only has to be present and consistent.)
+        assert_eq!(q.windows[0].resets_label, format_resets_label(1787196735));
+        assert!(!q.windows[0].resets_label.is_empty());
         assert_eq!(ts, 1786507202000); // the event's own timestamp, in ms
+    }
+
+    /// The expected strings are built from a *local* datetime, so these assert
+    /// the format without depending on the machine's timezone (Asia/Saigon here,
+    /// UTC in CI).
+    #[test]
+    fn a_reset_time_is_rendered_the_way_claudes_cli_prints_one() {
+        use chrono::{Local, TimeZone};
+        let at = Local.with_ymd_and_hms(2026, 8, 20, 10, 32, 15).single().unwrap();
+        assert_eq!(format_resets_label(at.timestamp()), "Aug 20 at 10:32am");
+    }
+
+    #[test]
+    fn a_reset_time_on_the_hour_omits_the_minutes() {
+        // Claude prints "Aug 20 at 1am", never "1:00am" — verified against live
+        // CLI output, which shows both shapes. A Codex row sitting next to a
+        // Claude one in the same panel must not be styled differently.
+        use chrono::{Local, TimeZone};
+        let at = Local.with_ymd_and_hms(2026, 8, 20, 1, 0, 0).single().unwrap();
+        assert_eq!(format_resets_label(at.timestamp()), "Aug 20 at 1am");
+    }
+
+    #[test]
+    fn midnight_and_noon_read_as_12am_and_12pm() {
+        use chrono::{Local, TimeZone};
+        let midnight = Local.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        assert_eq!(format_resets_label(midnight.timestamp()), "Jan 1 at 12am");
+        let noon = Local.with_ymd_and_hms(2026, 12, 31, 12, 5, 0).single().unwrap();
+        assert_eq!(format_resets_label(noon.timestamp()), "Dec 31 at 12:05pm");
+    }
+
+    #[test]
+    fn a_window_without_a_reset_time_gets_an_empty_label() {
+        let v: Value =
+            serde_json::from_str(r#"{"used_percent":3.0,"window_minutes":300}"#).unwrap();
+        let w = quota_window(&v).expect("a window");
+        assert_eq!(w.resets_at, None);
+        assert_eq!(w.resets_label, "");
     }
 
     #[test]
@@ -1103,5 +1176,4 @@ mod tests {
         let q: crate::model::QuotaSnapshot = serde_json::from_value(v).unwrap();
         assert_eq!(q.windows[0].used_percent, 4.0);
     }
-
 }
