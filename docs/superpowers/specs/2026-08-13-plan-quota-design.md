@@ -100,7 +100,11 @@ Both adapters produce the same thing, so the UI and the tray never branch on age
 pub struct QuotaWindow {
     pub label: String,        // "Session", "Week", "Week (Fable)"
     pub used_percent: f64,
-    pub resets_at: Option<i64>, // unix seconds; None when the source omits it
+    /// Unix seconds, when the source gives a machine timestamp — Codex does.
+    /// `None` for Claude, whose CLI prints only a human string.
+    pub resets_at: Option<i64>,
+    /// Human reset text for display, e.g. "Aug 20 at 12:59am". Empty if absent.
+    pub resets_label: String,
 }
 
 pub struct QuotaSnapshot {
@@ -136,6 +140,11 @@ reading a file:
 - caches the parsed result; a failed run keeps the previous snapshot and marks it
   stale rather than blanking the display
 - `source_at` == `fetched_at`, since the CLI reports live figures
+
+The reset time is kept as text, not converted. Claude prints `Aug 20 at 12:59am
+(Asia/Saigon)` — no year — so deriving a unix timestamp means guessing one, and
+the guess is wrong around New Year. Codex's `resets_at` is already unix, so it
+fills both fields; Claude fills only the label.
 
 Parsing is line-oriented and tolerant: find lines matching
 `^Current (.+?): ([0-9]+(?:\.[0-9]+)?)% used(?: · resets (.+?))?$`, capturing
