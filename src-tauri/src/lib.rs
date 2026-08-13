@@ -3,6 +3,7 @@ mod config;
 mod model;
 mod parser;
 mod pricing;
+mod quota;
 mod store;
 
 use model::{Dashboard, Workspace};
