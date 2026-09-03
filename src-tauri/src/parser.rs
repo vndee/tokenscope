@@ -57,6 +57,32 @@ fn normalize_model(name: &str) -> String {
     name.to_string()
 }
 
+/// The one price lookup every caller uses: the RAW (possibly dated) id first,
+/// then its normalized form. `Pricing::lookup` never strips a `-YYYYMMDD`
+/// suffix (`normalize_key` only lowercases and de-dots), so the second step is
+/// the only thing that prices "claude-opus-5-20260101" against an undated table
+/// entry — which is every entry in the built-in snapshot `Pricing::shared()`
+/// serves until the async price loader lands.
+///
+/// The order is load-bearing in both directions: raw first so a dated release
+/// priced in its own right wins over its base model, normalized second so a
+/// dated id is never left unpriced. Shared by the read paths (`compute_event`,
+/// `Agg::add_row`) *and* the archive writer (`rollup::rows_from_events`), whose
+/// per-project/branch/account costs are frozen on disk and never recomputed —
+/// a one-step lookup there froze a real day's spend at $0 permanently.
+pub(crate) fn priced_cost(
+    pricing: &Pricing,
+    raw: &str,
+    input: f64,
+    output: f64,
+    cc: f64,
+    cr: f64,
+) -> Option<f64> {
+    pricing
+        .cost(raw, input, output, cc, cr)
+        .or_else(|| pricing.cost(&normalize_model(raw), input, output, cc, cr))
+}
+
 /// Last path component of a session cwd → a fallback "project" label. Handles
 /// unix and windows separators; empty/blank → "(unknown)".
 fn project_of(cwd: &str) -> String {
@@ -482,6 +508,12 @@ fn all_time_extras(archive: &Archive) -> AllTimeExtras {
             active.push((d, tok / 1e6));
         }
     }
+    // Not redundant with the BTreeMap's key order. `%m`/`%d` accept unpadded
+    // values, so a corrupt key like "2026-1-5" — the same malformed shape
+    // `monthly_series` defends against, from a file whose keys `load_from`
+    // never validates — parses fine yet sorts *after* "2026-01-06" as a
+    // string. The streak walk below reads consecutive dates, so it would
+    // silently break a real run in two. Keep this sort.
     active.sort_by_key(|(d, _)| *d);
 
     let biggest = active
@@ -683,9 +715,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .with_timezone(&Local);
     let model = normalize_model(&r.model);
     // price lookup uses the raw (possibly dated) id, then the normalized one
-    let cost_opt = pricing
-        .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
-        .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr));
+    let cost_opt = priced_cost(pricing, &r.model, r.in_tok, r.out_tok, r.cc, r.cr);
     let savings = pricing
         .cache_savings(&r.model, r.cr)
         .or_else(|| pricing.cache_savings(&model, r.cr))
@@ -844,9 +874,7 @@ impl Agg {
     fn add_row(&mut self, r: &DayRow, cfg: &UserConfig, pricing: &Pricing) {
         for (raw, b) in &r.models {
             let model = normalize_model(raw);
-            let cost = pricing
-                .cost(raw, b.input, b.out, b.cc, b.cr)
-                .or_else(|| pricing.cost(&model, b.input, b.out, b.cc, b.cr));
+            let cost = priced_cost(pricing, raw, b.input, b.out, b.cc, b.cr);
             let savings = pricing
                 .cache_savings(raw, b.cr)
                 .or_else(|| pricing.cache_savings(&model, b.cr))

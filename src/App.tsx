@@ -1041,8 +1041,20 @@ export default function App() {
     return () => cancelAnimationFrame(id);
   }, [dark]);
 
+  // Selected dashboard; fall back to the aggregate if the active account is
+  // gone. Computed here rather than after the `!ws` return below because the
+  // all-time fetch needs `effectiveTab` — the tabs render "All" when the
+  // selected account disappears, so the fetch has to ask for "all" too.
+  const selected = !ws
+    ? undefined
+    : activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
+  const effectiveTab = selected ? activeTab : "all";
+
   // On-demand fetch when we've navigated to a past period (refDate set). Live
   // mode (refDate === null) reads the workspace + gets live pushes instead.
+  // NOTE: this one passes `activeTab`, not `effectiveTab` — the same dead-account
+  // mismatch fixed in the all-time fetch below. Left alone deliberately: it
+  // predates this branch and is out of its scope, not an inconsistency.
   useEffect(() => {
     if (refDate === null) return;
     let cancelled = false;
@@ -1053,15 +1065,26 @@ export default function App() {
   }, [refDate, period, activeTab]);
 
   const [allTime, setAllTime] = useState<AllTimeReport | null>(null);
+  // What the report is *of*. `openGen` (the popover was reopened) is a refresh
+  // of the same subject, so it swaps the numbers in place; a change of account
+  // or period is a different subject, and rendering the old one would show the
+  // WRONG account's totals — that case resets to the loading state first.
+  const allTimeSubject = `${effectiveTab}:${period}`;
+  const allTimeSubjectRef = useRef(allTimeSubject);
   useEffect(() => {
+    const prev = allTimeSubjectRef.current;
+    allTimeSubjectRef.current = allTimeSubject;
     if (period !== "All") return;
     let cancelled = false;
-    setAllTime(null); // show the loading state while the account switch lands
-    fetchAllTime(activeTab)
+    // show the loading state while the account switch lands
+    if (prev !== allTimeSubject) setAllTime(null);
+    fetchAllTime(effectiveTab)
       .then((r) => { if (!cancelled) setAllTime(r); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [period, activeTab]);
+    // openGen: the webview stays mounted while the popover is hidden, so without
+    // it the All page would freeze at whatever it showed when first opened.
+  }, [period, effectiveTab, allTimeSubject, openGen]);
 
   const t = themeFor(dark, preset);
   if (err) {
@@ -1081,10 +1104,7 @@ export default function App() {
   const tabs = ws.accounts.length > 1
     ? [{ id: "all", label: "All", agent: "all" }, ...ws.accounts.map((a) => ({ id: a.id, label: labelOverrides[a.id] ?? a.label, agent: a.agent }))]
     : [];
-  // Selected dashboard; fall back to the aggregate if the active account is gone.
-  const selected = activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
   const dash = selected ?? ws.all;
-  const effectiveTab = selected ? activeTab : "all";
   // Per-account plan quota; the aggregate "All" tab has no single quota to show.
   // With one account there's no real "all" (see tabs above) — that lone account's
   // quota is the one to show even though effectiveTab reads "all". Its agent

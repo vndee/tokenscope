@@ -9,6 +9,7 @@
 // them at read time and they must stay retroactive: MCP/skill names are stored
 // unfiltered (the whitelist is applied when the row is read), and per-model
 // tokens are stored raw (prices are applied when the row is read).
+use crate::parser::priced_cost;
 use crate::pricing::Pricing;
 use crate::store::RawEvent;
 use chrono::{DateTime, Local, Timelike};
@@ -229,9 +230,9 @@ pub fn rows_from_events(
         if e.model.is_empty() {
             continue;
         }
-        let cost = pricing
-            .cost(&e.model, e.in_tok, e.out_tok, e.cc, e.cr)
-            .unwrap_or(0.0);
+        // Same two-step lookup the read paths use (raw id, then normalized):
+        // these costs are frozen into the archive, so a miss here is permanent.
+        let cost = priced_cost(pricing, &e.model, e.in_tok, e.out_tok, e.cc, e.cr).unwrap_or(0.0);
         if !e.session.is_empty() {
             seen.entry(date.clone()).or_default().insert(e.session.clone());
         }
@@ -274,6 +275,7 @@ pub fn rows_from_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::ModelPrice;
     use chrono::NaiveDate;
 
     fn raw(ts_ms: i64, model: &str, session: &str) -> RawEvent {
@@ -323,6 +325,39 @@ mod tests {
         assert_eq!(r.sessions, 1);
         assert_eq!(r.tool_results, 2);
         assert_eq!(r.tool_errors, 1);
+    }
+
+    #[test]
+    fn an_archived_cost_prices_a_dated_id_against_an_undated_table_entry() {
+        // The table holds only the undated base model — exactly the shape of the
+        // built-in snapshot `Pricing::shared()` serves until the async price
+        // loader lands. `Pricing::lookup` never strips `-YYYYMMDD`, so a one-step
+        // lookup on the raw id misses and freezes this day's project, branch and
+        // account costs at $0 forever (this file is never pruned), while the
+        // headline and per-model costs — re-derived on read via the two-step
+        // lookup — come out correct. `priced_cost` is what keeps the two agreeing.
+        let pricing = Pricing::with_exact(&[(
+            "claude-opus-5",
+            ModelPrice { input: 2e-6, output: 10e-6, cache_create: 0.0, cache_read: 0.0 },
+        )]);
+        let mut proj = |_: &str| "repo".to_string();
+        let rows = rows_from_events(
+            &[raw(TS, "claude-opus-5-20260101", "s1")],
+            &mut proj,
+            "Work",
+            &pricing,
+        );
+        let (_, r) = rows.iter().next().unwrap();
+
+        let want = 100.0 * 2e-6 + 10.0 * 10e-6; // 100 input, 10 output
+        assert!(want > 0.0);
+        assert!(
+            (r.projects["repo"].1 - want).abs() < 1e-12,
+            "project cost {} != {want}",
+            r.projects["repo"].1
+        );
+        assert!((r.branches["main"].1 - want).abs() < 1e-12);
+        assert!((r.accounts["Work"].1 - want).abs() < 1e-12);
     }
 
     #[test]
