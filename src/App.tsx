@@ -76,6 +76,30 @@ function sharePcts(values: number[]): number[] {
   return units.map((u) => u / 10);
 }
 
+// The model lists both bodies render, derived in one place so the period view
+// and the all-time view cannot drift apart:
+//   - rows recolored with the active preset's ramp, by rank
+//   - `tokenModels` hides noise: a share below 0.1% would render a meaningless
+//     "0.0%". It matters most on the all-time page, which accrues a long tail of
+//     barely-touched models and has no limit=5 self-cap like the BarLists.
+//   - `costModels` keeps its own filter, since a model with negligible tokens
+//     can still carry real spend.
+//   - `tokenShares` is apportioned over the *visible* rows, so what's on screen
+//     sums to exactly 100.0%.
+function modelLists(models: ModelStat[], totalTokens: number, ramp: string[]) {
+  const colored = models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
+  const tokenModels = colored.filter(
+    (m) => Math.round((m.tokens / (totalTokens || 1)) * 1000) / 10 >= 0.1
+  );
+  return {
+    models: colored,
+    tokenModels,
+    costModels: colored.filter((m) => m.cost > 0),
+    maxM: Math.max(...tokenModels.map((m) => m.tokens), 1e-9),
+    tokenShares: sharePcts(tokenModels.map((m) => m.tokens)),
+  };
+}
+
 function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: Theme; share: number }) {
   // 1-decimal share; whole numbers drop the ".0" (100% not 100.0%).
   const pctStr = share % 1 === 0 ? share.toFixed(0) : share.toFixed(1);
@@ -405,19 +429,7 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
 // comparison against a previous period.
 function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[] }) {
   const M = a.report.metrics;
-  const models = a.report.models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
-  // Same noise filter the period body applies: hide rows that would round to a
-  // meaningless "0.0%". It matters more here — all-time accrues a long tail of
-  // barely-touched models, and this list has no limit=5 self-cap like the
-  // BarLists below it. Cost keeps its own filter, since a model with negligible
-  // tokens can still carry real spend.
-  const tokenModels = models.filter(
-    (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
-  );
-  const costModels = models.filter((m) => m.cost > 0);
-  const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
-  // Shares over the *visible* rows, so what's on screen sums to exactly 100.0%.
-  const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
+  const { tokenModels, costModels, maxM, tokenShares } = modelLists(a.report.models, M.totalTokens, ramp);
   const peak = peakHours(a.report.hourly);
   if (!a.first) {
     return <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>No usage recorded yet.</div>;
@@ -470,6 +482,15 @@ function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[
         </div>
       )}
 
+      {/* Tokens by account — the same split the period body shows on the
+          aggregate tab. The `activeTab === "all"` half of that condition is
+          implied here: a report scoped to one account carries exactly one
+          entry, so `> 1` only ever holds for the aggregate. */}
+      {(a.report.accounts?.length ?? 0) > 1 && (<>
+        <SectionRule t={t} />
+        <Label t={t}>Tokens by account</Label>
+        <div style={{ marginTop: 6 }}><TokenBarList items={a.report.accounts} theme={t} accent={t.accent} /></div>
+      </>)}
       {a.report.projects.length > 0 && (<>
         <SectionRule t={t} />
         <Label t={t}>Projects</Label>
@@ -489,7 +510,7 @@ function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[
   );
 }
 
-function Panel({ report, heatmap, allTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
+function Panel({ report, heatmap, allTime, allTimeErr, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -514,22 +535,11 @@ function Panel({ report, heatmap, allTime, period, onPeriod, dark, themePref, on
   const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
   const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
-  // Recolor model slices with the active preset's ramp (rank order), so the
-  // model bars + cost donut match the chosen theme instead of the fixed green.
-  const models = P.models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
-  // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
-  // Show models whose share is at least 0.1% when rounded to 1 decimal; below
-  // that it'd render a meaningless "0.0%" (a negligible token share). Such a
-  // model can still appear under Cost if it has a non-zero cost.
-  const tokenModels = models.filter(
-    (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
-  );
-  const costModels = models.filter((m) => m.cost > 0);
+  // Recolor model slices with the active preset's ramp (rank order), filter the
+  // noise, and apportion the shares — see `modelLists`, shared with AllTimePage.
+  const { models, tokenModels, costModels, maxM, tokenShares } = modelLists(P.models, M.totalTokens, ramp);
   // models that were used but have no LiteLLM pricing (cost unknown, not $0)
   const unpricedModels = models.filter((m) => !m.priced && m.tokens > 0);
-  const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
-  // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
-  const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
   const trendSub = { Day: "today 24h", Week: "this week", Month: "this month", All: "" }[period];
   const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months", All: "" }[period];
   const navLabel = period === "Day" && isCurrent ? "Today" : P.range;
@@ -680,7 +690,19 @@ function Panel({ report, heatmap, allTime, period, onPeriod, dark, themePref, on
         {period === "All" ? (
           allTime
             ? <AllTimePage a={allTime} t={t} ramp={ramp} />
-            : <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>Loading…</div>
+            : allTimeErr
+              ? (
+                <div style={{ padding: "18px 0" }}>
+                  <div style={{ font: `600 11px ${t.mono}`, color: "#e0795f" }}>Couldn't load all-time history</div>
+                  <div style={{ font: `500 10px/1.5 ${t.mono}`, color: t.faint, marginTop: 5, wordBreak: "break-word" }}>{allTimeErr}</div>
+                  <button
+                    onClick={onRetryAllTime}
+                    style={{ marginTop: 10, font: `600 10px ${t.ui}`, color: t.accent, background: t.segBg,
+                      border: `1px solid ${t.segBorder}`, borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}
+                  >Retry</button>
+                </div>
+              )
+              : <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>Loading…</div>
         ) : (<>
           {/* period navigation: ‹ range › with a Today reset when viewing the past */}
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, cursor: "default" }}>
@@ -1065,6 +1087,11 @@ export default function App() {
   }, [refDate, period, activeTab]);
 
   const [allTime, setAllTime] = useState<AllTimeReport | null>(null);
+  // Unlike the period fetch above — which swallows its failure because
+  // `liveReport` is a real fallback — the All page has no second data source.
+  // Without this, one failed invoke left it on "Loading…" forever.
+  const [allTimeErr, setAllTimeErr] = useState<string | null>(null);
+  const [allTimeRetry, setAllTimeRetry] = useState(0);
   // What the report is *of*. `openGen` (the popover was reopened) is a refresh
   // of the same subject, so it swaps the numbers in place; a change of account
   // or period is a different subject, and rendering the old one would show the
@@ -1077,14 +1104,20 @@ export default function App() {
     if (period !== "All") return;
     let cancelled = false;
     // show the loading state while the account switch lands
-    if (prev !== allTimeSubject) setAllTime(null);
+    if (prev !== allTimeSubject) { setAllTime(null); setAllTimeErr(null); }
     fetchAllTime(effectiveTab)
-      .then((r) => { if (!cancelled) setAllTime(r); })
-      .catch(() => {});
+      .then((r) => { if (!cancelled) { setAllTime(r); setAllTimeErr(null); } })
+      .catch((e) => {
+        // Keep any report already on screen — a stale figure beats an error
+        // page — and surface the failure only when there is nothing to show.
+        if (!cancelled) setAllTimeErr(String((e as Error)?.message ?? e) || "unknown error");
+      });
     return () => { cancelled = true; };
     // openGen: the webview stays mounted while the popover is hidden, so without
     // it the All page would freeze at whatever it showed when first opened.
-  }, [period, effectiveTab, allTimeSubject, openGen]);
+    // allTimeRetry: the Retry button, for a failure the user wants to re-try
+    // without closing and reopening the popover.
+  }, [period, effectiveTab, allTimeSubject, openGen, allTimeRetry]);
 
   const t = themeFor(dark, preset);
   if (err) {
@@ -1151,6 +1184,8 @@ export default function App() {
       report={report}
       heatmap={dash.heatmap}
       allTime={allTime}
+      allTimeErr={allTimeErr}
+      onRetryAllTime={() => setAllTimeRetry((n) => n + 1)}
       period={period}
       onPeriod={changePeriod}
       dark={dark}

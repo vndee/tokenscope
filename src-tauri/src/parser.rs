@@ -606,12 +606,6 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
         }
     }
 
-    let range = if x.first.is_empty() {
-        "No usage yet".to_string()
-    } else {
-        format!("All time · since {}", x.first)
-    };
-
     AllTimeReport {
         report: PeriodReport {
             metrics,
@@ -626,7 +620,12 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
             req_trend: Vec::new(),
             cost_trend: Vec::new(),
             hourly,
-            range,
+            // Deliberately empty. `range` is the period views' navigation label
+            // ("Mar 3" / "Mar 2026"), and all-time has no period to name: the
+            // page writes its own header from `first`, formatted for display,
+            // and nothing reads this. Computing a second, ISO-shaped copy of
+            // that sentence here only invited the two to disagree.
+            range: String::new(),
             // Deliberately empty: there is no previous all-time to trend against.
             trend: Vec::new(),
         },
