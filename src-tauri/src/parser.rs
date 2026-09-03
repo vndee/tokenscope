@@ -4,7 +4,7 @@
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
-use crate::rollup::DayRow;
+use crate::rollup::{Archive, DayRow};
 use crate::store::{RawEvent, Store};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
@@ -293,6 +293,7 @@ fn account_events(
     HashSet<String>,
     HashSet<String>,
     Option<crate::model::QuotaSnapshot>,
+    Archive,
 ) {
     let mut store = Store::load(&a.id);
     let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
@@ -306,15 +307,31 @@ fn account_events(
     // Resolve each event's project to its git-repo root, memoized per unique cwd
     // so the (filesystem-backed) walk-up runs once per directory, not per event.
     let mut proj_memo: HashMap<String, String> = HashMap::new();
+    let mut resolve = |cwd: &str| -> String {
+        proj_memo
+            .entry(cwd.to_string())
+            .or_insert_with(|| resolve_project(cwd))
+            .clone()
+    };
+
+    // Fold this build's live days into the durable archive before the events are
+    // mapped. `cutoff` is a timestamp, so its own day is only partly in the
+    // store; `absorb` is what keeps that from overwriting a complete row.
+    let cutoff_date = DateTime::from_timestamp_millis(cutoff)
+        .unwrap_or_default()
+        .with_timezone(&Local)
+        .date_naive();
+    let rows = crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
+    let mut archive = Archive::load(&a.id);
+    archive.absorb(rows, cutoff_date);
+    archive.save(&a.id);
+
     let events = store
         .events
         .iter()
         .map(|r| {
             let mut e = compute_event(r, &cfg, pricing);
-            e.project = proj_memo
-                .entry(r.cwd.clone())
-                .or_insert_with(|| resolve_project(&r.cwd))
-                .clone();
+            e.project = resolve(&r.cwd);
             e.account = a.label.clone();
             e
         })
@@ -334,7 +351,7 @@ fn account_events(
                     })
             }),
     };
-    (events, cfg.mcp_servers, cfg.skills, quota)
+    (events, cfg.mcp_servers, cfg.skills, quota, archive)
 }
 
 /// Build a per-account dashboard for every discovered Claude account, plus an
@@ -359,7 +376,7 @@ pub fn build_workspace() -> Workspace {
     let mut all_skills: HashSet<String> = HashSet::new();
 
     for (d, a) in crate::agents::discover_all() {
-        let (events, servers, skills, quota) = account_events(d, &a, &pricing, cutoff);
+        let (events, servers, skills, quota, _) = account_events(d, &a, &pricing, cutoff);
         let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
         all_servers.extend(servers);
         all_skills.extend(skills);
@@ -403,7 +420,7 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk, _) = account_events(d, &a, &pricing, cutoff);
+        let (ev, srv, sk, _, _) = account_events(d, &a, &pricing, cutoff);
         events.extend(ev);
         servers.extend(srv);
         skills.extend(sk);
@@ -424,6 +441,190 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
 /// build_workspace; must not itself be called while holding it.
 pub fn build_dashboard() -> Dashboard {
     build_workspace().all
+}
+
+/// The facts that only exist at all-time scale, derived from the archive.
+struct AllTimeExtras {
+    first: String,
+    last: String,
+    active_days: u64,
+    biggest_day: Option<(String, f64)>,
+    longest_streak: u64,
+}
+
+/// Days with any usage, the biggest of them, and the longest unbroken run.
+/// A row with no tokens is not an active day: the archive can hold one for a
+/// day that saw only slash-command records.
+fn all_time_extras(archive: &Archive) -> AllTimeExtras {
+    let mut active: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+    for (date, r) in &archive.days {
+        let tok: f64 = r
+            .models
+            .values()
+            .map(|b| b.input + b.cc + b.cr + b.out)
+            .sum();
+        if tok <= 0.0 {
+            continue;
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+            active.push((d, tok / 1e6));
+        }
+    }
+    active.sort_by_key(|(d, _)| *d);
+
+    let biggest = active
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(d, t)| (iso(*d), r2(*t)));
+
+    let mut longest = 0u64;
+    let mut run = 0u64;
+    let mut prev: Option<chrono::NaiveDate> = None;
+    for (d, _) in &active {
+        run = match prev {
+            Some(p) if *d == p + Duration::days(1) => run + 1,
+            _ => 1,
+        };
+        longest = longest.max(run);
+        prev = Some(*d);
+    }
+
+    AllTimeExtras {
+        first: active.first().map(|(d, _)| iso(*d)).unwrap_or_default(),
+        last: active.last().map(|(d, _)| iso(*d)).unwrap_or_default(),
+        active_days: active.len() as u64,
+        biggest_day: biggest,
+        longest_streak: longest,
+    }
+}
+
+/// Build the all-time report for one account id, or `"all"` for every account
+/// summed. Reads only the durable archives — every live day was absorbed into
+/// them by `account_events`, so the archive alone is the complete picture and
+/// no day can be counted twice.
+pub fn build_all_time(account_id: &str) -> AllTimeReport {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    let pricing = Pricing::shared();
+
+    let mut agg = Agg::default();
+    let mut merged = Archive::default();
+    let mut servers: HashSet<String> = HashSet::new();
+    let mut skills: HashSet<String> = HashSet::new();
+
+    for (d, a) in crate::agents::discover_all() {
+        if account_id != "all" && a.id != account_id {
+            continue;
+        }
+        // Runs ingest + absorb, so the archive read below is current.
+        let (_ev, srv, sk, _q, archive) = account_events(d, &a, &pricing, cutoff);
+        let cfg = (d.load_config)(&a);
+        for row in archive.days.values() {
+            agg.add_row(row, &cfg, &pricing);
+        }
+        // For the extras (first/last/streak/biggest) and the monthly bars the
+        // accounts' days union: a day is active if any account worked that day.
+        for (date, row) in archive.days {
+            let e = merged
+                .days
+                .entry(date.clone())
+                .or_insert_with(|| DayRow::new(&date));
+            for (m, b) in &row.models {
+                let t = e.models.entry(m.clone()).or_default();
+                t.input += b.input;
+                t.cc += b.cc;
+                t.cr += b.cr;
+                t.out += b.out;
+                t.requests += b.requests;
+            }
+            for (i, v) in row.hourly.iter().take(24).enumerate() {
+                e.hourly[i] += v;
+            }
+        }
+        servers.extend(srv);
+        skills.extend(sk);
+    }
+
+    let x = all_time_extras(&merged);
+    let series = monthly_series(&merged);
+    let mut metrics = agg.metrics(0.0, 0.0);
+    metrics.servers = servers.len() as u64;
+    metrics.skills = skills.len() as u64;
+
+    // `merged` already carries each day's summed histogram, so this is the
+    // cross-day total.
+    let mut hourly = vec![0.0f64; 24];
+    for row in merged.days.values() {
+        for (i, v) in row.hourly.iter().take(24).enumerate() {
+            hourly[i] += v;
+        }
+    }
+
+    let range = if x.first.is_empty() {
+        "No usage yet".to_string()
+    } else {
+        format!("All time · since {}", x.first)
+    };
+
+    AllTimeReport {
+        report: PeriodReport {
+            metrics,
+            series,
+            models: agg.models(),
+            projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
+            branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+            accounts: Agg::named_tokens(&agg.account_tok, &agg.account_cost),
+            tools: Agg::named(&agg.tool_counts),
+            mcp: Agg::named(&agg.mcp_counts),
+            skills: Agg::named(&agg.skill_counts),
+            req_trend: Vec::new(),
+            cost_trend: Vec::new(),
+            hourly,
+            range,
+            // Deliberately empty: there is no previous all-time to trend against.
+            trend: Vec::new(),
+        },
+        first: x.first,
+        last: x.last,
+        active_days: x.active_days,
+        biggest_day: x.biggest_day,
+        longest_streak: x.longest_streak,
+    }
+}
+
+/// One bar per calendar month spanned by the archive, oldest→newest, with a
+/// sparse axis label so a multi-year range stays readable.
+fn monthly_series(archive: &Archive) -> Vec<SeriesPoint> {
+    let mut by_month: std::collections::BTreeMap<String, (f64, f64, f64)> =
+        std::collections::BTreeMap::new();
+    for (date, r) in &archive.days {
+        let key = date[..7].to_string(); // "yyyy-mm"
+        let e = by_month.entry(key).or_default();
+        for b in r.models.values() {
+            e.0 += b.input / 1e6;
+            e.1 += (b.cc + b.cr) / 1e6;
+            e.2 += b.out / 1e6;
+        }
+    }
+    let n = by_month.len();
+    by_month
+        .into_iter()
+        .enumerate()
+        .map(|(i, (key, (input, cache, output)))| {
+            let (y, m) = key.split_at(4);
+            let mi: usize = m[1..].parse::<usize>().unwrap_or(1) - 1;
+            // Label roughly six ticks regardless of range length.
+            let every = (n / 6).max(1);
+            SeriesPoint {
+                label: if i % every == 0 { MONTHS[mi].to_string() } else { String::new() },
+                full: format!("{} {}", MONTHS[mi], y),
+                input,
+                cache,
+                output,
+                date: format!("{key}-01"),
+            }
+        })
+        .collect()
 }
 
 /// Derive a computed Event from a stored RawEvent, applying the *current* user
@@ -1204,5 +1405,44 @@ mod tests {
         assert_eq!(agg.subagent_tok, 42.0);
         assert_eq!(agg.tool_results, 7);
         assert_eq!(agg.tool_errors, 1);
+    }
+
+    #[test]
+    fn all_time_extras_describe_the_archived_range() {
+        // Raw token counts, in the millions: `all_time_extras` reports M tokens
+        // rounded to 2 dp (the `r2` Global Constraint), so toy values would all
+        // round to 0.0 and the assertion below would prove nothing.
+        let mut archive = Archive::default();
+        for (date, out) in [
+            ("2026-01-05", 10e6),
+            ("2026-01-06", 90e6), // the biggest day
+            ("2026-01-07", 20e6),
+            // a gap on the 8th breaks the streak
+            ("2026-01-09", 30e6),
+        ] {
+            let mut r = DayRow::new(date);
+            r.models.insert(
+                "claude-opus-5".to_string(),
+                TokBits { input: 0.0, cc: 0.0, cr: 0.0, out, requests: 1 },
+            );
+            archive.days.insert(date.to_string(), r);
+        }
+
+        let x = all_time_extras(&archive);
+        assert_eq!(x.first, "2026-01-05");
+        assert_eq!(x.last, "2026-01-09");
+        assert_eq!(x.active_days, 4);
+        assert_eq!(x.longest_streak, 3); // 05, 06, 07
+        assert_eq!(x.biggest_day, Some(("2026-01-06".to_string(), 90.0)));
+    }
+
+    #[test]
+    fn all_time_extras_of_an_empty_archive_are_empty_not_zeroed_dates() {
+        let x = all_time_extras(&Archive::default());
+        assert_eq!(x.first, "");
+        assert_eq!(x.last, "");
+        assert_eq!(x.active_days, 0);
+        assert_eq!(x.longest_streak, 0);
+        assert_eq!(x.biggest_day, None);
     }
 }

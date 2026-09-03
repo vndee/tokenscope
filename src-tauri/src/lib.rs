@@ -763,6 +763,16 @@ async fn get_period(account: String, period: String, reference: String) -> model
         .unwrap_or_else(|_| parser::build_period(&acc, &per, reference_dt))
 }
 
+/// The all-time report for `account` ("all" or an account id): lifetime totals,
+/// monthly history, and records, read from the durable rollup archive.
+#[tauri::command]
+async fn get_all_time(account: String) -> model::AllTimeReport {
+    let acc = account.clone();
+    tauri::async_runtime::spawn_blocking(move || parser::build_all_time(&account))
+        .await
+        .unwrap_or_else(|_| parser::build_all_time(&acc))
+}
+
 /// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
 /// change at most a few times a day, so back-to-back clicks inside this window
 /// coalesce into one fetch.
@@ -922,6 +932,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_workspace,
             get_period,
+            get_all_time,
             save_screenshot,
             begin_drag,
             refresh_pricing,

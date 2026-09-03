@@ -111,6 +111,26 @@ pub struct PeriodReport {
     pub trend: Vec<TrendPoint>,
 }
 
+/// The all-time report: an ordinary `PeriodReport` (so every existing chart
+/// component works unchanged, with `series` holding monthly buckets) plus the
+/// facts that only exist at this scale. `delta_*` and `trend` on the inner
+/// report are left at their defaults and are not rendered — the fields here
+/// replace them rather than faking a comparison against a previous "period".
+#[derive(Debug, Clone, Serialize)]
+pub struct AllTimeReport {
+    pub report: PeriodReport,
+    /// ISO date of the first/last day with any usage; empty when there is none.
+    pub first: String,
+    pub last: String,
+    #[serde(rename = "activeDays")]
+    pub active_days: u64,
+    /// (ISO date, M tokens) of the single biggest day.
+    #[serde(rename = "biggestDay")]
+    pub biggest_day: Option<(String, f64)>,
+    #[serde(rename = "longestStreak")]
+    pub longest_streak: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HeatDay {
     pub date: String, // ISO yyyy-mm-dd
