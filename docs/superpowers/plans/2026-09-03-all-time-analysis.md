@@ -1266,7 +1266,7 @@ and register it in `invoke_handler` (around line 923), after `get_period,`:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd src-tauri && cargo test --lib`
-Expected: PASS — 117 passed, 2 ignored. Also `cargo build` must be clean of warnings about unused variables at the updated `account_events` call sites.
+Expected: PASS — 119 passed, 2 ignored. (Task 4's fix round added two tests, taking its total from 115 to 117.) Also `cargo build` must be clean of warnings about unused variables at the updated `account_events` call sites.
 
 - [ ] **Step 5: Verify against real data**
 
