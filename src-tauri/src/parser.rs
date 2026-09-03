@@ -4,6 +4,7 @@
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
+use crate::rollup::DayRow;
 use crate::store::{RawEvent, Store};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
@@ -496,6 +497,10 @@ struct Agg {
     tool_errors: u64,
     requests: u64,
     sessions: HashSet<String>,
+    /// Sessions contributed by archived rows, which carry a count rather than
+    /// the ids. Kept separate from `sessions` so the two are never conflated:
+    /// a synthetic id would be indistinguishable from a real one.
+    sessions_count: u64,
     mcp_calls: u64,
     skill_calls: u64,
     model_tok: HashMap<String, f64>,
@@ -572,6 +577,77 @@ impl Agg {
         }
     }
 
+    /// Fold one archived day into this aggregate.
+    ///
+    /// This is where the archive's two read-time contracts are honoured: MCP and
+    /// skill names were stored unfiltered, so the *current* whitelist applies
+    /// here; per-model tokens were stored raw, so the *current* price table
+    /// applies here. Both therefore stay retroactive for days the raw event
+    /// store can no longer reproduce.
+    fn add_row(&mut self, r: &DayRow, cfg: &UserConfig, pricing: &Pricing) {
+        for (raw, b) in &r.models {
+            let model = normalize_model(raw);
+            let cost = pricing
+                .cost(raw, b.input, b.out, b.cc, b.cr)
+                .or_else(|| pricing.cost(&model, b.input, b.out, b.cc, b.cr));
+            let savings = pricing
+                .cache_savings(raw, b.cr)
+                .or_else(|| pricing.cache_savings(&model, b.cr))
+                .unwrap_or(0.0);
+
+            self.input += b.input;
+            self.cache += b.cc + b.cr;
+            self.output += b.out;
+            self.cost += cost.unwrap_or(0.0);
+            self.savings += savings;
+            self.requests += b.requests;
+
+            let tok = b.input + b.cc + b.cr + b.out;
+            *self.model_tok.entry(model.clone()).or_default() += tok;
+            *self.model_cost.entry(model.clone()).or_default() += cost.unwrap_or(0.0);
+            *self.model_priced.entry(model).or_default() |= cost.is_some();
+        }
+
+        self.sessions_count += r.sessions;
+        self.subagent_tok += r.subagent;
+        self.tool_results += r.tool_results;
+        self.tool_errors += r.tool_errors;
+
+        // mcp__ calls have their own server-grouped view; including them here
+        // would double-count them, exactly as compute_event avoids.
+        for (name, c) in &r.tools {
+            if !name.starts_with("mcp__") {
+                *self.tool_counts.entry(name.clone()).or_default() += c;
+            }
+        }
+        for (name, c) in &r.mcp {
+            if cfg.is_user_mcp(name) {
+                self.mcp_calls += c;
+                *self.mcp_counts.entry(name.clone()).or_default() += c;
+            }
+        }
+        for (name, c) in &r.skills {
+            if cfg.is_user_skill(name) {
+                self.skill_calls += c;
+                let short = name.rsplit(':').next().unwrap_or(name).to_string();
+                *self.skill_counts.entry(short).or_default() += c;
+            }
+        }
+
+        for (name, (tok_m, cost)) in &r.projects {
+            *self.project_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.project_cost.entry(name.clone()).or_default() += cost;
+        }
+        for (name, (tok_m, cost)) in &r.branches {
+            *self.branch_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.branch_cost.entry(name.clone()).or_default() += cost;
+        }
+        for (name, (tok_m, cost)) in &r.accounts {
+            *self.account_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.account_cost.entry(name.clone()).or_default() += cost;
+        }
+    }
+
     fn models(&self) -> Vec<ModelStat> {
         let mut v: Vec<(String, f64, f64)> = self
             .model_tok
@@ -642,7 +718,7 @@ impl Agg {
             mcp_calls: self.mcp_calls,
             skill_calls: self.skill_calls,
             requests: self.requests,
-            sessions: self.sessions.len() as u64,
+            sessions: self.sessions.len() as u64 + self.sessions_count,
             delta_tokens,
             delta_cost,
             servers: self.mcp_counts.len() as u64,
@@ -996,5 +1072,83 @@ mod tests {
         assert_eq!(vendor_of("codex-auto-review"), "OpenAI");
         // Unchanged for the models already handled.
         assert_eq!(vendor_of("claude-opus-5"), "Anthropic");
+    }
+
+    use crate::rollup::{DayRow, TokBits};
+
+    fn day_row() -> DayRow {
+        let mut r = DayRow::new("2026-01-05");
+        r.models.insert(
+            "claude-opus-5-20260101".to_string(),
+            TokBits { input: 1_000_000.0, cc: 0.0, cr: 0.0, out: 100_000.0, requests: 3 },
+        );
+        r.mcp.insert("mcp__github".to_string(), 4);
+        r.mcp.insert("mcp__not-installed".to_string(), 9);
+        r.skills.insert("gstack:review".to_string(), 2);
+        r.tools.insert("Read".to_string(), 5);
+        r.tools.insert("mcp__github".to_string(), 4);
+        r.sessions = 2;
+        r
+    }
+
+    fn cfg_with(mcp: &[&str], skills: &[&str]) -> UserConfig {
+        UserConfig {
+            mcp_servers: mcp.iter().map(|s| s.to_string()).collect(),
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_archived_row_is_filtered_by_the_current_whitelist_on_read() {
+        // The whole point of archiving names unfiltered: installing an MCP
+        // server must make past calls count, even for days the raw store can no
+        // longer reproduce.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&["mcp__github"], &["review"]), &Pricing::empty());
+
+        assert_eq!(agg.mcp_calls, 4); // the un-installed server contributes nothing
+        assert_eq!(agg.mcp_counts.get("mcp__github"), Some(&4));
+        assert_eq!(agg.mcp_counts.get("mcp__not-installed"), None);
+        assert_eq!(agg.skill_calls, 2);
+        assert_eq!(agg.skill_counts.get("review"), Some(&2));
+    }
+
+    #[test]
+    fn a_newly_installed_server_retroactively_counts_in_an_archived_row() {
+        let mut agg = Agg::default();
+        agg.add_row(
+            &day_row(),
+            &cfg_with(&["mcp__github", "mcp__not-installed"], &[]),
+            &Pricing::empty(),
+        );
+        assert_eq!(agg.mcp_calls, 13);
+    }
+
+    #[test]
+    fn an_archived_rows_tools_drop_mcp_entries() {
+        // mcp__ calls have their own server-grouped view; counting them again
+        // under tools would duplicate them, exactly as compute_event avoids.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.tool_counts.get("Read"), Some(&5));
+        assert_eq!(agg.tool_counts.get("mcp__github"), None);
+    }
+
+    #[test]
+    fn an_archived_row_groups_tokens_under_the_normalized_model_name() {
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.requests, 3);
+        assert_eq!(agg.sessions_count, 2);
+        assert_eq!(agg.input, 1_000_000.0);
+        assert_eq!(agg.output, 100_000.0);
+        // The dated release merges into its base model for display.
+        assert!(agg.model_tok.contains_key("claude-opus-5"));
+        assert!(!agg.model_tok.contains_key("claude-opus-5-20260101"));
+        // No price table → cost unknown, and the model is marked unpriced.
+        assert_eq!(agg.cost, 0.0);
+        assert_eq!(agg.model_priced.get("claude-opus-5"), Some(&false));
     }
 }
