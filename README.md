@@ -33,6 +33,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI / Codex logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 | Codex plan quota | `rate_limits` on `token_count` lines in the Codex session logs |
 | Claude plan quota | `claude -p "/usage"`, run per account with `CLAUDE_CONFIG_DIR` |
+| All-time daily rollup (survives the 210-day event prune) | `~/Library/Caches/tokenscope/rollup-<account>.json` |
 
 Plan quota never touches a credential: Codex reports it inside the logs already
 being read, and Claude's comes from its own supported CLI. Tokenscope does not
@@ -67,6 +68,21 @@ Each Skill whitelist directory is scanned two ways: every non-dot top-level dire
 - Tool classification (Codex): an `mcp_tool_call_end` event names its server → MCP (checked against `config.toml`'s whitelist, so the built-in `codex_apps` connector is filtered out); reading a `skills/<name>/SKILL.md` (or `skills/<plugin>/<name>/SKILL.md`) path during a turn → Skill, once per turn
 
 > Cost is an **estimate** based on public prices; subscription users should read it as "equivalent spend value".
+
+The **All time** page reads a durable per-day rollup instead of the event
+store, which keeps only the last 210 days. A day is archived once the raw
+store still fully covers it, and rewritten on every launch that ingests new
+data until it falls out of that window; the boundary day, which the prune
+leaves only partially in the store, is written once and never overwritten by
+a later partial read. MCP/Skill names are archived unfiltered and per-model
+tokens are archived raw — the whitelist and the price table are applied when
+a row is read, not when it's written — so installing an MCP server, adding a
+Skill, or a price refresh all still apply retroactively to already-archived
+days. The one exception is project / branch / account cost, frozen at
+archive time (deriving it per day on read would need a project×model cross
+product); their token counts, and the headline and per-model costs, are
+still derived fresh on every read. What an archived day cannot do is drill
+down below the hour histogram it stores.
 
 ### Token types & cost formula
 
