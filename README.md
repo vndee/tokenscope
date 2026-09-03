@@ -71,18 +71,20 @@ Each Skill whitelist directory is scanned two ways: every non-dot top-level dire
 
 The **All time** page reads a durable per-day rollup instead of the event
 store, which keeps only the last 210 days. A day is archived once the raw
-store still fully covers it, and rewritten on every launch that ingests new
-data until it falls out of that window; the boundary day, which the prune
-leaves only partially in the store, is written once and never overwritten by
-a later partial read. MCP/Skill names are archived unfiltered and per-model
-tokens are archived raw — the whitelist and the price table are applied when
-a row is read, not when it's written — so installing an MCP server, adding a
-Skill, or a price refresh all still apply retroactively to already-archived
-days. The one exception is project / branch / account cost, frozen at
-archive time (deriving it per day on read would need a project×model cross
-product); their token counts, and the headline and per-model costs, are
-still derived fresh on every read. What an archived day cannot do is drill
-down below the hour histogram it stores.
+store still fully covers it, and rewritten on every launch that has new data
+to fold in, until it falls out of that window; the boundary day, which the
+prune leaves only partially in the store, is written once and never
+overwritten by a later partial read. MCP/Skill names are archived unfiltered
+and per-model tokens are archived raw — the whitelist and the price table
+are applied when a row is read, not when it's written — so installing an MCP
+server, adding a Skill, or a price refresh all still apply retroactively to
+already-archived days. The one exception is the project / branch / account
+breakdown: it's stored as a single (tokens, cost) pair per name and read
+back exactly as archived, so both members are frozen (deriving them per day
+on read would need a project×model cross product). What is still derived
+fresh on every read is the headline cost, the per-model costs, and the
+MCP/Skill filtering. What an archived day cannot do is drill down below the
+hour histogram it stores.
 
 ### Token types & cost formula
 
