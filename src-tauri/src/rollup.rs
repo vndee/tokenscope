@@ -9,8 +9,7 @@
 // them at read time and they must stay retroactive: MCP/skill names are stored
 // unfiltered (the whitelist is applied when the row is read), and per-model
 // tokens are stored raw (prices are applied when the row is read).
-use crate::parser::priced_cost;
-use crate::pricing::Pricing;
+use crate::pricing::{priced_cost, Pricing};
 use crate::store::RawEvent;
 use chrono::{DateTime, Local, Timelike};
 use serde::{Deserialize, Serialize};

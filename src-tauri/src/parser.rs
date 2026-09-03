@@ -3,7 +3,7 @@
 // into Day / Week / Month reports + a daily heatmap.
 use crate::config::UserConfig;
 use crate::model::*;
-use crate::pricing::Pricing;
+use crate::pricing::{normalize_model, priced_cost_norm, Pricing};
 use crate::rollup::{Archive, DayRow};
 use crate::store::{RawEvent, Store};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
@@ -41,47 +41,9 @@ struct Event {
 const PALETTE: &[&str] = &["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const OVERFLOW_GRAY: &str = "#79817b";
 
-/// Strip a trailing "-YYYYMMDD" date suffix so dated releases merge into
-/// their base model (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5").
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-
-fn normalize_model(name: &str) -> String {
-    if let Some(idx) = name.rfind('-') {
-        let suffix = &name[idx + 1..];
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return name[..idx].to_string();
-        }
-    }
-    name.to_string()
-}
-
-/// The one price lookup every caller uses: the RAW (possibly dated) id first,
-/// then its normalized form. `Pricing::lookup` never strips a `-YYYYMMDD`
-/// suffix (`normalize_key` only lowercases and de-dots), so the second step is
-/// the only thing that prices "claude-opus-5-20260101" against an undated table
-/// entry — which is every entry in the built-in snapshot `Pricing::shared()`
-/// serves until the async price loader lands.
-///
-/// The order is load-bearing in both directions: raw first so a dated release
-/// priced in its own right wins over its base model, normalized second so a
-/// dated id is never left unpriced. Shared by the read paths (`compute_event`,
-/// `Agg::add_row`) *and* the archive writer (`rollup::rows_from_events`), whose
-/// per-project/branch/account costs are frozen on disk and never recomputed —
-/// a one-step lookup there froze a real day's spend at $0 permanently.
-pub(crate) fn priced_cost(
-    pricing: &Pricing,
-    raw: &str,
-    input: f64,
-    output: f64,
-    cc: f64,
-    cr: f64,
-) -> Option<f64> {
-    pricing
-        .cost(raw, input, output, cc, cr)
-        .or_else(|| pricing.cost(&normalize_model(raw), input, output, cc, cr))
-}
 
 /// Last path component of a session cwd → a fallback "project" label. Handles
 /// unix and windows separators; empty/blank → "(unknown)".
@@ -761,8 +723,11 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .unwrap_or_default()
         .with_timezone(&Local);
     let model = normalize_model(&r.model);
-    // price lookup uses the raw (possibly dated) id, then the normalized one
-    let cost_opt = priced_cost(pricing, &r.model, r.in_tok, r.out_tok, r.cc, r.cr);
+    // Price lookup uses the raw (possibly dated) id, then the normalized one.
+    // `_norm` hands over the `model` binding above rather than normalizing a
+    // second time: `normalize_model` always allocates, and this runs once per
+    // event on the hottest path in the app.
+    let cost_opt = priced_cost_norm(pricing, &r.model, &model, r.in_tok, r.out_tok, r.cc, r.cr);
     let savings = pricing
         .cache_savings(&r.model, r.cr)
         .or_else(|| pricing.cache_savings(&model, r.cr))
@@ -921,7 +886,7 @@ impl Agg {
     fn add_row(&mut self, r: &DayRow, cfg: &UserConfig, pricing: &Pricing) {
         for (raw, b) in &r.models {
             let model = normalize_model(raw);
-            let cost = priced_cost(pricing, raw, b.input, b.out, b.cc, b.cr);
+            let cost = priced_cost_norm(pricing, raw, &model, b.input, b.out, b.cc, b.cr);
             let savings = pricing
                 .cache_savings(raw, b.cr)
                 .or_else(|| pricing.cache_savings(&model, b.cr))
