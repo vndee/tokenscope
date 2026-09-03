@@ -442,14 +442,18 @@ First add a test-only constructor to `src-tauri/src/pricing.rs`. Place it immedi
 pub struct Pricing {
 ```
 
-Then add to `src-tauri/src/rollup.rs`, after the `impl Archive` block:
+Then add these imports to the **top** of `src-tauri/src/rollup.rs`, merged into the existing `use` block (never mid-file — every other module in this repo keeps its imports at the top):
 
 ```rust
 use crate::pricing::Pricing;
 use crate::store::RawEvent;
 use chrono::{DateTime, Local, Timelike};
 use std::collections::HashSet;
+```
 
+And add the function itself after the `impl Archive` block:
+
+```rust
 /// Fold raw events into one row per local calendar day.
 ///
 /// Built from `RawEvent` rather than `parser::Event` on purpose: `Event.model`
@@ -892,10 +896,10 @@ Then add `add_row` to the `impl Agg` block, right after `fn add`:
 Add the import at the top of `parser.rs`, next to the existing `use crate::store::{RawEvent, Store};`:
 
 ```rust
-use crate::rollup::{Archive, DayRow};
+use crate::rollup::DayRow;
 ```
 
-(`Archive` is used in Task 5; importing both now keeps the import list stable.)
+Import **only** `DayRow`. `Archive` is not used until Task 5, and importing it here would leave an unused-import warning for a whole task.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -930,13 +934,16 @@ Add to the `tests` module in `src-tauri/src/parser.rs`:
 ```rust
     #[test]
     fn all_time_extras_describe_the_archived_range() {
+        // Raw token counts, in the millions: `all_time_extras` reports M tokens
+        // rounded to 2 dp (the `r2` Global Constraint), so toy values would all
+        // round to 0.0 and the assertion below would prove nothing.
         let mut archive = Archive::default();
         for (date, out) in [
-            ("2026-01-05", 10.0),
-            ("2026-01-06", 90.0), // the biggest day
-            ("2026-01-07", 20.0),
+            ("2026-01-05", 10e6),
+            ("2026-01-06", 90e6), // the biggest day
+            ("2026-01-07", 20e6),
             // a gap on the 8th breaks the streak
-            ("2026-01-09", 30.0),
+            ("2026-01-09", 30e6),
         ] {
             let mut r = DayRow::new(date);
             r.models.insert(
@@ -951,7 +958,7 @@ Add to the `tests` module in `src-tauri/src/parser.rs`:
         assert_eq!(x.last, "2026-01-09");
         assert_eq!(x.active_days, 4);
         assert_eq!(x.longest_streak, 3); // 05, 06, 07
-        assert_eq!(x.biggest_day, Some(("2026-01-06".to_string(), 90.0 / 1e6)));
+        assert_eq!(x.biggest_day, Some(("2026-01-06".to_string(), 90.0)));
     }
 
     #[test]
@@ -996,7 +1003,7 @@ pub struct AllTimeReport {
 }
 ```
 
-**3b.** In `src-tauri/src/parser.rs`, persist rows during ingest. In `account_events`, after the existing `store.save(&a.id);` block and before `let cfg = (d.load_config)(a);`, the project memo is needed by both the rollup and the event mapping, so hoist it. Replace the body from `let cfg = ...` through the `let events = ...` binding with:
+**3b.** In `src-tauri/src/parser.rs`, widen Task 4's import to `use crate::rollup::{Archive, DayRow};` — this task is the first to use `Archive`. Then persist rows during ingest. In `account_events`, after the existing `store.save(&a.id);` block and before `let cfg = (d.load_config)(a);`, the project memo is needed by both the rollup and the event mapping, so hoist it. Replace the body from `let cfg = ...` through the `let events = ...` binding with:
 
 ```rust
     let cfg = (d.load_config)(a);
@@ -1350,7 +1357,7 @@ git commit -m "feat: add the all-time report type and its fetcher"
 
 **Files:**
 - Modify: `src/App.tsx` (new `AllTimePage`; `Panel` renders it; `period` state widens; `Segmented` gains a fourth item)
-- Modify: `src/charts.tsx:18` (`Segmented` default `items`) — **only if** the default needs changing; prefer passing `items` explicitly from `App.tsx` and leaving the default alone.
+- Do NOT modify `src/charts.tsx`. `Segmented` already accepts an `items` prop; Task 7 passes the four-item list explicitly and leaves the component's default (`["Day","Week","Month"]`) untouched, since other call sites rely on it.
 
 **Interfaces:**
 - Consumes: `AllTimeReport`, `fetchAllTime` (Task 6); the existing `BarChart`, `BarList`, `TokenBarList`, `CostDonut`, `Segmented`, `MiniStat`, `Label`, `SectionRule`, `fmtTokens`, `fmtMoney`, `fmtInt`, `fmtHeatDate`, `peakHours`, `fmtHourRange`.
@@ -1362,6 +1369,20 @@ In `src/App.tsx`:
 
 ```ts
 const [period, setPeriod] = useState<"Day" | "Week" | "Month" | "All">("Week");
+```
+
+`App.tsx:443-444` index two records by `period`:
+
+```ts
+const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months" }[period];
+```
+
+Widening `period` makes both a hard typecheck error under `strict: true`. Add an `All` entry to each so the lookups stay total — the values are never read, because the branch that renders them does not run in `All` mode:
+
+```ts
+const trendSub = { Day: "today 24h", Week: "this week", Month: "this month", All: "" }[period];
+const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months", All: "" }[period];
 ```
 
 Update `changePeriod`'s cast to `"Day" | "Week" | "Month" | "All"`, and make it a no-op for date navigation when `All` is picked (there is no reference date to keep):
