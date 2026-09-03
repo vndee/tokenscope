@@ -1375,6 +1375,7 @@ mod tests {
     use crate::rollup::{DayRow, TokBits};
 
 
+
     fn day_row() -> DayRow {
         let mut r = DayRow::new("2026-01-05");
         r.models.insert(

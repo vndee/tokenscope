@@ -11,7 +11,7 @@
 // tokens are stored raw (prices are applied when the row is read).
 use crate::pricing::{priced_cost, Pricing};
 use crate::store::RawEvent;
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -243,28 +243,42 @@ pub fn rows_from_events(
     let mut rows: BTreeMap<String, DayRow> = BTreeMap::new();
     // Session ids seen per day, collapsed into a count once we're done.
     let mut seen: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    // The last day seen, and its ISO string. Events are sequential within a log
+    // file, so this hits for nearly every one — which turns a per-event
+    // `format("%Y-%m-%d")` (re-parsing the format spec) plus a `String` alloc,
+    // plus two more clones of it to key `rows` and `seen`, into one per day.
+    let mut day_key: Option<(chrono::NaiveDate, String)> = None;
 
     for e in events {
         let ts: DateTime<Local> = DateTime::from_timestamp_millis(e.ts_ms)
             .unwrap_or_default()
             .with_timezone(&Local);
-        let date = ts.date_naive().format("%Y-%m-%d").to_string();
-        let row = rows
-            .entry(date.clone())
-            .or_insert_with(|| DayRow::new(&date));
+        let d = ts.date_naive();
+        if day_key.as_ref().map_or(true, |(cached, _)| *cached != d) {
+            let s = format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day());
+            // Both maps are seeded on the day change, so the per-event path is
+            // a plain lookup with no key to allocate. Seeding `seen` with an
+            // empty set is harmless: the collapse below then writes
+            // `sessions = 0`, which is already a fresh row's value.
+            rows.entry(s.clone()).or_insert_with(|| DayRow::new(&s));
+            seen.entry(s.clone()).or_default();
+            day_key = Some((d, s));
+        }
+        let date = day_key.as_ref().map(|(_, s)| s.as_str()).expect("just set");
+        let row = rows.get_mut(date).expect("seeded on the day change");
 
         let tok = e.in_tok + e.cc + e.cr + e.out_tok;
 
         // Tools/MCP/Skills count on every event; models, requests and sessions
         // skip model-less records. Mirrors Agg::add exactly.
         for t in &e.tools {
-            *row.tools.entry(t.clone()).or_default() += 1;
+            *bump(&mut row.tools, t) += 1;
         }
         for s in &e.mcp {
-            *row.mcp.entry(s.clone()).or_default() += 1;
+            *bump(&mut row.mcp, s) += 1;
         }
         for s in &e.skills {
-            *row.skills.entry(s.clone()).or_default() += 1;
+            *bump(&mut row.skills, s) += 1;
         }
         row.tool_results += e.tool_results as u64;
         row.tool_errors += e.tool_errors as u64;
@@ -277,9 +291,14 @@ pub fn rows_from_events(
         // these costs are frozen into the archive, so a miss here is permanent.
         let cost = priced_cost(pricing, &e.model, e.in_tok, e.out_tok, e.cc, e.cr).unwrap_or(0.0);
         if !e.session.is_empty() {
-            seen.entry(date.clone()).or_default().insert(e.session.clone());
+            let ids = seen.get_mut(date).expect("seeded on the day change");
+            // `contains` first: a session spans many events, so all but the
+            // first insert would clone the id only to drop it.
+            if !ids.contains(&e.session) {
+                ids.insert(e.session.clone());
+            }
         }
-        let bits = row.models.entry(e.model.clone()).or_default();
+        let bits = bump(&mut row.models, &e.model);
         bits.input += e.in_tok;
         bits.cc += e.cc;
         bits.cr += e.cr;
@@ -296,12 +315,14 @@ pub fn rows_from_events(
             p.1 += cost;
         }
         if !e.branch.is_empty() {
-            let b = row.branches.entry(e.branch.clone()).or_default();
+            let b = bump(&mut row.branches, &e.branch);
             b.0 += tok / 1e6;
             b.1 += cost;
         }
         if !account_label.is_empty() {
-            let a = row.accounts.entry(account_label.to_string()).or_default();
+            // Constant for the whole call, so `entry(account_label.to_string())`
+            // allocated the same key once per event and threw every one away.
+            let a = bump(&mut row.accounts, account_label);
             a.0 += tok / 1e6;
             a.1 += cost;
         }
@@ -313,6 +334,19 @@ pub fn rows_from_events(
         }
     }
     rows
+}
+
+/// `map.entry(key.to_string()).or_default()`, without allocating the key on a
+/// hit. Every map this is used for has tiny cardinality (a handful of tools,
+/// models and branches; exactly one account label) against hundreds of
+/// thousands of events, so `entry` spent nearly all of its clones on keys
+/// `or_default` immediately discarded. Two hash probes cost less than one
+/// allocation.
+fn bump<'m, V: Default>(map: &'m mut HashMap<String, V>, key: &str) -> &'m mut V {
+    if !map.contains_key(key) {
+        map.insert(key.to_string(), V::default());
+    }
+    map.get_mut(key).expect("inserted above")
 }
 
 #[cfg(test)]
