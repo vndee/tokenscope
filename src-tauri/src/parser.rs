@@ -28,7 +28,7 @@ struct Event {
     priced: bool, // whether a price was found for this model
     project: String, // cwd basename ("" if unknown)
     branch: String,  // git branch ("" if unknown)
-    account: String, // owning account label (set by account_events)
+    account: String, // owning account label (set by materialize_events)
     tools: Vec<String>, // all tool_use names in this msg (mcp__ excluded here)
     sidechain: bool,    // ran inside a subagent
     tool_results: u64,  // tool_result blocks (reliability denominator)
@@ -68,7 +68,7 @@ fn project_of(cwd: &str) -> String {
 /// that contains a `.git` entry (the repo root) and returning its basename, so a
 /// session launched in a subdir (…/repo/backend) rolls up to the repo (repo).
 /// Falls back to the cwd's own basename when no repo is found or the path is gone.
-/// Filesystem-backed, so callers memoize per unique cwd (see `account_events`).
+/// Filesystem-backed, so callers memoize per unique cwd (see `account_sync` and `materialize_events`).
 fn resolve_project(cwd: &str) -> String {
     if !cwd.is_empty() {
         let mut dir = std::path::Path::new(cwd);
@@ -559,7 +559,7 @@ fn all_time_extras(archive: &Archive) -> AllTimeExtras {
 
 /// Build the all-time report for one account id, or `"all"` for every account
 /// summed. Reads only the durable archives — every live day was absorbed into
-/// them by `account_events`, so the archive alone is the complete picture and
+/// them by `account_sync`, so the archive alone is the complete picture and
 /// no day can be counted twice.
 pub fn build_all_time(account_id: &str) -> AllTimeReport {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -771,7 +771,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         priced: cost_opt.is_some(),
         project: project_of(&r.cwd),
         branch: r.branch.clone(),
-        account: String::new(), // filled in by account_events (knows the account)
+        account: String::new(), // filled in by materialize_events (knows the account)
         tools,
         sidechain: r.sidechain,
         tool_results: r.tool_results as u64,

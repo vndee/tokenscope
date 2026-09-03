@@ -427,7 +427,7 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
 // cost me, ever" — so it gets its own body rather than a wider window on the
 // period layout: no date navigation, no delta badge, and records instead of a
 // comparison against a previous period.
-function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[] }) {
+function AllTimePage({ a, t, ramp, activeTab }: { a: AllTimeReport; t: Theme; ramp: string[]; activeTab: string }) {
   const M = a.report.metrics;
   const { tokenModels, costModels, maxM, tokenShares } = modelLists(a.report.models, M.totalTokens, ramp);
   const peak = peakHours(a.report.hourly);
@@ -482,11 +482,13 @@ function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[
         </div>
       )}
 
-      {/* Tokens by account — the same split the period body shows on the
-          aggregate tab. The `activeTab === "all"` half of that condition is
-          implied here: a report scoped to one account carries exactly one
-          entry, so `> 1` only ever holds for the aggregate. */}
-      {(a.report.accounts?.length ?? 0) > 1 && (<>
+      {/* Tokens by account — same guard as the period body's aggregate-tab
+          split. Account labels are archived at fold time from `.claude.json`
+          (organizationName/displayName/email local-part) and never rewritten,
+          so a single account can legitimately end up with more than one label
+          if that name ever changes — `accounts.length > 1` alone isn't proof
+          of multiple accounts, only `activeTab === "all"` is. */}
+      {activeTab === "all" && (a.report.accounts?.length ?? 0) > 1 && (<>
         <SectionRule t={t} />
         <Label t={t}>Tokens by account</Label>
         <div style={{ marginTop: 6 }}><TokenBarList items={a.report.accounts} theme={t} accent={t.accent} /></div>
@@ -510,7 +512,7 @@ function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[
   );
 }
 
-function Panel({ report, heatmap, allTime, allTimeErr, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
+function Panel({ report, heatmap, allTime, allTimeErr, allTimeBusy, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; allTimeBusy: boolean; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -689,7 +691,7 @@ function Panel({ report, heatmap, allTime, allTimeErr, onRetryAllTime, period, o
         <div style={{ padding: "14px 15px 15px" }}>
         {period === "All" ? (
           allTime
-            ? <AllTimePage a={allTime} t={t} ramp={ramp} />
+            ? <AllTimePage a={allTime} t={t} ramp={ramp} activeTab={activeTab} />
             : allTimeErr
               ? (
                 <div style={{ padding: "18px 0" }}>
@@ -697,9 +699,10 @@ function Panel({ report, heatmap, allTime, allTimeErr, onRetryAllTime, period, o
                   <div style={{ font: `500 10px/1.5 ${t.mono}`, color: t.faint, marginTop: 5, wordBreak: "break-word" }}>{allTimeErr}</div>
                   <button
                     onClick={onRetryAllTime}
-                    style={{ marginTop: 10, font: `600 10px ${t.ui}`, color: t.accent, background: t.segBg,
-                      border: `1px solid ${t.segBorder}`, borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}
-                  >Retry</button>
+                    disabled={allTimeBusy}
+                    style={{ marginTop: 10, font: `600 10px ${t.ui}`, color: allTimeBusy ? t.faint : t.accent, background: t.segBg,
+                      border: `1px solid ${t.segBorder}`, borderRadius: 6, padding: "4px 10px", cursor: allTimeBusy ? "default" : "pointer" }}
+                  >{allTimeBusy ? "Retrying…" : "Retry"}</button>
                 </div>
               )
               : <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>Loading…</div>
@@ -1092,6 +1095,12 @@ export default function App() {
   // Without this, one failed invoke left it on "Loading…" forever.
   const [allTimeErr, setAllTimeErr] = useState<string | null>(null);
   const [allTimeRetry, setAllTimeRetry] = useState(0);
+  // Visible in-flight state for the Retry button (mirrors `quotaBusy` for the
+  // quota refresh control): without it, a click that doesn't change the fetch
+  // subject leaves the old error on screen for the whole ~600ms `build_all_time`
+  // and the user can't tell it registered, so they click again and queue up
+  // more BUILD_LOCK work.
+  const [allTimeBusy, setAllTimeBusy] = useState(false);
   // What the report is *of*. `openGen` (the popover was reopened) is a refresh
   // of the same subject, so it swaps the numbers in place; a change of account
   // or period is a different subject, and rendering the old one would show the
@@ -1105,13 +1114,15 @@ export default function App() {
     let cancelled = false;
     // show the loading state while the account switch lands
     if (prev !== allTimeSubject) { setAllTime(null); setAllTimeErr(null); }
+    setAllTimeBusy(true);
     fetchAllTime(effectiveTab)
       .then((r) => { if (!cancelled) { setAllTime(r); setAllTimeErr(null); } })
       .catch((e) => {
         // Keep any report already on screen — a stale figure beats an error
         // page — and surface the failure only when there is nothing to show.
         if (!cancelled) setAllTimeErr(String((e as Error)?.message ?? e) || "unknown error");
-      });
+      })
+      .finally(() => { if (!cancelled) setAllTimeBusy(false); });
     return () => { cancelled = true; };
     // openGen: the webview stays mounted while the popover is hidden, so without
     // it the All page would freeze at whatever it showed when first opened.
@@ -1185,7 +1196,16 @@ export default function App() {
       heatmap={dash.heatmap}
       allTime={allTime}
       allTimeErr={allTimeErr}
-      onRetryAllTime={() => setAllTimeRetry((n) => n + 1)}
+      allTimeBusy={allTimeBusy}
+      onRetryAllTime={() => {
+        // Give the click visible effect immediately — don't wait for the
+        // effect (same subject, so it wouldn't reset these on its own) —
+        // and disable the button so repeated clicks can't queue up more
+        // BUILD_LOCK work.
+        setAllTimeErr(null);
+        setAllTimeBusy(true);
+        setAllTimeRetry((n) => n + 1);
+      }}
       period={period}
       onPeriod={changePeriod}
       dark={dark}
