@@ -274,6 +274,7 @@ pub fn rows_from_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     fn raw(ts_ms: i64, model: &str, session: &str) -> RawEvent {
         RawEvent {
@@ -394,8 +395,6 @@ mod tests {
         );
         r
     }
-
-    use chrono::NaiveDate;
 
     fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
