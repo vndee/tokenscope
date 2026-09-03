@@ -189,9 +189,6 @@ pub fn rows_from_events(
             .or_insert_with(|| DayRow::new(&date));
 
         let tok = e.in_tok + e.cc + e.cr + e.out_tok;
-        let cost = pricing
-            .cost(&e.model, e.in_tok, e.out_tok, e.cc, e.cr)
-            .unwrap_or(0.0);
 
         // Tools/MCP/Skills count on every event; models, requests and sessions
         // skip model-less records. Mirrors Agg::add exactly.
@@ -211,6 +208,9 @@ pub fn rows_from_events(
         if e.model.is_empty() {
             continue;
         }
+        let cost = pricing
+            .cost(&e.model, e.in_tok, e.out_tok, e.cc, e.cr)
+            .unwrap_or(0.0);
         if !e.session.is_empty() {
             seen.entry(date.clone()).or_default().insert(e.session.clone());
         }
@@ -253,7 +253,6 @@ pub fn rows_from_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::RawEvent;
 
     fn raw(ts_ms: i64, model: &str, session: &str) -> RawEvent {
         RawEvent {
@@ -345,16 +344,25 @@ mod tests {
         let p = Pricing::empty();
         let day_ms = 86_400_000;
         let mut proj = |_: &str| "repo".to_string();
+        // Same session on two different days, plus two events with the same
+        // session on day 1 to verify per-day deduplication.
         let rows = rows_from_events(
-            &[raw(TS, "m", "s1"), raw(TS + day_ms, "m", "s1")],
+            &[
+                raw(TS, "m", "s1"),
+                raw(TS + 3600_000, "m", "s1"),  // Second s1 event on same day
+                raw(TS + 7200_000, "m", "s2"),   // Different session, same day
+                raw(TS + day_ms, "m", "s1"),    // s1 again on day 2
+            ],
             &mut proj,
             "Work",
             &p,
         );
         assert_eq!(rows.len(), 2);
-        for r in rows.values() {
-            assert_eq!(r.sessions, 1);
-        }
+        let days: Vec<_> = rows.values().collect();
+        // Day 1: s1 appears twice but counts as one session; s2 appears once → 2 sessions total
+        assert_eq!(days[0].sessions, 2);
+        // Day 2: s1 appears once → 1 session
+        assert_eq!(days[1].sessions, 1);
     }
 
     fn row(date: &str, out: f64) -> DayRow {
