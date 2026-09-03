@@ -20,12 +20,17 @@ use std::path::PathBuf;
 pub const ROLLUP_VERSION: u32 = 1;
 
 /// Raw token components for one model on one day, plus its request count.
-/// Kept raw so cost is re-derived from the *current* price table on read.
+/// Kept raw (absolute token counts, not M tokens or cost) so cost is re-derived
+/// from the *current* price table on read.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct TokBits {
+    /// Absolute raw input tokens.
     pub input: f64,
+    /// cache creation tokens (absolute raw count).
     pub cc: f64,
+    /// cache read tokens (absolute raw count).
     pub cr: f64,
+    /// Absolute raw output tokens.
     pub out: f64,
     pub requests: u64,
 }
@@ -45,11 +50,15 @@ pub struct DayRow {
     pub branches: HashMap<String, (f64, f64)>,
     #[serde(default)]
     pub accounts: HashMap<String, (f64, f64)>,
-    /// Unfiltered names — the whitelist is applied on read.
+    /// Every tool_use name in this message. Contains both `mcp__` and non-MCP entries;
+    /// `mcp__` entries are dropped on read (never whitelist-filtered) so the MCP view
+    /// isn't duplicated.
     #[serde(default)]
     pub tools: HashMap<String, u64>,
+    /// Unfiltered MCP server names — the whitelist is applied on read.
     #[serde(default)]
     pub mcp: HashMap<String, u64>,
+    /// Unfiltered Skill names — the whitelist is applied on read.
     #[serde(default)]
     pub skills: HashMap<String, u64>,
     /// Hour-of-day token histogram, M tokens.
@@ -60,7 +69,7 @@ pub struct DayRow {
     /// unbounded id set. Bounded at one per crossing, and accepted.
     #[serde(default)]
     pub sessions: u64,
-    /// Raw tokens spent inside subagents (isSidechain).
+    /// Absolute raw tokens spent inside subagents (isSidechain).
     #[serde(default)]
     pub subagent: f64,
     #[serde(default)]
@@ -99,6 +108,9 @@ struct Doc {
     days: BTreeMap<String, DayRow>,
 }
 
+/// Atomically replace `path`'s contents: write a sibling temp file, then rename
+/// over the target (same-volume rename is atomic on Windows and Unix). Avoids
+/// the half-written/truncated JSON that a crash mid-`fs::write` would leave.
 fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, data)?;
