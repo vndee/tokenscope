@@ -5,7 +5,7 @@ use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::{normalize_model, priced_cost_norm, Pricing};
 use crate::rollup::{Archive, DayRow};
-use crate::store::{RawEvent, Store};
+use crate::store::{RawEvent, Store, RETENTION_DAYS};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -44,6 +44,14 @@ const OVERFLOW_GRAY: &str = "#79817b";
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/// A skill's display name: the segment after the last ':' of its key, so
+/// "gstack:review" and a bare "review" both read as "review". Shared by the two
+/// read paths (`compute_event` for live events, `Agg::add_row` for archived
+/// rows) so the archive and the live store can never disagree about a name.
+fn short_skill_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
 
 /// Last path component of a session cwd → a fallback "project" label. Handles
 /// unix and windows separators; empty/blank → "(unknown)".
@@ -398,8 +406,8 @@ pub fn build_workspace() -> Workspace {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let now = Local::now();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (now - Duration::days(210)).timestamp_millis();
+    // Reports/heatmap span ~26 weeks (+ prev month); RETENTION_DAYS leaves margin.
+    let cutoff = (now - Duration::days(RETENTION_DAYS)).timestamp_millis();
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
@@ -455,7 +463,7 @@ pub fn build_workspace() -> Workspace {
 /// month). Powers date navigation and drill-down into past periods.
 pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) -> PeriodReport {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    let cutoff = (Local::now() - Duration::days(RETENTION_DAYS)).timestamp_millis();
     let pricing = Pricing::shared();
 
     let mut events: Vec<Event> = Vec::new();
@@ -555,7 +563,7 @@ fn all_time_extras(archive: &Archive) -> AllTimeExtras {
 /// no day can be counted twice.
 pub fn build_all_time(account_id: &str) -> AllTimeReport {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    let cutoff = (Local::now() - Duration::days(RETENTION_DAYS)).timestamp_millis();
     let pricing = Pricing::shared();
 
     let mut agg = Agg::default();
@@ -742,7 +750,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .skills
         .iter()
         .filter(|s| cfg.is_user_skill(s))
-        .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
+        .map(|s| short_skill_name(s).to_string())
         .collect();
     // Tool-usage breakdown covers built-in tools; mcp__ calls have their own
     // (server-grouped) view, so drop them here to avoid a duplicated, noisier list.
@@ -926,8 +934,10 @@ impl Agg {
         for (name, c) in &r.skills {
             if cfg.is_user_skill(name) {
                 self.skill_calls += c;
-                let short = name.rsplit(':').next().unwrap_or(name).to_string();
-                *self.skill_counts.entry(short).or_default() += c;
+                *self
+                    .skill_counts
+                    .entry(short_skill_name(name).to_string())
+                    .or_default() += c;
             }
         }
 
@@ -1428,6 +1438,28 @@ mod tests {
             &Pricing::empty(),
         );
         assert_eq!(agg.mcp_calls, 13);
+    }
+
+    #[test]
+    fn sessions_sum_the_live_id_set_and_the_archived_counts() {
+        // `metrics.sessions` is the one figure fed from both halves of the
+        // all-time picture: live events carry session *ids* (deduped in a set),
+        // archived rows carry only a per-day *count*, because keeping the ids
+        // would mean archiving an unbounded set. The two are held apart so a
+        // synthetic id can never look real, and combined only here — untested
+        // until now, so a dropped term or a `.max()` would have gone unnoticed.
+        let mut agg = Agg::default();
+        agg.add(&ev("s1", "claude-opus-5"));
+        agg.add(&ev("s1", "claude-opus-5")); // same session: still one
+        agg.add(&ev("s2", "claude-opus-5"));
+        assert_eq!(agg.sessions.len(), 2);
+
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+        assert_eq!(agg.sessions_count, 2, "day_row() carries sessions = 2");
+
+        // 2 distinct live ids + 2 archived days' worth. `.max()` would say 2,
+        // and either term alone would say 2 — only the sum says 4.
+        assert_eq!(agg.metrics(0.0, 0.0).sessions, 4);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // Durable per-day rollup archive.
 //
-// The raw event store is pruned to 210 days (see parser.rs), and pruned events
+// The raw event store is pruned to `store::RETENTION_DAYS` (the cutoff is
+// computed in parser.rs), and pruned events
 // never come back — an old log already read to EOF is never re-read. This file
 // is what makes "all time" mean all time: one small, self-describing row per
 // calendar day, in its own never-pruned document.
@@ -18,7 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 
 // Bump when a row's meaning changes. A mismatch discards the archive whole:
-// up to 210 days rebuild from the raw store, and older history is lost, which
+// up to RETENTION_DAYS rebuild from the raw store, and older history is lost, which
 // is strictly better than silently misreading it.
 pub const ROLLUP_VERSION: u32 = 1;
 
@@ -377,9 +378,19 @@ mod tests {
         }
     }
 
-    // 2026-01-05T09:00:00Z as ms; the local hour is asserted from the event
-    // itself so the test is timezone-independent.
+    // 2026-01-05T09:00:00Z as ms. Tests that care which hour bucket a row books
+    // into derive the expected hour from this timestamp with `local_hour`, never
+    // from a hard-coded number, so they hold in any timezone.
     const TS: i64 = 1_767_603_600_000;
+
+    /// The local hour-of-day an event at `ts_ms` falls in — the same conversion
+    /// `rows_from_events` does, so an assertion built on it is timezone-independent.
+    fn local_hour(ts_ms: i64) -> usize {
+        DateTime::from_timestamp_millis(ts_ms)
+            .unwrap()
+            .with_timezone(&Local)
+            .hour() as usize
+    }
 
     #[test]
     fn a_row_carries_unfiltered_names_and_raw_model_tokens() {
@@ -465,11 +476,26 @@ mod tests {
             &p,
         );
         assert_eq!(rows.len(), 2);
-        // Each row books its tokens into exactly one hour bucket.
-        for r in rows.values() {
+        // One day per row, and each day's tokens land in the *specific* bucket
+        // for the event's local hour. Asserting only the 24-bucket sum would be
+        // invariant to which bucket was written, so `hourly[0] += ...` would
+        // pass it; these assertions are what pin the hour half of this test.
+        // Rows are date-ordered, so they line up with the ascending timestamps.
+        let want = 110.0 / 1e6;
+        for (ms, r) in [TS, TS + day_ms].into_iter().zip(rows.values()) {
             assert_eq!(r.hourly.len(), 24);
-            let total: f64 = r.hourly.iter().sum();
-            assert!((total - 110.0 / 1e6).abs() < 1e-12);
+            let h = local_hour(ms);
+            assert!(
+                (r.hourly[h] - want).abs() < 1e-12,
+                "hour {h} holds {}, want {want}",
+                r.hourly[h]
+            );
+            // Single-event day: every other bucket must be untouched.
+            for (i, v) in r.hourly.iter().enumerate() {
+                if i != h {
+                    assert_eq!(*v, 0.0, "hour {i} should be empty, holds {v}");
+                }
+            }
         }
     }
 
@@ -664,8 +690,8 @@ mod tests {
 
     #[test]
     fn an_archive_from_an_older_version_is_discarded_whole() {
-        // A format change must lose history rather than misread it: up to 210
-        // days rebuild themselves from the raw store on the next build.
+        // A format change must lose history rather than misread it: up to
+        // RETENTION_DAYS rebuild themselves from the raw store on the next build.
         let dir = std::env::temp_dir().join(format!("ts-roll-ver-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::create_dir_all(&dir);
