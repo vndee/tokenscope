@@ -71,11 +71,12 @@ Each Skill whitelist directory is scanned two ways: every non-dot top-level dire
 
 The **All time** page reads a durable per-day rollup instead of the event
 store, which keeps only the last 210 days. A day is archived once the raw
-store still fully covers it, and rewritten on every launch that has new data
-to fold in, until it falls out of that window; the boundary day, which the
-prune leaves only partially in the store, is written once and never
-overwritten by a later partial read. MCP/Skill names are archived unfiltered
-and per-model tokens are archived raw — the whitelist and the price table
+store still fully covers it, and rewritten on every launch that has anything
+to fold in — new log bytes, or events aged out by the prune — until it
+falls out of that window; the boundary day, which the prune leaves only
+partially in the store, is written once and never overwritten by a later
+partial read. MCP/Skill names are archived unfiltered and per-model
+tokens are archived raw — the whitelist and the price table
 are applied when a row is read, not when it's written — so installing an MCP
 server, adding a Skill, or a price refresh all still apply retroactively to
 already-archived days. The one exception is the project / branch / account
