@@ -9,8 +9,11 @@
 // them at read time and they must stay retroactive: MCP/skill names are stored
 // unfiltered (the whitelist is applied when the row is read), and per-model
 // tokens are stored raw (prices are applied when the row is read).
+use crate::pricing::Pricing;
+use crate::store::RawEvent;
+use chrono::{DateTime, Local, Timelike};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -159,9 +162,200 @@ impl Archive {
     }
 }
 
+/// Fold raw events into one row per local calendar day.
+///
+/// Built from `RawEvent` rather than `parser::Event` on purpose: `Event.model`
+/// is already normalized (the archive needs the raw id as a price key) and
+/// `Event.mcp`/`skills` are already whitelist-filtered (the archive needs them
+/// unfiltered). `project_of` resolves a cwd to its project name — the caller
+/// passes its memoized resolver so the filesystem walk isn't repeated per event.
+pub fn rows_from_events(
+    events: &[RawEvent],
+    project_of: &mut dyn FnMut(&str) -> String,
+    account_label: &str,
+    pricing: &Pricing,
+) -> BTreeMap<String, DayRow> {
+    let mut rows: BTreeMap<String, DayRow> = BTreeMap::new();
+    // Session ids seen per day, collapsed into a count once we're done.
+    let mut seen: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+
+    for e in events {
+        let ts: DateTime<Local> = DateTime::from_timestamp_millis(e.ts_ms)
+            .unwrap_or_default()
+            .with_timezone(&Local);
+        let date = ts.date_naive().format("%Y-%m-%d").to_string();
+        let row = rows
+            .entry(date.clone())
+            .or_insert_with(|| DayRow::new(&date));
+
+        let tok = e.in_tok + e.cc + e.cr + e.out_tok;
+        let cost = pricing
+            .cost(&e.model, e.in_tok, e.out_tok, e.cc, e.cr)
+            .unwrap_or(0.0);
+
+        // Tools/MCP/Skills count on every event; models, requests and sessions
+        // skip model-less records. Mirrors Agg::add exactly.
+        for t in &e.tools {
+            *row.tools.entry(t.clone()).or_default() += 1;
+        }
+        for s in &e.mcp {
+            *row.mcp.entry(s.clone()).or_default() += 1;
+        }
+        for s in &e.skills {
+            *row.skills.entry(s.clone()).or_default() += 1;
+        }
+        row.tool_results += e.tool_results as u64;
+        row.tool_errors += e.tool_errors as u64;
+        row.hourly[ts.hour() as usize] += tok / 1e6;
+
+        if e.model.is_empty() {
+            continue;
+        }
+        if !e.session.is_empty() {
+            seen.entry(date.clone()).or_default().insert(e.session.clone());
+        }
+        let bits = row.models.entry(e.model.clone()).or_default();
+        bits.input += e.in_tok;
+        bits.cc += e.cc;
+        bits.cr += e.cr;
+        bits.out += e.out_tok;
+        bits.requests += 1;
+
+        if e.sidechain {
+            row.subagent += tok;
+        }
+        let project = project_of(&e.cwd);
+        if !project.is_empty() {
+            let p = row.projects.entry(project).or_default();
+            p.0 += tok / 1e6;
+            p.1 += cost;
+        }
+        if !e.branch.is_empty() {
+            let b = row.branches.entry(e.branch.clone()).or_default();
+            b.0 += tok / 1e6;
+            b.1 += cost;
+        }
+        if !account_label.is_empty() {
+            let a = row.accounts.entry(account_label.to_string()).or_default();
+            a.0 += tok / 1e6;
+            a.1 += cost;
+        }
+    }
+
+    for (date, ids) in seen {
+        if let Some(r) = rows.get_mut(&date) {
+            r.sessions = ids.len() as u64;
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::RawEvent;
+
+    fn raw(ts_ms: i64, model: &str, session: &str) -> RawEvent {
+        RawEvent {
+            ts_ms,
+            session: session.into(),
+            model: model.into(),
+            in_tok: 100.0,
+            cc: 0.0,
+            cr: 0.0,
+            out_tok: 10.0,
+            mcp: vec!["mcp__github".into()],
+            skills: vec!["gstack:review".into()],
+            id: String::new(),
+            source: "/logs/a.jsonl".into(),
+            cwd: "/w/repo".into(),
+            branch: "main".into(),
+            tools: vec!["Read".into(), "mcp__github".into()],
+            sidechain: false,
+            tool_results: 2,
+            tool_errors: 1,
+        }
+    }
+
+    // 2026-01-05T09:00:00Z as ms; the local hour is asserted from the event
+    // itself so the test is timezone-independent.
+    const TS: i64 = 1_767_603_600_000;
+
+    #[test]
+    fn a_row_carries_unfiltered_names_and_raw_model_tokens() {
+        let p = Pricing::empty();
+        let mut proj = |_: &str| "repo".to_string();
+        let rows = rows_from_events(&[raw(TS, "claude-opus-5-20260101", "s1")], &mut proj, "Work", &p);
+        let (_, r) = rows.iter().next().unwrap();
+
+        // Raw id, so the price table can be applied on read.
+        let bits = &r.models["claude-opus-5-20260101"];
+        assert_eq!(bits.input, 100.0);
+        assert_eq!(bits.out, 10.0);
+        assert_eq!(bits.requests, 1);
+        // Unfiltered: no whitelist has been applied.
+        assert_eq!(r.mcp["mcp__github"], 1);
+        assert_eq!(r.skills["gstack:review"], 1);
+        // Tools keep the mcp__ entry too; parser.rs drops it on read.
+        assert_eq!(r.tools["Read"], 1);
+        assert_eq!(r.tools["mcp__github"], 1);
+        assert_eq!(r.sessions, 1);
+        assert_eq!(r.tool_results, 2);
+        assert_eq!(r.tool_errors, 1);
+    }
+
+    #[test]
+    fn an_event_with_no_model_counts_its_tools_but_not_a_request_or_session() {
+        // An empty model marks a record that is not an LLM request (Claude's
+        // slash-command lines, Codex's tool records). Counting one as a request
+        // or a session fabricates activity — the same guard Agg::add applies.
+        let p = Pricing::empty();
+        let mut proj = |_: &str| "repo".to_string();
+        let rows = rows_from_events(&[raw(TS, "", "s1")], &mut proj, "Work", &p);
+        let (_, r) = rows.iter().next().unwrap();
+
+        assert!(r.models.is_empty());
+        assert_eq!(r.sessions, 0);
+        assert_eq!(r.tools["Read"], 1);
+        assert_eq!(r.mcp["mcp__github"], 1);
+    }
+
+    #[test]
+    fn events_group_by_local_calendar_day_and_hour() {
+        let p = Pricing::empty();
+        let day_ms = 86_400_000;
+        let mut proj = |_: &str| "repo".to_string();
+        let rows = rows_from_events(
+            &[raw(TS, "m", "s1"), raw(TS + day_ms, "m", "s2")],
+            &mut proj,
+            "Work",
+            &p,
+        );
+        assert_eq!(rows.len(), 2);
+        // Each row books its tokens into exactly one hour bucket.
+        for r in rows.values() {
+            assert_eq!(r.hourly.len(), 24);
+            let total: f64 = r.hourly.iter().sum();
+            assert!((total - 110.0 / 1e6).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_session_spanning_two_days_counts_once_in_each() {
+        let p = Pricing::empty();
+        let day_ms = 86_400_000;
+        let mut proj = |_: &str| "repo".to_string();
+        let rows = rows_from_events(
+            &[raw(TS, "m", "s1"), raw(TS + day_ms, "m", "s1")],
+            &mut proj,
+            "Work",
+            &p,
+        );
+        assert_eq!(rows.len(), 2);
+        for r in rows.values() {
+            assert_eq!(r.sessions, 1);
+        }
+    }
 
     fn row(date: &str, out: f64) -> DayRow {
         let mut r = DayRow::new(date);

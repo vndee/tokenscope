@@ -38,6 +38,7 @@ impl ModelPrice {
     }
 }
 
+#[derive(Default)]
 pub struct Pricing {
     exact: HashMap<String, ModelPrice>,
     norm: HashMap<String, ModelPrice>,
@@ -366,6 +367,13 @@ impl Pricing {
             return Some(p);
         }
         self.norm.get(&normalize_key(model))
+    }
+
+    /// An empty table: every lookup misses. Test-only — production code always
+    /// goes through `load`/`shared`, which fall back to a built-in snapshot.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self::default()
     }
 
     /// Exact-or-normalized cost in USD. None = no pricing data for this model.
