@@ -4,6 +4,7 @@ mod model;
 mod parser;
 mod pricing;
 mod quota;
+mod rollup;
 mod store;
 
 use model::{Dashboard, Workspace};
