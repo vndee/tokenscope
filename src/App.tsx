@@ -406,7 +406,18 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
 function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[] }) {
   const M = a.report.metrics;
   const models = a.report.models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
+  // Same noise filter the period body applies: hide rows that would round to a
+  // meaningless "0.0%". It matters more here — all-time accrues a long tail of
+  // barely-touched models, and this list has no limit=5 self-cap like the
+  // BarLists below it. Cost keeps its own filter, since a model with negligible
+  // tokens can still carry real spend.
+  const tokenModels = models.filter(
+    (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
+  );
   const costModels = models.filter((m) => m.cost > 0);
+  const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
+  // Shares over the *visible* rows, so what's on screen sums to exactly 100.0%.
+  const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
   const peak = peakHours(a.report.hourly);
   if (!a.first) {
     return <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>No usage recorded yet.</div>;
@@ -449,9 +460,8 @@ function AllTimePage({ a, t, ramp }: { a: AllTimeReport; t: Theme; ramp: string[
       <SectionRule t={t} />
       <Label t={t}>Models</Label>
       <div style={{ marginTop: 6 }}>
-        {models.map((m, i) => (
-          <ModelRow key={m.name} m={m} max={Math.max(...models.map((x) => x.tokens), 1e-9)} theme={t}
-            share={sharePcts(models.map((x) => x.tokens))[i]} />
+        {tokenModels.map((m, i) => (
+          <ModelRow key={m.name} m={m} max={maxM} theme={t} share={tokenShares[i]} />
         ))}
       </div>
       {costModels.length > 0 && (

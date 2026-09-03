@@ -120,6 +120,10 @@ export function isCurrentPeriod(iso: string, period: string): boolean {
 
 // ── formatting helpers ──────────────────────────────────────────
 export const fmtTokens = (m: number) => {
+  // All-time totals are ~1000x a period's, so four-digit "6191.06M" figures are
+  // the norm on that page rather than an edge case — and a heavy user's Month
+  // view reaches them too.
+  if (m >= 1000) return (m / 1000).toFixed(2) + "B";
   if (m >= 1) return m.toFixed(2) + "M";
   const k = m * 1000;
   // one decimal for sub-1K totals (e.g. "0.4K"), but only when it rounds to a
