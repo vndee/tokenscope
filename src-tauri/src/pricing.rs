@@ -376,6 +376,18 @@ impl Pricing {
         Self::default()
     }
 
+    /// A table with only exact-id entries, `norm` left empty. Test-only — lets a
+    /// test put different prices on a raw id and its normalized form, to pin
+    /// which one `cost`/`cache_savings` consult first.
+    #[cfg(test)]
+    pub fn with_exact(entries: &[(&str, ModelPrice)]) -> Self {
+        let mut p = Self::default();
+        for (id, price) in entries {
+            p.exact.insert(id.to_string(), price.clone());
+        }
+        p
+    }
+
     /// Exact-or-normalized cost in USD. None = no pricing data for this model.
     pub fn cost(
         &self,

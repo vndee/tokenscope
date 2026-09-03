@@ -1074,6 +1074,7 @@ mod tests {
         assert_eq!(vendor_of("claude-opus-5"), "Anthropic");
     }
 
+    use crate::pricing::ModelPrice;
     use crate::rollup::{DayRow, TokBits};
 
     fn day_row() -> DayRow {
@@ -1088,6 +1089,12 @@ mod tests {
         r.tools.insert("Read".to_string(), 5);
         r.tools.insert("mcp__github".to_string(), 4);
         r.sessions = 2;
+        r.projects.insert("proj-a".to_string(), (1.5, 2.25));
+        r.branches.insert("main".to_string(), (2.0, 3.0));
+        r.accounts.insert("acct-1".to_string(), (0.5, 0.75));
+        r.subagent = 42.0;
+        r.tool_results = 7;
+        r.tool_errors = 1;
         r
     }
 
@@ -1150,5 +1157,52 @@ mod tests {
         // No price table → cost unknown, and the model is marked unpriced.
         assert_eq!(agg.cost, 0.0);
         assert_eq!(agg.model_priced.get("claude-opus-5"), Some(&false));
+    }
+
+    #[test]
+    fn an_archived_row_is_priced_by_its_raw_id_before_its_normalized_one() {
+        // Archived rows key `models` by the raw (possibly dated) id specifically
+        // so a price update or a dated release's own rate applies retroactively.
+        // Put different prices on the raw id and its normalized form: if
+        // `add_row` looked up the normalized id first, this row would be priced
+        // at 7.0 (1_000_000 * 5e-6 + 100_000 * 20e-6) instead of the 3.0 below.
+        let pricing = Pricing::with_exact(&[
+            (
+                "claude-opus-5-20260101",
+                ModelPrice { input: 2e-6, output: 10e-6, cache_create: 0.0, cache_read: 0.0 },
+            ),
+            (
+                "claude-opus-5",
+                ModelPrice { input: 5e-6, output: 20e-6, cache_create: 0.0, cache_read: 0.0 },
+            ),
+        ]);
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &pricing);
+
+        assert_eq!(agg.cost, 3.0);
+        assert_eq!(agg.model_priced.get("claude-opus-5"), Some(&true));
+    }
+
+    #[test]
+    fn an_archived_rows_project_branch_account_and_passthrough_fields_convert_correctly() {
+        // `DayRow` stores project/branch/account tokens in M tokens (to match
+        // how they're frozen at archive time); `Agg` accumulates raw tokens
+        // everywhere else. This pins the `* 1e6` conversion in `add_row`: a
+        // dropped or inverted conversion here would be a 1,000,000x error that
+        // every other test in this module is blind to.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.project_tok.get("proj-a"), Some(&1_500_000.0));
+        assert_eq!(agg.branch_tok.get("main"), Some(&2_000_000.0));
+        assert_eq!(agg.account_tok.get("acct-1"), Some(&500_000.0));
+        // Costs are frozen USD already, not M tokens — they pass through unchanged.
+        assert_eq!(agg.project_cost.get("proj-a"), Some(&2.25));
+        assert_eq!(agg.branch_cost.get("main"), Some(&3.0));
+        assert_eq!(agg.account_cost.get("acct-1"), Some(&0.75));
+        // Plain counters/totals pass through unchanged too.
+        assert_eq!(agg.subagent_tok, 42.0);
+        assert_eq!(agg.tool_results, 7);
+        assert_eq!(agg.tool_errors, 1);
     }
 }
