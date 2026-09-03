@@ -314,17 +314,29 @@ fn account_events(
             .clone()
     };
 
-    // Fold this build's live days into the durable archive before the events are
-    // mapped. `cutoff` is a timestamp, so its own day is only partly in the
-    // store; `absorb` is what keeps that from overwriting a complete row.
-    let cutoff_date = DateTime::from_timestamp_millis(cutoff)
-        .unwrap_or_default()
-        .with_timezone(&Local)
-        .date_naive();
-    let rows = crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
+    // Load unconditionally: callers get the archive back and it must always be
+    // valid, whether or not this build had anything new to fold in.
     let mut archive = Archive::load(&a.id);
-    archive.absorb(rows, cutoff_date);
-    archive.save(&a.id);
+    // Re-folding every retained event and rewriting the archive costs real time,
+    // and this runs on the 30s poll and on every watcher refresh. Skip it when
+    // `dirty` says the event set is unchanged: the same events yield the same
+    // rows. A price refresh or a whitelist change is NOT a reason to re-absorb —
+    // rows keep raw per-model tokens and unfiltered names precisely so both
+    // apply at read time in `add_row`. Only the frozen project/branch/account
+    // cost can drift, which the archive format already accepts as frozen.
+    if dirty || archive.days.is_empty() {
+        // Fold this build's live days into the durable archive before the events
+        // are mapped. `cutoff` is a timestamp, so its own day is only partly in
+        // the store; `absorb` is what keeps that from overwriting a complete row.
+        let cutoff_date = DateTime::from_timestamp_millis(cutoff)
+            .unwrap_or_default()
+            .with_timezone(&Local)
+            .date_naive();
+        let rows =
+            crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
+        archive.absorb(rows, cutoff_date);
+        archive.save(&a.id);
+    }
 
     let events = store
         .events
@@ -516,7 +528,8 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        // Runs ingest + absorb, so the archive read below is current.
+        // Runs ingest, and re-absorbs whenever anything changed, so the archive
+        // read below is current either way.
         let (_ev, srv, sk, _q, archive) = account_events(d, &a, &pricing, cutoff);
         let cfg = (d.load_config)(&a);
         for row in archive.days.values() {
@@ -524,23 +537,7 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
         }
         // For the extras (first/last/streak/biggest) and the monthly bars the
         // accounts' days union: a day is active if any account worked that day.
-        for (date, row) in archive.days {
-            let e = merged
-                .days
-                .entry(date.clone())
-                .or_insert_with(|| DayRow::new(&date));
-            for (m, b) in &row.models {
-                let t = e.models.entry(m.clone()).or_default();
-                t.input += b.input;
-                t.cc += b.cc;
-                t.cr += b.cr;
-                t.out += b.out;
-                t.requests += b.requests;
-            }
-            for (i, v) in row.hourly.iter().take(24).enumerate() {
-                e.hourly[i] += v;
-            }
-        }
+        merge_days(&mut merged, archive);
         servers.extend(srv);
         skills.extend(sk);
     }
@@ -592,13 +589,61 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
     }
 }
 
+/// The 1..=12 month of a "yyyy-mm…" key, or `None` if it is not one.
+fn month_num(key: &str) -> Option<usize> {
+    key.get(5..7)
+        .and_then(|m| m.parse::<usize>().ok())
+        .filter(|m| (1..=12).contains(m))
+}
+
+/// Union one account's archive into a cross-account one, summing days the two
+/// share.
+///
+/// PARTIAL by design: only `models` and `hourly` are carried over, because only
+/// `all_time_extras`, `monthly_series` and the cross-day hourly fold read the
+/// result. Every other `DayRow` field — `projects`, `branches`, `accounts`,
+/// `tools`, `mcp`, `skills`, `sessions`, `subagent`, `tool_results`,
+/// `tool_errors` — is left at its default here; those come from `Agg::add_row`
+/// per account instead. Reading them off the merged archive would silently
+/// return zeros.
+fn merge_days(into: &mut Archive, from: Archive) {
+    for (date, row) in from.days {
+        let e = into
+            .days
+            .entry(date.clone())
+            .or_insert_with(|| DayRow::new(&date));
+        for (m, b) in &row.models {
+            let t = e.models.entry(m.clone()).or_default();
+            t.input += b.input;
+            t.cc += b.cc;
+            t.cr += b.cr;
+            t.out += b.out;
+            t.requests += b.requests;
+        }
+        // `hourly` is `#[serde(default)]`, so a deserialized row can carry an
+        // empty vec. Safe because `e` always comes from `DayRow::new` (24 zeros)
+        // and the source side is bounded by `take(24)`.
+        for (i, v) in row.hourly.iter().take(24).enumerate() {
+            e.hourly[i] += v;
+        }
+    }
+}
+
 /// One bar per calendar month spanned by the archive, oldest→newest, with a
 /// sparse axis label so a multi-year range stays readable.
 fn monthly_series(archive: &Archive) -> Vec<SeriesPoint> {
     let mut by_month: std::collections::BTreeMap<String, (f64, f64, f64)> =
         std::collections::BTreeMap::new();
     for (date, r) in &archive.days {
-        let key = date[..7].to_string(); // "yyyy-mm"
+        // Keys are ours today ("%Y-%m-%d"), but an `Archive` is deserialized from
+        // a file whose keys `load_from` never validates — only its version. A
+        // corrupted-but-parseable archive must not panic the whole dashboard
+        // build on a slice boundary, so skip a key we cannot read rather than
+        // relabel it as January.
+        let key = match date.get(..7) {
+            Some(k) if month_num(k).is_some() => k.to_string(), // "yyyy-mm"
+            _ => continue,
+        };
         let e = by_month.entry(key).or_default();
         for b in r.models.values() {
             e.0 += b.input / 1e6;
@@ -611,8 +656,10 @@ fn monthly_series(archive: &Archive) -> Vec<SeriesPoint> {
         .into_iter()
         .enumerate()
         .map(|(i, (key, (input, cache, output)))| {
-            let (y, m) = key.split_at(4);
-            let mi: usize = m[1..].parse::<usize>().unwrap_or(1) - 1;
+            let y = key.get(..4).unwrap_or("");
+            // Clamped, not trusted: the collection loop above already rejected a
+            // key without a real month, so this only keeps `MONTHS` in bounds.
+            let mi = month_num(&key).unwrap_or(1).saturating_sub(1).min(11);
             // Label roughly six ticks regardless of range length.
             let every = (n / 6).max(1);
             SeriesPoint {
@@ -785,6 +832,15 @@ impl Agg {
     /// here; per-model tokens were stored raw, so the *current* price table
     /// applies here. Both therefore stay retroactive for days the raw event
     /// store can no longer reproduce.
+    ///
+    /// One deliberate divergence from `add`: a model-less record (a Claude
+    /// slash-command line, a Codex tool record) never reaches `r.models`, so its
+    /// tokens are invisible here — while `add` books them into `input`/`cache`/
+    /// `output` outside its model guard, and `rows_from_events` books them into
+    /// the row's `hourly` histogram. All-time `total_tokens` can therefore in
+    /// principle undershoot the sum of its own `hourly`. Empirically it is zero
+    /// today, because those records carry no tokens; noted so the gap isn't
+    /// rediscovered later as a frontend bug.
     fn add_row(&mut self, r: &DayRow, cfg: &UserConfig, pricing: &Pricing) {
         for (raw, b) in &r.models {
             let model = normalize_model(raw);
@@ -1407,26 +1463,40 @@ mod tests {
         assert_eq!(agg.tool_errors, 1);
     }
 
+    /// An archive of `(date, input, cc, cr, out)` rows, one model each.
+    fn archive_of(rows: &[(&str, f64, f64, f64, f64)]) -> Archive {
+        let mut archive = Archive::default();
+        for (date, input, cc, cr, out) in rows {
+            let mut r = DayRow::new(date);
+            r.models.insert(
+                "claude-opus-5".to_string(),
+                TokBits { input: *input, cc: *cc, cr: *cr, out: *out, requests: 1 },
+            );
+            archive.days.insert(date.to_string(), r);
+        }
+        archive
+    }
+
     #[test]
     fn all_time_extras_describe_the_archived_range() {
         // Raw token counts, in the millions: `all_time_extras` reports M tokens
         // rounded to 2 dp (the `r2` Global Constraint), so toy values would all
         // round to 0.0 and the assertion below would prove nothing.
-        let mut archive = Archive::default();
-        for (date, out) in [
-            ("2026-01-05", 10e6),
-            ("2026-01-06", 90e6), // the biggest day
-            ("2026-01-07", 20e6),
-            // a gap on the 8th breaks the streak
-            ("2026-01-09", 30e6),
-        ] {
-            let mut r = DayRow::new(date);
-            r.models.insert(
-                "claude-opus-5".to_string(),
-                TokBits { input: 0.0, cc: 0.0, cr: 0.0, out, requests: 1 },
-            );
-            archive.days.insert(date.to_string(), r);
-        }
+        //
+        // The biggest day carries most of its tokens in `input`/`cc`/`cr` and the
+        // *fewest* in `out`, so an implementation that summed only `out` would
+        // both misreport its size (20.0, not 90.0) and crown the 9th instead.
+        let archive = archive_of(&[
+            ("2026-01-05", 0.0, 0.0, 0.0, 10e6),
+            ("2026-01-06", 40e6, 20e6, 10e6, 20e6), // 90M, the biggest day
+            ("2026-01-07", 0.0, 0.0, 0.0, 20e6),
+            // A row with no tokens at all — the archive holds one for a day that
+            // saw only slash-command records. It sits in the gap between the
+            // streak and the last day, so if the `tok <= 0.0` guard were dropped
+            // it would both count as active (5) and bridge the streak (05..09).
+            ("2026-01-08", 0.0, 0.0, 0.0, 0.0),
+            ("2026-01-09", 0.0, 0.0, 0.0, 30e6),
+        ]);
 
         let x = all_time_extras(&archive);
         assert_eq!(x.first, "2026-01-05");
@@ -1434,6 +1504,129 @@ mod tests {
         assert_eq!(x.active_days, 4);
         assert_eq!(x.longest_streak, 3); // 05, 06, 07
         assert_eq!(x.biggest_day, Some(("2026-01-06".to_string(), 90.0)));
+    }
+
+    #[test]
+    fn merging_two_accounts_sums_the_days_they_share_and_keeps_the_ones_they_dont() {
+        let mut merged = Archive::default();
+        let mut a = archive_of(&[("2026-01-05", 1e6, 2e6, 3e6, 4e6)]);
+        let mut b = archive_of(&[
+            ("2026-01-05", 10e6, 20e6, 30e6, 40e6),
+            ("2026-01-06", 5e6, 0.0, 0.0, 0.0), // only this account worked the 6th
+        ]);
+        a.days.get_mut("2026-01-05").unwrap().hourly[3] = 1.5;
+        b.days.get_mut("2026-01-05").unwrap().hourly[3] = 2.5;
+        b.days.get_mut("2026-01-05").unwrap().hourly[9] = 7.0;
+
+        merge_days(&mut merged, a);
+        merge_days(&mut merged, b);
+
+        assert_eq!(merged.days.len(), 2);
+        let shared = &merged.days["2026-01-05"].models["claude-opus-5"];
+        assert_eq!(shared.input, 11e6);
+        assert_eq!(shared.cc, 22e6);
+        assert_eq!(shared.cr, 33e6);
+        assert_eq!(shared.out, 44e6);
+        assert_eq!(shared.requests, 2);
+        // Histograms add bucket-wise, and untouched buckets stay zero.
+        let h = &merged.days["2026-01-05"].hourly;
+        assert_eq!(h.len(), 24);
+        assert_eq!(h[3], 4.0);
+        assert_eq!(h[9], 7.0);
+        assert_eq!(h[0], 0.0);
+        // A day only one account has survives untouched.
+        assert_eq!(merged.days["2026-01-06"].models["claude-opus-5"].input, 5e6);
+    }
+
+    #[test]
+    fn merging_a_row_whose_hourly_vector_is_empty_does_not_panic() {
+        // `DayRow::hourly` is `#[serde(default)]`, so a row read back from disk
+        // can legitimately have no buckets at all. The merge survives it only
+        // because the destination always comes from `DayRow::new` (24 zeros) and
+        // the source is bounded by `take(24)`.
+        let mut merged = Archive::default();
+        let mut incoming = archive_of(&[("2026-01-05", 1e6, 0.0, 0.0, 2e6)]);
+        incoming.days.get_mut("2026-01-05").unwrap().hourly = Vec::new();
+
+        merge_days(&mut merged, incoming);
+
+        let day = &merged.days["2026-01-05"];
+        assert_eq!(day.hourly.len(), 24);
+        assert!(day.hourly.iter().all(|v| *v == 0.0));
+        assert_eq!(day.models["claude-opus-5"].input, 1e6);
+        assert_eq!(day.models["claude-opus-5"].out, 2e6);
+    }
+
+    #[test]
+    fn monthly_series_buckets_days_into_months_in_m_tokens() {
+        // Two days in January, one in February. Cache is creation + read.
+        let series = monthly_series(&archive_of(&[
+            ("2026-01-05", 1e6, 2e6, 3e6, 4e6),
+            ("2026-01-20", 1e6, 0.0, 0.0, 1e6),
+            ("2026-02-03", 6e6, 1e6, 1e6, 2e6),
+        ]));
+
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].input, 2.0);
+        assert_eq!(series[0].cache, 5.0);
+        assert_eq!(series[0].output, 5.0);
+        assert_eq!(series[1].input, 6.0);
+        assert_eq!(series[1].cache, 2.0);
+        assert_eq!(series[1].output, 2.0);
+        // The drill-down anchor is the first of the month, not a day that exists.
+        assert_eq!(series[0].date, "2026-01-01");
+        assert_eq!(series[1].date, "2026-02-01");
+        assert_eq!(series[0].full, "Jan 2026");
+        assert_eq!(series[1].full, "Feb 2026");
+        // Six or fewer months: every bar is labelled.
+        assert_eq!(series[0].label, "Jan");
+        assert_eq!(series[1].label, "Feb");
+    }
+
+    #[test]
+    fn a_long_monthly_range_labels_only_about_six_ticks() {
+        // 13 months → every 2nd bar labelled, so the axis stays readable instead
+        // of printing a tick per month.
+        let rows: Vec<(String, f64, f64, f64, f64)> = (0..13)
+            .map(|i| {
+                let (y, m) = (2025 + i / 12, i % 12 + 1);
+                (format!("{y}-{m:02}-05"), 1e6, 0.0, 0.0, 0.0)
+            })
+            .collect();
+        let refs: Vec<(&str, f64, f64, f64, f64)> =
+            rows.iter().map(|(d, a, b, c, e)| (d.as_str(), *a, *b, *c, *e)).collect();
+
+        let series = monthly_series(&archive_of(&refs));
+
+        assert_eq!(series.len(), 13);
+        let labelled: Vec<usize> = series
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.label.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(labelled, vec![0, 2, 4, 6, 8, 10, 12]);
+        // Every bar still carries its full label for the tooltip.
+        assert_eq!(series[1].full, "Feb 2025");
+        assert_eq!(series[12].full, "Jan 2026");
+    }
+
+    #[test]
+    fn a_malformed_archive_key_is_skipped_rather_than_crashing_the_build() {
+        // `Archive::load_from` validates the document version and nothing else,
+        // so a corrupted-but-parseable file can hand us any key at all. None of
+        // these may panic on a slice boundary or an out-of-range month index.
+        let mut archive = archive_of(&[("2026-01-05", 1e6, 0.0, 0.0, 0.0)]);
+        for bad in ["", "2026", "2026-00-01", "2026-13-01", "2026-xx-01", "20é6-01-01"] {
+            archive.days.insert(bad.to_string(), DayRow::new(bad));
+        }
+
+        let series = monthly_series(&archive);
+
+        // Only the one well-formed day produced a bar.
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].full, "Jan 2026");
+        assert_eq!(series[0].date, "2026-01-01");
     }
 
     #[test]
