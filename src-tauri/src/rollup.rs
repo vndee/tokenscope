@@ -160,6 +160,27 @@ impl Archive {
             let _ = write_atomic(&dir.join(format!("rollup-{id}.json")), t.as_bytes());
         }
     }
+
+    /// Fold this build's live day rows into the archive.
+    ///
+    /// `cutoff_date` is the calendar date of the raw store's prune cutoff. The
+    /// prune cuts on a *timestamp*, so that day is only partially present in
+    /// the store: rewriting it would replace a complete row (archived on an
+    /// earlier build, when the cutoff was earlier still) with a partial one, on
+    /// every build. So only days strictly after it are rewritten. The boundary
+    /// day is written just once, when nothing is on file for it yet — on a
+    /// first run a partial row beats losing the day outright.
+    ///
+    /// Days older than the boundary are left exactly as they are: they are the
+    /// history the raw store can no longer reproduce.
+    pub fn absorb(&mut self, live: BTreeMap<String, DayRow>, cutoff_date: chrono::NaiveDate) {
+        let boundary = cutoff_date.format("%Y-%m-%d").to_string();
+        for (date, row) in live {
+            if date > boundary || !self.days.contains_key(&date) {
+                self.days.insert(date, row);
+            }
+        }
+    }
 }
 
 /// Fold raw events into one row per local calendar day.
@@ -372,6 +393,72 @@ mod tests {
             TokBits { input: 10.0, cc: 0.0, cr: 0.0, out, requests: 1 },
         );
         r
+    }
+
+    use chrono::NaiveDate;
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn live(dates: &[(&str, f64)]) -> BTreeMap<String, DayRow> {
+        dates
+            .iter()
+            .map(|(s, out)| (s.to_string(), row(s, *out)))
+            .collect()
+    }
+
+    #[test]
+    fn absorbing_twice_rewrites_a_day_instead_of_adding_a_second_copy() {
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+
+        assert_eq!(a.days.len(), 1);
+        assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 5.0);
+    }
+
+    #[test]
+    fn a_day_inside_the_window_takes_the_newer_value() {
+        // Prices or the whitelist may have changed; a day the raw store still
+        // fully covers must be re-derived, not preserved.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+        a.absorb(live(&[("2026-03-10", 9.0)]), d("2026-01-01"));
+
+        assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 9.0);
+    }
+
+    #[test]
+    fn the_partial_boundary_day_never_overwrites_a_complete_row() {
+        // The prune cuts on a timestamp, so the cutoff's own day is only partly
+        // in the raw store. Yesterday's build archived it complete; today's
+        // partial view must not replace that.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 9.0)]), d("2026-03-09")); // complete
+        a.absorb(live(&[("2026-03-10", 2.0)]), d("2026-03-10")); // now partial
+
+        assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 9.0);
+    }
+
+    #[test]
+    fn a_boundary_day_with_no_row_yet_is_archived_partial() {
+        // First run: a partial row beats losing the day entirely.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 2.0)]), d("2026-03-10"));
+
+        assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 2.0);
+    }
+
+    #[test]
+    fn a_day_older_than_the_boundary_is_never_touched_by_live_rows() {
+        let mut a = Archive::default();
+        a.days.insert("2026-01-05".to_string(), row("2026-01-05", 42.0));
+        a.absorb(live(&[("2026-01-05", 1.0), ("2026-03-10", 5.0)]), d("2026-03-01"));
+
+        assert_eq!(a.days["2026-01-05"].models["claude-opus-5"].out, 42.0);
+        assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 5.0);
+        assert_eq!(a.days.len(), 2);
     }
 
     #[test]
