@@ -4,10 +4,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, Workspace, PeriodReport, HeatDay, ModelStat, Theme, QuotaSnapshot,
+  Dashboard, Workspace, PeriodReport, AllTimeReport, HeatDay, ModelStat, Theme, QuotaSnapshot,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
-  fetchWorkspace, fetchPeriod, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale,
-  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, projection, activeStreak, weekdayRhythm,
+  fetchWorkspace, fetchPeriod, fetchAllTime, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale,
+  fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, fmtHeatDate, projection, activeStreak, weekdayRhythm,
 } from "./data";
 import {
   Segmented, BarChart, Sparkline, CostDonut, BarList, TokenBarList, Heatmap, TrendChart,
@@ -74,6 +74,30 @@ function sharePcts(values: number[]): number[] {
     .slice(0, left)
     .forEach(({ i }) => (units[i] += 1));
   return units.map((u) => u / 10);
+}
+
+// The model lists both bodies render, derived in one place so the period view
+// and the all-time view cannot drift apart:
+//   - rows recolored with the active preset's ramp, by rank
+//   - `tokenModels` hides noise: a share below 0.1% would render a meaningless
+//     "0.0%". It matters most on the all-time page, which accrues a long tail of
+//     barely-touched models and has no limit=5 self-cap like the BarLists.
+//   - `costModels` keeps its own filter, since a model with negligible tokens
+//     can still carry real spend.
+//   - `tokenShares` is apportioned over the *visible* rows, so what's on screen
+//     sums to exactly 100.0%.
+function modelLists(models: ModelStat[], totalTokens: number, ramp: string[]) {
+  const colored = models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
+  const tokenModels = colored.filter(
+    (m) => Math.round((m.tokens / (totalTokens || 1)) * 1000) / 10 >= 0.1
+  );
+  return {
+    models: colored,
+    tokenModels,
+    costModels: colored.filter((m) => m.cost > 0),
+    maxM: Math.max(...tokenModels.map((m) => m.tokens), 1e-9),
+    tokenShares: sharePcts(tokenModels.map((m) => m.tokens)),
+  };
 }
 
 function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: Theme; share: number }) {
@@ -399,7 +423,96 @@ function AccountTabs({ t, tabs, activeTab, onSelect, onRename }:
   );
 }
 
-function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; period: "Day" | "Week" | "Month"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
+// The all-time page. A different question from Day/Week/Month — "what has this
+// cost me, ever" — so it gets its own body rather than a wider window on the
+// period layout: no date navigation, no delta badge, and records instead of a
+// comparison against a previous period.
+function AllTimePage({ a, t, ramp, activeTab }: { a: AllTimeReport; t: Theme; ramp: string[]; activeTab: string }) {
+  const M = a.report.metrics;
+  const { tokenModels, costModels, maxM, tokenShares } = modelLists(a.report.models, M.totalTokens, ramp);
+  const peak = peakHours(a.report.hourly);
+  if (!a.first) {
+    return <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>No usage recorded yet.</div>;
+  }
+  return (
+    <div>
+      <div style={{ font: `600 10px ${t.ui}`, color: t.dim, letterSpacing: ".05em", textTransform: "uppercase" }}>
+        All time · since {fmtHeatDate(a.first)}
+      </div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginTop: 6 }}>
+        <span style={{ font: `600 30px/1 ${t.display}`, color: t.text }}>{fmtTokens(M.totalTokens)}</span>
+        <span style={{ font: `600 15px ${t.mono}`, color: t.accent }}>{fmtMoney(M.cost)}</span>
+      </div>
+
+      <SectionRule t={t} />
+      <Label t={t}>By month</Label>
+      <div style={{ marginTop: 8 }}>
+        <BarChart data={a.report.series} theme={t} accent={t.accent} accentSoft={t.accentSoft} />
+      </div>
+
+      <SectionRule t={t} />
+      <Label t={t}>Records</Label>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
+        <MiniStat label="Active days" value={fmtInt(a.activeDays)} theme={t} />
+        <MiniStat label="Longest streak" value={`${fmtInt(a.longestStreak)}d`} theme={t} />
+        <MiniStat
+          label="Biggest day"
+          value={a.biggestDay ? fmtTokens(a.biggestDay[1]) : "—"}
+          sub={a.biggestDay ? fmtHeatDate(a.biggestDay[0]) : undefined}
+          theme={t}
+        />
+        <MiniStat label="Sessions" value={fmtInt(M.sessions)} sub={`${fmtInt(M.requests)} requests`} theme={t} />
+      </div>
+      {peak && (
+        <div style={{ font: `500 10px ${t.mono}`, color: t.faint, marginTop: 8 }}>
+          Busiest hours {fmtHourRange(peak.start, peak.end)} · {Math.round(peak.share * 100)}% of all tokens
+        </div>
+      )}
+
+      <SectionRule t={t} />
+      <Label t={t}>Models</Label>
+      <div style={{ marginTop: 6 }}>
+        {tokenModels.map((m, i) => (
+          <ModelRow key={m.name} m={m} max={maxM} theme={t} share={tokenShares[i]} />
+        ))}
+      </div>
+      {costModels.length > 0 && (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 10 }}>
+          <CostDonut models={costModels} theme={t} palette={ramp} overflow={PRESET_OVERFLOW} />
+        </div>
+      )}
+
+      {/* Tokens by account — same guard as the period body's aggregate-tab
+          split. Account labels are archived at fold time from `.claude.json`
+          (organizationName/displayName/email local-part) and never rewritten,
+          so a single account can legitimately end up with more than one label
+          if that name ever changes — `accounts.length > 1` alone isn't proof
+          of multiple accounts, only `activeTab === "all"` is. */}
+      {activeTab === "all" && (a.report.accounts?.length ?? 0) > 1 && (<>
+        <SectionRule t={t} />
+        <Label t={t}>Tokens by account</Label>
+        <div style={{ marginTop: 6 }}><TokenBarList items={a.report.accounts} theme={t} accent={t.accent} /></div>
+      </>)}
+      {a.report.projects.length > 0 && (<>
+        <SectionRule t={t} />
+        <Label t={t}>Projects</Label>
+        <div style={{ marginTop: 6 }}><TokenBarList items={a.report.projects} theme={t} accent={t.accent} /></div>
+      </>)}
+      {a.report.mcp.length > 0 && (<>
+        <SectionRule t={t} />
+        <Label t={t}>MCP calls</Label>
+        <div style={{ marginTop: 6 }}><BarList items={a.report.mcp} theme={t} accent={t.accent} /></div>
+      </>)}
+      {a.report.skills.length > 0 && (<>
+        <SectionRule t={t} />
+        <Label t={t}>Skill calls</Label>
+        <div style={{ marginTop: 6 }}><BarList items={a.report.skills} theme={t} accent={t.accent} /></div>
+      </>)}
+    </div>
+  );
+}
+
+function Panel({ report, heatmap, allTime, allTimeErr, allTimeBusy, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; allTimeBusy: boolean; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -424,24 +537,13 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
   const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
   const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
-  // Recolor model slices with the active preset's ramp (rank order), so the
-  // model bars + cost donut match the chosen theme instead of the fixed green.
-  const models = P.models.map((m, i) => ({ ...m, color: i < ramp.length ? ramp[i] : PRESET_OVERFLOW }));
-  // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
-  // Show models whose share is at least 0.1% when rounded to 1 decimal; below
-  // that it'd render a meaningless "0.0%" (a negligible token share). Such a
-  // model can still appear under Cost if it has a non-zero cost.
-  const tokenModels = models.filter(
-    (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
-  );
-  const costModels = models.filter((m) => m.cost > 0);
+  // Recolor model slices with the active preset's ramp (rank order), filter the
+  // noise, and apportion the shares — see `modelLists`, shared with AllTimePage.
+  const { models, tokenModels, costModels, maxM, tokenShares } = modelLists(P.models, M.totalTokens, ramp);
   // models that were used but have no LiteLLM pricing (cost unknown, not $0)
   const unpricedModels = models.filter((m) => !m.priced && m.tokens > 0);
-  const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
-  // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
-  const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
-  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
-  const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months" }[period];
+  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month", All: "" }[period];
+  const trendLabel = { Day: "Last 14 days", Week: "Last 12 weeks", Month: "Last 6 months", All: "" }[period];
   const navLabel = period === "Day" && isCurrent ? "Today" : P.range;
   // Full-period spend projection (current week/month only) + activity streak.
   const proj = projection(period, M.totalTokens, M.cost, isCurrent);
@@ -576,7 +678,7 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
             padding: tabs.length > 1 ? "6px 15px 12px" : "15px 15px 12px",
           }}>
             <div data-no-drag="" style={{ display: "flex", alignItems: "center", cursor: "default" }}>
-              <Segmented value={period} theme={t} onSelect={onPeriod} />
+              <Segmented value={period} items={["Day", "Week", "Month", "All"]} theme={t} onSelect={onPeriod} />
             </div>
             <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
               <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
@@ -587,205 +689,224 @@ function Panel({ report, heatmap, period, onPeriod, dark, themePref, onToggleThe
         </div>
         {/* scrolling body */}
         <div style={{ padding: "14px 15px 15px" }}>
-        {/* period navigation: ‹ range › with a Today reset when viewing the past */}
-        <div data-no-drag="" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, cursor: "default" }}>
-          <button onClick={onPrev} aria-label="previous period" title="Previous" style={arrowStyle(false)}>‹</button>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <span style={{ font: `600 12px ${t.ui}`, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{navLabel}</span>
-            {loading && <span style={{ font: `500 10px ${t.mono}`, color: t.faint }}>…</span>}
-            {!isCurrent && <button onClick={onToday} style={{ font: `600 9.5px ${t.ui}`, color: t.accent, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Today</button>}
-          </div>
-          <button onClick={onNext} disabled={isCurrent} aria-label="next period" title="Next" style={arrowStyle(isCurrent)}>›</button>
-        </div>
-        {/* hero */}
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
-          <div>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>Total tokens</div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
-              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
-              {Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
+        {period === "All" ? (
+          allTime
+            ? <AllTimePage a={allTime} t={t} ramp={ramp} activeTab={activeTab} />
+            : allTimeErr
+              ? (
+                <div style={{ padding: "18px 0" }}>
+                  <div style={{ font: `600 11px ${t.mono}`, color: "#e0795f" }}>Couldn't load all-time history</div>
+                  <div style={{ font: `500 10px/1.5 ${t.mono}`, color: t.faint, marginTop: 5, wordBreak: "break-word" }}>{allTimeErr}</div>
+                  <button
+                    onClick={onRetryAllTime}
+                    disabled={allTimeBusy}
+                    style={{ marginTop: 10, font: `600 10px ${t.ui}`, color: allTimeBusy ? t.faint : t.accent, background: t.segBg,
+                      border: `1px solid ${t.segBorder}`, borderRadius: 6, padding: "4px 10px", cursor: allTimeBusy ? "default" : "pointer" }}
+                  >{allTimeBusy ? "Retrying…" : "Retry"}</button>
+                </div>
+              )
+              : <div style={{ font: `500 11px ${t.mono}`, color: t.faint, padding: "18px 0" }}>Loading…</div>
+        ) : (<>
+          {/* period navigation: ‹ range › with a Today reset when viewing the past */}
+          <div data-no-drag="" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, cursor: "default" }}>
+            <button onClick={onPrev} aria-label="previous period" title="Previous" style={arrowStyle(false)}>‹</button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <span style={{ font: `600 12px ${t.ui}`, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{navLabel}</span>
+              {loading && <span style={{ font: `500 10px ${t.mono}`, color: t.faint }}>…</span>}
+              {!isCurrent && <button onClick={onToday} style={{ font: `600 9.5px ${t.ui}`, color: t.accent, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Today</button>}
             </div>
+            <button onClick={onNext} disabled={isCurrent} aria-label="next period" title="Next" style={arrowStyle(isCurrent)}>›</button>
           </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
-            <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
-            {proj && <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 2 }}>↗ on pace ~{fmtMoney(proj.cost)}</div>}
-          </div>
-        </div>
-        {/* cached vs rest (uncached input + output) — 2-colour pill. Dark segment
-            is the cache share, matching the "% cached" label below. */}
-        <div style={{ display: "flex", height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
-          {M.totalTokens > 0 && <>
-            <div style={{ width: `${cachePct}%`, background: t.accent }} />
-            <div style={{ width: `${restPct}%`, background: t.accentSoft }} />
-          </>}
-        </div>
-        <SplitLegend t={t} cacheM={M.cacheTokens} restM={M.inputTokens + M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
-        {/* cache-savings callout — what caching kept off the bill this period */}
-        {M.cacheSavings > 0 && (
-          <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: -9, marginBottom: 13, font: `600 10.5px ${t.mono}`, color: t.accent }}>
-            <svg width="10" height="12" viewBox="0 0 10 12" fill={t.accent} style={{ flex: "0 0 auto" }} aria-hidden="true"><path d="M6 0 0 7h3l-1 5 6-7H5z" /></svg>
-            {M.cost > 0
-              ? `${((M.cost + M.cacheSavings) / M.cost).toFixed(1)}× cheaper with cache · ${fmtMoney(M.cacheSavings)} saved`
-              : `Saved ${fmtMoney(M.cacheSavings)} via cache`}
-          </div>
-        )}
-        {/* bar chart — bars in Week/Month drill into that day */}
-        <BarChart data={P.series} theme={t} height={84} onPick={(p) => onDrillDay(p.date)} />
-        {(() => {
-          // Busiest 3-hour window of the period — a quick "when do I work" read.
-          const pk = peakHours(P.hourly);
-          return pk ? (
-            <div style={{ marginTop: 8, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke={t.faint} strokeWidth="1.3" style={{ flex: "0 0 auto" }} aria-hidden="true"><circle cx="6" cy="6" r="4.6" /><path d="M6 3.4V6l1.9 1.1" strokeLinecap="round" /></svg>
-              Most active {fmtHourRange(pk.start, pk.end)} · {Math.round(pk.share * 100)}% of tokens
-            </div>
-          ) : null;
-        })()}
-        {/* zoomed-out trend line (click a point to jump to that period) */}
-        <SectionRule t={t} m="14px 0 10px" />
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-          <Label t={t}>Trend</Label>
-          <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
-        </div>
-        <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
-        <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy}
-          onRefresh={canRefreshQuota ? refreshQuota : undefined}
-          onPurge={canRefreshQuota ? purgeQuotaLogs : undefined} purging={purging} />
-        <SectionRule t={t} m="14px 0 10px" />
-        {/* models */}
-        <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
-        {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
-        {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
-        <SectionRule t={t} m="10px 0 10px" />
-        {/* cost donut */}
-        <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
-        {costModels.length > 0
-          ? <CostDonut models={costModels} theme={t} size={costModels.length === 1 ? 84 : 100} thickness={costModels.length === 1 ? 13 : 15} palette={ramp} overflow={PRESET_OVERFLOW} />
-          : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
-        {unpricedModels.length > 0 && (
-          <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
-            {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
-            <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
-          </div>
-        )}
-        {/* tokens by account — split the aggregate "All" view across accounts */}
-        {activeTab === "all" && (P.accounts?.length ?? 0) > 1 && (
-          <>
-            <SectionRule t={t} m="12px 0 10px" />
-            <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by account</Label></div>
-            <TokenBarList key={period + "-acct"} items={P.accounts} theme={t} accent={t.accent} />
-          </>
-        )}
-        {/* tokens by project — where the spend actually went (cwd basename) */}
-        {P.projects.length > 0 && (
-          <>
-            <SectionRule t={t} m="12px 0 10px" />
-            <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by project</Label></div>
-            <TokenBarList key={period} items={P.projects} theme={t} accent={t.accent} />
-          </>
-        )}
-        <SectionRule t={t} m="12px 0 12px" />
-        {/* footer stats */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <MiniStat label="Requests" value={fmtInt(M.requests)} sub={M.sessions > 0 ? `${M.sessions} sessions · ${fmtTokens(M.totalTokens / M.sessions)}/ea` : `${M.sessions} sessions`} theme={t}>
-            <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
-          </MiniStat>
-          <MiniStat label="Cost trend" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}>
-            <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
-          </MiniStat>
-        </div>
-        {/* tools — the real workhorses (Bash/Read/Edit…); header carries the
-            subagent token share, since the Agent tool lives in this list too */}
-        {P.tools.length > 0 && (
-          <>
-            <SectionRule t={t} />
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-              <Label t={t}>Tools</Label>
-              {M.subagentTokens > 0 && (
-                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
-                  <span style={{ color: t.text, fontWeight: 600 }}>{pct(M.subagentTokens, M.totalTokens)}%</span> via subagents
-                </span>
-              )}
-            </div>
-            <BarList key={period} items={P.tools} theme={t} accent={t.accent} />
-            {M.toolResults > 0 && (
-              <div style={{ marginTop: 7, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: M.toolErrors > 0 ? "#e0795f" : t.accent, fontWeight: 600 }}>{((M.toolErrors / M.toolResults) * 100).toFixed(1)}%</span>
-                of {fmtInt(M.toolResults)} tool calls errored
+          {/* hero */}
+          <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
+            <div>
+              <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>Total tokens</div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
+                <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
+                {Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
               </div>
-            )}
-          </>
-        )}
-        {/* MCP — shown whenever the user has installed MCP servers */}
-        {M.servers > 0 && (
-          <>
-            <SectionRule t={t} />
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-              <Label t={t}>MCP calls</Label>
-              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} servers</span>
             </div>
-            {P.mcp.length > 0
-              ? <BarList key={period} items={P.mcp} theme={t} accent={t.accent} />
-              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No MCP calls in this period</div>}
-          </>
-        )}
-        {/* Skill — shown whenever the user has installed skills */}
-        {M.skills > 0 && (
-          <>
-            <SectionRule t={t} />
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-              <Label t={t}>Skill calls</Label>
-              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} skills</span>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
+              <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
+              {proj && <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 2 }}>↗ on pace ~{fmtMoney(proj.cost)}</div>}
             </div>
-            {P.skills.length > 0
-              ? <BarList key={period} items={P.skills} theme={t} accent={t.accent} />
-              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No skill calls in this period</div>}
-          </>
-        )}
-        {/* heatmap */}
-        <SectionRule t={t} />
-        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 9 }}>
-          <Label t={t}>Daily activity</Label>
-          {streak >= 2 && (
-            <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
-              🔥 <span style={{ color: t.text, fontWeight: 600 }}>{streak}</span>-day streak
-            </span>
+          </div>
+          {/* cached vs rest (uncached input + output) — 2-colour pill. Dark segment
+              is the cache share, matching the "% cached" label below. */}
+          <div style={{ display: "flex", height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
+            {M.totalTokens > 0 && <>
+              <div style={{ width: `${cachePct}%`, background: t.accent }} />
+              <div style={{ width: `${restPct}%`, background: t.accentSoft }} />
+            </>}
+          </div>
+          <SplitLegend t={t} cacheM={M.cacheTokens} restM={M.inputTokens + M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
+          {/* cache-savings callout — what caching kept off the bill this period */}
+          {M.cacheSavings > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: -9, marginBottom: 13, font: `600 10.5px ${t.mono}`, color: t.accent }}>
+              <svg width="10" height="12" viewBox="0 0 10 12" fill={t.accent} style={{ flex: "0 0 auto" }} aria-hidden="true"><path d="M6 0 0 7h3l-1 5 6-7H5z" /></svg>
+              {M.cost > 0
+                ? `${((M.cost + M.cacheSavings) / M.cost).toFixed(1)}× cheaper with cache · ${fmtMoney(M.cacheSavings)} saved`
+                : `Saved ${fmtMoney(M.cacheSavings)} via cache`}
+            </div>
           )}
-        </div>
-        <Heatmap days={heatmap} theme={t} accent={t.accent} />
-        {/* weekly rhythm — day-of-week token pattern over the heatmap window */}
-        {(() => {
-          const wr = weekdayRhythm(heatmap);
-          if (!wr) return null;
-          const max = Math.max(...wr.bars, 1e-9);
-          const ini = ["M", "T", "W", "T", "F", "S", "S"];
-          const full = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-          return (
-            <div style={{ marginTop: 14 }}>
-              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-                <Label t={t}>Weekly rhythm</Label>
-                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
-                  busiest <span style={{ color: t.text, fontWeight: 600 }}>{full[wr.busiest]}</span> · {Math.round(wr.weekendPct)}% weekend
-                </span>
+          {/* bar chart — bars in Week/Month drill into that day */}
+          <BarChart data={P.series} theme={t} height={84} onPick={(p) => onDrillDay(p.date)} />
+          {(() => {
+            // Busiest 3-hour window of the period — a quick "when do I work" read.
+            const pk = peakHours(P.hourly);
+            return pk ? (
+              <div style={{ marginTop: 8, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
+                <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke={t.faint} strokeWidth="1.3" style={{ flex: "0 0 auto" }} aria-hidden="true"><circle cx="6" cy="6" r="4.6" /><path d="M6 3.4V6l1.9 1.1" strokeLinecap="round" /></svg>
+                Most active {fmtHourRange(pk.start, pk.end)} · {Math.round(pk.share * 100)}% of tokens
               </div>
-              <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 38 }}>
-                {wr.bars.map((v, i) => (
-                  <div key={i} title={`${full[i]} · ${fmtTokens(v)}`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-                    <div style={{ width: "100%", height: 28, display: "flex", alignItems: "flex-end" }}>
-                      <div style={{ width: "100%", height: `${Math.max((v / max) * 100, 3)}%`, background: i === wr.busiest ? t.accent : t.accentSoft, borderRadius: "3px 3px 0 0" }} />
-                    </div>
-                    <span style={{ font: `500 8.5px ${t.mono}`, color: i >= 5 ? t.faint : t.dim }}>{ini[i]}</span>
-                  </div>
-                ))}
-              </div>
+            ) : null;
+          })()}
+          {/* zoomed-out trend line (click a point to jump to that period) */}
+          <SectionRule t={t} m="14px 0 10px" />
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+            <Label t={t}>Trend</Label>
+            <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
+          </div>
+          <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
+          <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy}
+            onRefresh={canRefreshQuota ? refreshQuota : undefined}
+            onPurge={canRefreshQuota ? purgeQuotaLogs : undefined} purging={purging} />
+          <SectionRule t={t} m="14px 0 10px" />
+          {/* models */}
+          <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
+          {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
+          {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
+          <SectionRule t={t} m="10px 0 10px" />
+          {/* cost donut */}
+          <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
+          {costModels.length > 0
+            ? <CostDonut models={costModels} theme={t} size={costModels.length === 1 ? 84 : 100} thickness={costModels.length === 1 ? 13 : 15} palette={ramp} overflow={PRESET_OVERFLOW} />
+            : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
+          {unpricedModels.length > 0 && (
+            <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
+              {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
+              <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
             </div>
-          );
-        })()}
-        {/* footer note */}
-        <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
-          Est. cost via models.dev / LiteLLM · estimate
-        </div>
+          )}
+          {/* tokens by account — split the aggregate "All" view across accounts */}
+          {activeTab === "all" && (P.accounts?.length ?? 0) > 1 && (
+            <>
+              <SectionRule t={t} m="12px 0 10px" />
+              <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by account</Label></div>
+              <TokenBarList key={period + "-acct"} items={P.accounts} theme={t} accent={t.accent} />
+            </>
+          )}
+          {/* tokens by project — where the spend actually went (cwd basename) */}
+          {P.projects.length > 0 && (
+            <>
+              <SectionRule t={t} m="12px 0 10px" />
+              <div style={{ marginBottom: 6 }}><Label t={t}>Tokens by project</Label></div>
+              <TokenBarList key={period} items={P.projects} theme={t} accent={t.accent} />
+            </>
+          )}
+          <SectionRule t={t} m="12px 0 12px" />
+          {/* footer stats */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <MiniStat label="Requests" value={fmtInt(M.requests)} sub={M.sessions > 0 ? `${M.sessions} sessions · ${fmtTokens(M.totalTokens / M.sessions)}/ea` : `${M.sessions} sessions`} theme={t}>
+              <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+            </MiniStat>
+            <MiniStat label="Cost trend" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}>
+              <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
+            </MiniStat>
+          </div>
+          {/* tools — the real workhorses (Bash/Read/Edit…); header carries the
+              subagent token share, since the Agent tool lives in this list too */}
+          {P.tools.length > 0 && (
+            <>
+              <SectionRule t={t} />
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+                <Label t={t}>Tools</Label>
+                {M.subagentTokens > 0 && (
+                  <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                    <span style={{ color: t.text, fontWeight: 600 }}>{pct(M.subagentTokens, M.totalTokens)}%</span> via subagents
+                  </span>
+                )}
+              </div>
+              <BarList key={period} items={P.tools} theme={t} accent={t.accent} />
+              {M.toolResults > 0 && (
+                <div style={{ marginTop: 7, font: `500 9.5px ${t.mono}`, color: t.faint, display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ color: M.toolErrors > 0 ? "#e0795f" : t.accent, fontWeight: 600 }}>{((M.toolErrors / M.toolResults) * 100).toFixed(1)}%</span>
+                  of {fmtInt(M.toolResults)} tool calls errored
+                </div>
+              )}
+            </>
+          )}
+          {/* MCP — shown whenever the user has installed MCP servers */}
+          {M.servers > 0 && (
+            <>
+              <SectionRule t={t} />
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+                <Label t={t}>MCP calls</Label>
+                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} servers</span>
+              </div>
+              {P.mcp.length > 0
+                ? <BarList key={period} items={P.mcp} theme={t} accent={t.accent} />
+                : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No MCP calls in this period</div>}
+            </>
+          )}
+          {/* Skill — shown whenever the user has installed skills */}
+          {M.skills > 0 && (
+            <>
+              <SectionRule t={t} />
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+                <Label t={t}>Skill calls</Label>
+                <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} skills</span>
+              </div>
+              {P.skills.length > 0
+                ? <BarList key={period} items={P.skills} theme={t} accent={t.accent} />
+                : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No skill calls in this period</div>}
+            </>
+          )}
+          {/* heatmap */}
+          <SectionRule t={t} />
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 9 }}>
+            <Label t={t}>Daily activity</Label>
+            {streak >= 2 && (
+              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                🔥 <span style={{ color: t.text, fontWeight: 600 }}>{streak}</span>-day streak
+              </span>
+            )}
+          </div>
+          <Heatmap days={heatmap} theme={t} accent={t.accent} />
+          {/* weekly rhythm — day-of-week token pattern over the heatmap window */}
+          {(() => {
+            const wr = weekdayRhythm(heatmap);
+            if (!wr) return null;
+            const max = Math.max(...wr.bars, 1e-9);
+            const ini = ["M", "T", "W", "T", "F", "S", "S"];
+            const full = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            return (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+                  <Label t={t}>Weekly rhythm</Label>
+                  <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                    busiest <span style={{ color: t.text, fontWeight: 600 }}>{full[wr.busiest]}</span> · {Math.round(wr.weekendPct)}% weekend
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 38 }}>
+                  {wr.bars.map((v, i) => (
+                    <div key={i} title={`${full[i]} · ${fmtTokens(v)}`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                      <div style={{ width: "100%", height: 28, display: "flex", alignItems: "flex-end" }}>
+                        <div style={{ width: "100%", height: `${Math.max((v / max) * 100, 3)}%`, background: i === wr.busiest ? t.accent : t.accentSoft, borderRadius: "3px 3px 0 0" }} />
+                      </div>
+                      <span style={{ font: `500 8.5px ${t.mono}`, color: i >= 5 ? t.faint : t.dim }}>{ini[i]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+          {/* footer note */}
+          <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
+            Est. cost via models.dev / LiteLLM · estimate
+          </div>
+        </>)}
         </div>{/* /scrolling body */}
       </div>
       {toast && (
@@ -836,7 +957,7 @@ export default function App() {
   // Period + which date we're viewing. refDate === null means "current/live"
   // (uses the workspace data + live updates); a set ISO date means we've
   // navigated to a past day/week/month, fetched on demand into `fetchedPeriod`.
-  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
+  const [period, setPeriod] = useState<"Day" | "Week" | "Month" | "All">("Week");
   const [refDate, setRefDate] = useState<string | null>(null);
   const [fetchedPeriod, setFetchedPeriod] = useState<PeriodReport | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -945,8 +1066,20 @@ export default function App() {
     return () => cancelAnimationFrame(id);
   }, [dark]);
 
+  // Selected dashboard; fall back to the aggregate if the active account is
+  // gone. Computed here rather than after the `!ws` return below because the
+  // all-time fetch needs `effectiveTab` — the tabs render "All" when the
+  // selected account disappears, so the fetch has to ask for "all" too.
+  const selected = !ws
+    ? undefined
+    : activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
+  const effectiveTab = selected ? activeTab : "all";
+
   // On-demand fetch when we've navigated to a past period (refDate set). Live
   // mode (refDate === null) reads the workspace + gets live pushes instead.
+  // NOTE: this one passes `activeTab`, not `effectiveTab` — the same dead-account
+  // mismatch fixed in the all-time fetch below. Left alone deliberately: it
+  // predates this branch and is out of its scope, not an inconsistency.
   useEffect(() => {
     if (refDate === null) return;
     let cancelled = false;
@@ -955,6 +1088,47 @@ export default function App() {
       .catch(() => {});
     return () => { cancelled = true; };
   }, [refDate, period, activeTab]);
+
+  const [allTime, setAllTime] = useState<AllTimeReport | null>(null);
+  // Unlike the period fetch above — which swallows its failure because
+  // `liveReport` is a real fallback — the All page has no second data source.
+  // Without this, one failed invoke left it on "Loading…" forever.
+  const [allTimeErr, setAllTimeErr] = useState<string | null>(null);
+  const [allTimeRetry, setAllTimeRetry] = useState(0);
+  // Visible in-flight state for the Retry button (mirrors `quotaBusy` for the
+  // quota refresh control): without it, a click that doesn't change the fetch
+  // subject leaves the old error on screen for the whole ~600ms `build_all_time`
+  // and the user can't tell it registered, so they click again and queue up
+  // more BUILD_LOCK work.
+  const [allTimeBusy, setAllTimeBusy] = useState(false);
+  // What the report is *of*. `openGen` (the popover was reopened) is a refresh
+  // of the same subject, so it swaps the numbers in place; a change of account
+  // or period is a different subject, and rendering the old one would show the
+  // WRONG account's totals — that case resets to the loading state first.
+  const allTimeSubject = `${effectiveTab}:${period}`;
+  const allTimeSubjectRef = useRef(allTimeSubject);
+  useEffect(() => {
+    const prev = allTimeSubjectRef.current;
+    allTimeSubjectRef.current = allTimeSubject;
+    if (period !== "All") return;
+    let cancelled = false;
+    // show the loading state while the account switch lands
+    if (prev !== allTimeSubject) { setAllTime(null); setAllTimeErr(null); }
+    setAllTimeBusy(true);
+    fetchAllTime(effectiveTab)
+      .then((r) => { if (!cancelled) { setAllTime(r); setAllTimeErr(null); } })
+      .catch((e) => {
+        // Keep any report already on screen — a stale figure beats an error
+        // page — and surface the failure only when there is nothing to show.
+        if (!cancelled) setAllTimeErr(String((e as Error)?.message ?? e) || "unknown error");
+      })
+      .finally(() => { if (!cancelled) setAllTimeBusy(false); });
+    return () => { cancelled = true; };
+    // openGen: the webview stays mounted while the popover is hidden, so without
+    // it the All page would freeze at whatever it showed when first opened.
+    // allTimeRetry: the Retry button, for a failure the user wants to re-try
+    // without closing and reopening the popover.
+  }, [period, effectiveTab, allTimeSubject, openGen, allTimeRetry]);
 
   const t = themeFor(dark, preset);
   if (err) {
@@ -974,10 +1148,7 @@ export default function App() {
   const tabs = ws.accounts.length > 1
     ? [{ id: "all", label: "All", agent: "all" }, ...ws.accounts.map((a) => ({ id: a.id, label: labelOverrides[a.id] ?? a.label, agent: a.agent }))]
     : [];
-  // Selected dashboard; fall back to the aggregate if the active account is gone.
-  const selected = activeTab === "all" ? ws.all : ws.accounts.find((a) => a.id === activeTab)?.dash;
   const dash = selected ?? ws.all;
-  const effectiveTab = selected ? activeTab : "all";
   // Per-account plan quota; the aggregate "All" tab has no single quota to show.
   // With one account there's no real "all" (see tabs above) — that lone account's
   // quota is the one to show even though effectiveTab reads "all". Its agent
@@ -1002,8 +1173,9 @@ export default function App() {
   };
   const goToday = () => setRefDate(null);
   const changePeriod = (p: string) => {
-    setPeriod(p as "Day" | "Week" | "Month");
+    setPeriod(p as "Day" | "Week" | "Month" | "All");
     setFetchedPeriod(null); // force a refetch at the new granularity
+    if (p === "All") { setRefDate(null); return; }
     if (refDate && isCurrentPeriod(refDate, p)) setRefDate(null);
   };
   const drillDay = (iso: string) => {
@@ -1022,6 +1194,18 @@ export default function App() {
     <Panel
       report={report}
       heatmap={dash.heatmap}
+      allTime={allTime}
+      allTimeErr={allTimeErr}
+      allTimeBusy={allTimeBusy}
+      onRetryAllTime={() => {
+        // Give the click visible effect immediately — don't wait for the
+        // effect (same subject, so it wouldn't reset these on its own) —
+        // and disable the button so repeated clicks can't queue up more
+        // BUILD_LOCK work.
+        setAllTimeErr(null);
+        setAllTimeBusy(true);
+        setAllTimeRetry((n) => n + 1);
+      }}
       period={period}
       onPeriod={changePeriod}
       dark={dark}

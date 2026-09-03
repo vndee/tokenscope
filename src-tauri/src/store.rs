@@ -94,6 +94,13 @@ struct SnapshotRef<'a> {
     quota: &'a Option<(i64, serde_json::Value)>,
 }
 
+/// How long a raw event stays in the store. Every caller that computes a prune
+/// cutoff must use this same value: `rollup::Archive::absorb` decides which days
+/// are safe to rewrite from the cutoff date, so a caller pruning to a different
+/// horizon would either freeze days the store can still reproduce or overwrite
+/// archived days with partial ones.
+pub const RETENTION_DAYS: i64 = 210;
+
 pub struct Store {
     pub events: Vec<RawEvent>,
     // message id -> index in `events`. A single assistant message can be split
@@ -237,10 +244,11 @@ impl Store {
         self.rebuild_index();
     }
 
-    /// Drop events older than `cutoff_ms`. The reports/heatmap only span the last
-    /// ~26 weeks, so anything older is dead weight that grows events.json without
-    /// bound. Returns whether anything was removed. Old logs already at EOF are
-    /// never re-read, so their pruned events don't reappear.
+    /// Drop events older than `cutoff_ms` (callers derive it from
+    /// `RETENTION_DAYS`). The reports/heatmap only span the last ~26 weeks, so
+    /// anything older is dead weight that grows events.json without bound.
+    /// Returns whether anything was removed. Old logs already at EOF are never
+    /// re-read, so their pruned events don't reappear.
     pub fn prune_before(&mut self, cutoff_ms: i64) -> bool {
         let before = self.events.len();
         self.events.retain(|e| e.ts_ms >= cutoff_ms);

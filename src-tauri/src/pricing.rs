@@ -38,6 +38,7 @@ impl ModelPrice {
     }
 }
 
+#[derive(Default)]
 pub struct Pricing {
     exact: HashMap<String, ModelPrice>,
     norm: HashMap<String, ModelPrice>,
@@ -52,6 +53,82 @@ fn normalize_key(s: &str) -> String {
 
 fn bare(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Strip a trailing "-YYYYMMDD" date suffix so dated releases merge into their
+/// base model (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5").
+///
+/// Lives here, not in `parser.rs`, because `rollup.rs` needs the price lookup
+/// built on it and must stay independent of `parser::Event` — `pricing.rs` has
+/// no `use crate::` dependencies of its own, so it is the one module both can
+/// sit on top of without a cycle.
+pub(crate) fn normalize_model(name: &str) -> String {
+    if let Some(idx) = name.rfind('-') {
+        let suffix = &name[idx + 1..];
+        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return name[..idx].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// The one price lookup every caller uses: the RAW (possibly dated) id first,
+/// then its normalized form. `Pricing::lookup` never strips a `-YYYYMMDD`
+/// suffix (`normalize_key` only lowercases and de-dots), so the second step is
+/// the only thing that prices "claude-opus-5-20260101" against an undated table
+/// entry — which is every entry in the built-in snapshot `Pricing::shared()`
+/// serves until the async price loader lands.
+///
+/// The order is load-bearing in both directions: raw first so a dated release
+/// priced in its own right wins over its base model, normalized second so a
+/// dated id is never left unpriced. Shared by the read paths
+/// (`parser::compute_event`, `parser::Agg::add_row`) *and* the archive writer
+/// (`rollup::rows_from_events`), whose per-project/branch/account costs are
+/// frozen on disk and never recomputed — a one-step lookup there froze a real
+/// day's spend at $0 permanently.
+///
+/// `normalize_model` allocates, so it is produced lazily: a raw id the table
+/// already knows never pays for its normalized form at all.
+fn priced_cost_impl<S: AsRef<str>>(
+    pricing: &Pricing,
+    raw: &str,
+    norm: impl FnOnce() -> S,
+    input: f64,
+    output: f64,
+    cc: f64,
+    cr: f64,
+) -> Option<f64> {
+    pricing
+        .cost(raw, input, output, cc, cr)
+        .or_else(|| pricing.cost(norm().as_ref(), input, output, cc, cr))
+}
+
+/// `priced_cost_impl` for callers holding only the raw id.
+pub(crate) fn priced_cost(
+    pricing: &Pricing,
+    raw: &str,
+    input: f64,
+    output: f64,
+    cc: f64,
+    cr: f64,
+) -> Option<f64> {
+    priced_cost_impl(pricing, raw, || normalize_model(raw), input, output, cc, cr)
+}
+
+/// `priced_cost` for callers that already normalized `raw` for their own use
+/// (the per-event and per-row read paths both key their model split on it), so
+/// the second `normalize_model` allocation is skipped. One implementation
+/// behind both entry points, so the lookup order cannot drift between them.
+pub(crate) fn priced_cost_norm(
+    pricing: &Pricing,
+    raw: &str,
+    norm: &str,
+    input: f64,
+    output: f64,
+    cc: f64,
+    cr: f64,
+) -> Option<f64> {
+    priced_cost_impl(pricing, raw, || norm, input, output, cc, cr)
 }
 
 /// Whether `provider` is `id`'s first-party vendor, as opposed to a reseller,
@@ -366,6 +443,25 @@ impl Pricing {
             return Some(p);
         }
         self.norm.get(&normalize_key(model))
+    }
+
+    /// An empty table: every lookup misses. Test-only — production code always
+    /// goes through `load`/`shared`, which fall back to a built-in snapshot.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// A table with only exact-id entries, `norm` left empty. Test-only — lets a
+    /// test put different prices on a raw id and its normalized form, to pin
+    /// which one `cost`/`cache_savings` consult first.
+    #[cfg(test)]
+    pub fn with_exact(entries: &[(&str, ModelPrice)]) -> Self {
+        let mut p = Self::default();
+        for (id, price) in entries {
+            p.exact.insert(id.to_string(), price.clone());
+        }
+        p
     }
 
     /// Exact-or-normalized cost in USD. None = no pricing data for this model.

@@ -33,6 +33,7 @@
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI / Codex 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
 | Codex 套餐额度 | Codex 会话日志中 `token_count` 行携带的 `rate_limits` |
 | Claude 套餐额度 | 按账户带上 `CLAUDE_CONFIG_DIR` 运行 `claude -p "/usage"` |
+| 全量每日汇总归档（不受 210 天事件裁剪影响） | `~/Library/Caches/tokenscope/rollup-<account>.json` |
 
 套餐额度不会碰任何凭据：Codex 的额度就在已经在读的日志里，Claude 的额度来自它自己官方支持的 CLI。Tokenscope 不读 Keychain、不读任何鉴权文件，也不会调用任何未公开的接口。超过 30 分钟的数据会以变暗样式展示，而非当作当前值，托盘的 `⚠` 也会忽略它们——所以每小时刷新一次的 Claude 告警，在每小时的前半段有效、后半段静默。面板则始终带着自己的 "as of" 标注展示这个数字。
 
@@ -59,6 +60,8 @@ Claude 的额度会在启动后不久检查一次，此后每小时自动检查�
 - 工具分类（Codex）：`mcp_tool_call_end` 事件带出的 server 名 → MCP（对照 `config.toml` 白名单校验，内置的 `codex_apps` 连接器会被过滤掉）；某一轮内读取过 `skills/<name>/SKILL.md`（或 `skills/<plugin>/<name>/SKILL.md`）路径 → Skill，每轮只计一次
 
 > 花费为按公开价格的**估算**；订阅用户应理解为「等效消费价值」。
+
+**All time** 页面读取的是持久化的按天汇总归档，而不是只保留最近 210 天记录的事件存储。只要原始存储仍完整覆盖某一天，这一天就会被归档，并在此后每次有内容需要并入的启动中重写——新摄入的日志字节，或是被裁剪淘汰出窗口的事件——直到它滑出这个窗口为止；被裁剪得只剩部分记录的那个边界日，只会被写入一次，此后不会被某次局部重读覆盖。MCP / Skill 名称在归档时不做过滤，每个模型的 token 也按原始值归档——白名单与价格表是在读取这一行时才应用，而不是写入时——所以安装新的 MCP、添加 Skill，或是刷新价格，仍会追溯性地作用到已归档的日子上。唯一的例外是项目 / 分支 / 账户这一档：它按名称存成单一的（token 数，花费）二元组，读取时原样取回——两个字段都被固定住（按天推导需要项目×模型的笛卡尔积）。真正在每次读取时重新计算的，是总览花费、按模型的花费，以及 MCP / Skill 的过滤。已归档的一天做不到的是：钻取到它保存的按小时直方图以下的细节。
 
 ### 四类 Token 与计价公式
 

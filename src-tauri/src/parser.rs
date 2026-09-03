@@ -3,8 +3,9 @@
 // into Day / Week / Month reports + a daily heatmap.
 use crate::config::UserConfig;
 use crate::model::*;
-use crate::pricing::Pricing;
-use crate::store::{RawEvent, Store};
+use crate::pricing::{normalize_model, priced_cost_norm, Pricing};
+use crate::rollup::{Archive, DayRow};
+use crate::store::{RawEvent, Store, RETENTION_DAYS};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -27,7 +28,7 @@ struct Event {
     priced: bool, // whether a price was found for this model
     project: String, // cwd basename ("" if unknown)
     branch: String,  // git branch ("" if unknown)
-    account: String, // owning account label (set by account_events)
+    account: String, // owning account label (set by materialize_events)
     tools: Vec<String>, // all tool_use names in this msg (mcp__ excluded here)
     sidechain: bool,    // ran inside a subagent
     tool_results: u64,  // tool_result blocks (reliability denominator)
@@ -40,20 +41,16 @@ struct Event {
 const PALETTE: &[&str] = &["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const OVERFLOW_GRAY: &str = "#79817b";
 
-/// Strip a trailing "-YYYYMMDD" date suffix so dated releases merge into
-/// their base model (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5").
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-fn normalize_model(name: &str) -> String {
-    if let Some(idx) = name.rfind('-') {
-        let suffix = &name[idx + 1..];
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return name[..idx].to_string();
-        }
-    }
-    name.to_string()
+/// A skill's display name: the segment after the last ':' of its key, so
+/// "gstack:review" and a bare "review" both read as "review". Shared by the two
+/// read paths (`compute_event` for live events, `Agg::add_row` for archived
+/// rows) so the archive and the live store can never disagree about a name.
+fn short_skill_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 /// Last path component of a session cwd → a fallback "project" label. Handles
@@ -71,7 +68,7 @@ fn project_of(cwd: &str) -> String {
 /// that contains a `.git` entry (the repo root) and returning its basename, so a
 /// session launched in a subdir (…/repo/backend) rolls up to the repo (repo).
 /// Falls back to the cwd's own basename when no repo is found or the path is gone.
-/// Filesystem-backed, so callers memoize per unique cwd (see `account_events`).
+/// Filesystem-backed, so callers memoize per unique cwd (see `account_sync` and `materialize_events`).
 fn resolve_project(cwd: &str) -> String {
     if !cwd.is_empty() {
         let mut dir = std::path::Path::new(cwd);
@@ -279,45 +276,78 @@ fn build_reports(
     }
 }
 
+/// One account after `account_sync`: everything a caller gets for the cost every
+/// caller has to pay. Materializing the `Vec<Event>` on top of this is a
+/// separate, much more expensive step (`materialize_events`) that only the
+/// period views need.
+struct AccountSync {
+    store: Store,
+    cfg: UserConfig,
+    archive: Archive,
+    quota: Option<crate::model::QuotaSnapshot>,
+    /// cwd -> git-repo-root project name. Shared between the archive fold and a
+    /// later `materialize_events` so the (filesystem-backed) walk-up runs once
+    /// per directory per build, not once per step and not once per event.
+    proj_memo: HashMap<String, String>,
+}
+
+/// `resolve_project`, memoized. `get` before `entry` because `entry` allocates
+/// the key even on a hit, and this runs once per event.
+fn resolve_memo(memo: &mut HashMap<String, String>, cwd: &str) -> String {
+    if let Some(v) = memo.get(cwd) {
+        return v.clone();
+    }
+    let v = resolve_project(cwd);
+    memo.insert(cwd.to_string(), v.clone());
+    v
+}
+
 /// Load one account's incremental store (ingest new log bytes, prune, persist),
-/// then compute its events with the current config + prices. Returns the events
-/// plus the account's installed MCP-server / Skill sets.
-fn account_events(
+/// load its config and its durable archive, and maintain the archive.
+///
+/// This is the part *every* caller needs. `need_archive` says the caller will
+/// actually read the archive back (`build_all_time`), which forces a fold so the
+/// All page is never a refresh behind; otherwise the fold runs only when
+/// durability requires it (see `Archive::needs_absorb`). That split is what
+/// keeps the 30s poll and the 400ms-debounced watcher off the fold entirely.
+fn account_sync(
     d: &crate::agents::AgentDescriptor,
     a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
-) -> (
-    Vec<Event>,
-    HashSet<String>,
-    HashSet<String>,
-    Option<crate::model::QuotaSnapshot>,
-) {
+    need_archive: bool,
+) -> AccountSync {
     let mut store = Store::load(&a.id);
-    let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
-    if store.prune_before(cutoff) {
-        dirty = true;
-    }
-    if dirty {
+    let ingested = store.ingest(&a.log_root, (d.parser)().as_ref());
+    let pruned = store.prune_before(cutoff);
+    if ingested || pruned {
         store.save(&a.id);
     }
     let cfg = (d.load_config)(a);
-    // Resolve each event's project to its git-repo root, memoized per unique cwd
-    // so the (filesystem-backed) walk-up runs once per directory, not per event.
     let mut proj_memo: HashMap<String, String> = HashMap::new();
-    let events = store
-        .events
-        .iter()
-        .map(|r| {
-            let mut e = compute_event(r, &cfg, pricing);
-            e.project = proj_memo
-                .entry(r.cwd.clone())
-                .or_insert_with(|| resolve_project(&r.cwd))
-                .clone();
-            e.account = a.label.clone();
-            e
-        })
-        .collect();
+
+    // Load unconditionally: callers get the archive back and it must always be
+    // valid, whether or not this build had anything new to fold in.
+    let mut archive = Archive::load(&a.id);
+    let today = Local::now().date_naive();
+    let today_iso = iso(today);
+    if need_archive || archive.needs_absorb(&today_iso, pruned) {
+        // Fold this build's live days into the durable archive. `cutoff` is a
+        // timestamp, so its own day is only partly in the store; `absorb` is
+        // what keeps that from overwriting a complete row.
+        let cutoff_date = DateTime::from_timestamp_millis(cutoff)
+            .unwrap_or_default()
+            .with_timezone(&Local)
+            .date_naive();
+        let mut resolve = |cwd: &str| resolve_memo(&mut proj_memo, cwd);
+        let rows = crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
+        archive.absorb(rows, cutoff_date);
+        archive.last_absorbed = today_iso;
+        // Only written when something actually changed: `absorb` just ran, and
+        // `last_absorbed` moved with it.
+        archive.save(&a.id);
+    }
+
     // Codex reports quota in its logs; Claude's arrives from the poller cache.
     let quota = match d.id {
         "claude" => crate::quota::cached(&a.id),
@@ -333,7 +363,39 @@ fn account_events(
                     })
             }),
     };
-    (events, cfg.mcp_servers, cfg.skills, quota)
+    AccountSync {
+        store,
+        cfg,
+        archive,
+        quota,
+        proj_memo,
+    }
+}
+
+/// Map a synced account's raw events into computed `Event`s: current config +
+/// prices applied, project resolved to its git-repo root, account label stamped.
+///
+/// The expensive half of a refresh, and deliberately NOT part of `account_sync`:
+/// `build_all_time` reads only the archive, so making it materialize (and then
+/// drop) tens of megabytes of `Event` per account on every popover focus was
+/// pure waste.
+fn materialize_events(sync: &mut AccountSync, label: &str, pricing: &Pricing) -> Vec<Event> {
+    let AccountSync {
+        store,
+        cfg,
+        proj_memo,
+        ..
+    } = sync;
+    store
+        .events
+        .iter()
+        .map(|r| {
+            let mut e = compute_event(r, cfg, pricing);
+            e.project = resolve_memo(proj_memo, &r.cwd);
+            e.account = label.to_string();
+            e
+        })
+        .collect()
 }
 
 /// Build a per-account dashboard for every discovered Claude account, plus an
@@ -344,8 +406,8 @@ pub fn build_workspace() -> Workspace {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let now = Local::now();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (now - Duration::days(210)).timestamp_millis();
+    // Reports/heatmap span ~26 weeks (+ prev month); RETENTION_DAYS leaves margin.
+    let cutoff = (now - Duration::days(RETENTION_DAYS)).timestamp_millis();
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
@@ -358,10 +420,19 @@ pub fn build_workspace() -> Workspace {
     let mut all_skills: HashSet<String> = HashSet::new();
 
     for (d, a) in crate::agents::discover_all() {
-        let (events, servers, skills, quota) = account_events(d, &a, &pricing, cutoff);
-        let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
-        all_servers.extend(servers);
-        all_skills.extend(skills);
+        // The archive is maintained but never read here, so this pays only for
+        // a fold that durability actually requires.
+        let mut sync = account_sync(d, &a, &pricing, cutoff, false);
+        let events = materialize_events(&mut sync, &a.label, &pricing);
+        let AccountSync { cfg, quota, .. } = sync;
+        let dash = build_reports(
+            &events,
+            cfg.mcp_servers.len() as u64,
+            cfg.skills.len() as u64,
+            now,
+        );
+        all_servers.extend(cfg.mcp_servers);
+        all_skills.extend(cfg.skills);
         all_events.extend(events);
         accounts.push(AccountData {
             id: a.id,
@@ -392,7 +463,7 @@ pub fn build_workspace() -> Workspace {
 /// month). Powers date navigation and drill-down into past periods.
 pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) -> PeriodReport {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
+    let cutoff = (Local::now() - Duration::days(RETENTION_DAYS)).timestamp_millis();
     let pricing = Pricing::shared();
 
     let mut events: Vec<Event> = Vec::new();
@@ -402,10 +473,10 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk, _) = account_events(d, &a, &pricing, cutoff);
-        events.extend(ev);
-        servers.extend(srv);
-        skills.extend(sk);
+        let mut sync = account_sync(d, &a, &pricing, cutoff, false);
+        events.extend(materialize_events(&mut sync, &a.label, &pricing));
+        servers.extend(sync.cfg.mcp_servers);
+        skills.extend(sync.cfg.skills);
     }
 
     let mut rep = match parse_period(period) {
@@ -425,6 +496,232 @@ pub fn build_dashboard() -> Dashboard {
     build_workspace().all
 }
 
+/// The facts that only exist at all-time scale, derived from the archive.
+struct AllTimeExtras {
+    first: String,
+    last: String,
+    active_days: u64,
+    biggest_day: Option<(String, f64)>,
+    longest_streak: u64,
+}
+
+/// Days with any usage, the biggest of them, and the longest unbroken run.
+/// A row with no tokens is not an active day: the archive can hold one for a
+/// day that saw only slash-command records.
+fn all_time_extras(archive: &Archive) -> AllTimeExtras {
+    let mut active: Vec<(chrono::NaiveDate, f64)> = Vec::new();
+    for (date, r) in &archive.days {
+        let tok: f64 = r
+            .models
+            .values()
+            .map(|b| b.input + b.cc + b.cr + b.out)
+            .sum();
+        if tok <= 0.0 {
+            continue;
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+            active.push((d, tok / 1e6));
+        }
+    }
+    // Not redundant with the BTreeMap's key order. `%m`/`%d` accept unpadded
+    // values, so a corrupt key like "2026-1-5" — the same malformed shape
+    // `monthly_series` defends against, from a file whose keys `load_from`
+    // never validates — parses fine yet sorts *after* "2026-01-06" as a
+    // string. The streak walk below reads consecutive dates, so it would
+    // silently break a real run in two. Keep this sort.
+    active.sort_by_key(|(d, _)| *d);
+
+    let biggest = active
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(d, t)| (iso(*d), r2(*t)));
+
+    let mut longest = 0u64;
+    let mut run = 0u64;
+    let mut prev: Option<chrono::NaiveDate> = None;
+    for (d, _) in &active {
+        run = match prev {
+            Some(p) if *d == p + Duration::days(1) => run + 1,
+            _ => 1,
+        };
+        longest = longest.max(run);
+        prev = Some(*d);
+    }
+
+    AllTimeExtras {
+        first: active.first().map(|(d, _)| iso(*d)).unwrap_or_default(),
+        last: active.last().map(|(d, _)| iso(*d)).unwrap_or_default(),
+        active_days: active.len() as u64,
+        biggest_day: biggest,
+        longest_streak: longest,
+    }
+}
+
+/// Build the all-time report for one account id, or `"all"` for every account
+/// summed. Reads only the durable archives — every live day was absorbed into
+/// them by `account_sync`, so the archive alone is the complete picture and
+/// no day can be counted twice.
+pub fn build_all_time(account_id: &str) -> AllTimeReport {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cutoff = (Local::now() - Duration::days(RETENTION_DAYS)).timestamp_millis();
+    let pricing = Pricing::shared();
+
+    let mut agg = Agg::default();
+    let mut merged = Archive::default();
+    let mut servers: HashSet<String> = HashSet::new();
+    let mut skills: HashSet<String> = HashSet::new();
+
+    for (d, a) in crate::agents::discover_all() {
+        if account_id != "all" && a.id != account_id {
+            continue;
+        }
+        // `need_archive`: this is the one caller that reads the archive, so it
+        // always re-folds and the All page is never a refresh behind. It never
+        // materializes the events, which is the whole point of the split — the
+        // largest account alone is ~43 MB of `Event` that this would discard.
+        let sync = account_sync(d, &a, &pricing, cutoff, true);
+        let AccountSync { cfg, archive, .. } = sync;
+        for row in archive.days.values() {
+            agg.add_row(row, &cfg, &pricing);
+        }
+        // For the extras (first/last/streak/biggest) and the monthly bars the
+        // accounts' days union: a day is active if any account worked that day.
+        merge_days(&mut merged, archive);
+        servers.extend(cfg.mcp_servers);
+        skills.extend(cfg.skills);
+    }
+
+    let x = all_time_extras(&merged);
+    let series = monthly_series(&merged);
+    let mut metrics = agg.metrics(0.0, 0.0);
+    metrics.servers = servers.len() as u64;
+    metrics.skills = skills.len() as u64;
+
+    // `merged` already carries each day's summed histogram, so this is the
+    // cross-day total.
+    let mut hourly = vec![0.0f64; 24];
+    for row in merged.days.values() {
+        for (i, v) in row.hourly.iter().take(24).enumerate() {
+            hourly[i] += v;
+        }
+    }
+
+    AllTimeReport {
+        report: PeriodReport {
+            metrics,
+            series,
+            models: agg.models(),
+            projects: Agg::named_tokens(&agg.project_tok, &agg.project_cost),
+            branches: Agg::named_tokens(&agg.branch_tok, &agg.branch_cost),
+            accounts: Agg::named_tokens(&agg.account_tok, &agg.account_cost),
+            tools: Agg::named(&agg.tool_counts),
+            mcp: Agg::named(&agg.mcp_counts),
+            skills: Agg::named(&agg.skill_counts),
+            req_trend: Vec::new(),
+            cost_trend: Vec::new(),
+            hourly,
+            // Deliberately empty. `range` is the period views' navigation label
+            // ("Mar 3" / "Mar 2026"), and all-time has no period to name: the
+            // page writes its own header from `first`, formatted for display,
+            // and nothing reads this. Computing a second, ISO-shaped copy of
+            // that sentence here only invited the two to disagree.
+            range: String::new(),
+            // Deliberately empty: there is no previous all-time to trend against.
+            trend: Vec::new(),
+        },
+        first: x.first,
+        last: x.last,
+        active_days: x.active_days,
+        biggest_day: x.biggest_day,
+        longest_streak: x.longest_streak,
+    }
+}
+
+/// The 1..=12 month of a "yyyy-mm…" key, or `None` if it is not one.
+fn month_num(key: &str) -> Option<usize> {
+    key.get(5..7)
+        .and_then(|m| m.parse::<usize>().ok())
+        .filter(|m| (1..=12).contains(m))
+}
+
+/// Union one account's archive into a cross-account one, summing days the two
+/// share.
+///
+/// PARTIAL by design: only `models` and `hourly` are carried over, because only
+/// `all_time_extras`, `monthly_series` and the cross-day hourly fold read the
+/// result. Every other `DayRow` field — `projects`, `branches`, `accounts`,
+/// `tools`, `mcp`, `skills`, `sessions`, `subagent`, `tool_results`,
+/// `tool_errors` — is left at its default here; those come from `Agg::add_row`
+/// per account instead. Reading them off the merged archive would silently
+/// return zeros.
+fn merge_days(into: &mut Archive, from: Archive) {
+    for (date, row) in from.days {
+        let e = into
+            .days
+            .entry(date.clone())
+            .or_insert_with(|| DayRow::new(&date));
+        for (m, b) in &row.models {
+            let t = e.models.entry(m.clone()).or_default();
+            t.input += b.input;
+            t.cc += b.cc;
+            t.cr += b.cr;
+            t.out += b.out;
+            t.requests += b.requests;
+        }
+        // `hourly` is `#[serde(default)]`, so a deserialized row can carry an
+        // empty vec. Safe because `e` always comes from `DayRow::new` (24 zeros)
+        // and the source side is bounded by `take(24)`.
+        for (i, v) in row.hourly.iter().take(24).enumerate() {
+            e.hourly[i] += v;
+        }
+    }
+}
+
+/// One bar per calendar month spanned by the archive, oldest→newest, with a
+/// sparse axis label so a multi-year range stays readable.
+fn monthly_series(archive: &Archive) -> Vec<SeriesPoint> {
+    let mut by_month: std::collections::BTreeMap<String, (f64, f64, f64)> =
+        std::collections::BTreeMap::new();
+    for (date, r) in &archive.days {
+        // Keys are ours today ("%Y-%m-%d"), but an `Archive` is deserialized from
+        // a file whose keys `load_from` never validates — only its version. A
+        // corrupted-but-parseable archive must not panic the whole dashboard
+        // build on a slice boundary, so skip a key we cannot read rather than
+        // relabel it as January.
+        let key = match date.get(..7) {
+            Some(k) if month_num(k).is_some() => k.to_string(), // "yyyy-mm"
+            _ => continue,
+        };
+        let e = by_month.entry(key).or_default();
+        for b in r.models.values() {
+            e.0 += b.input / 1e6;
+            e.1 += (b.cc + b.cr) / 1e6;
+            e.2 += b.out / 1e6;
+        }
+    }
+    let n = by_month.len();
+    by_month
+        .into_iter()
+        .enumerate()
+        .map(|(i, (key, (input, cache, output)))| {
+            let y = key.get(..4).unwrap_or("");
+            // Clamped, not trusted: the collection loop above already rejected a
+            // key without a real month, so this only keeps `MONTHS` in bounds.
+            let mi = month_num(&key).unwrap_or(1).saturating_sub(1).min(11);
+            // Label roughly six ticks regardless of range length.
+            let every = (n / 6).max(1);
+            SeriesPoint {
+                label: if i % every == 0 { MONTHS[mi].to_string() } else { String::new() },
+                full: format!("{} {}", MONTHS[mi], y),
+                input,
+                cache,
+                output,
+                date: format!("{key}-01"),
+            }
+        })
+        .collect()
+}
+
 /// Derive a computed Event from a stored RawEvent, applying the *current* user
 /// config (MCP/Skill whitelist) and prices. This is why these aren't baked into
 /// the store: installing an MCP or a price refresh applies retroactively.
@@ -433,10 +730,11 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .unwrap_or_default()
         .with_timezone(&Local);
     let model = normalize_model(&r.model);
-    // price lookup uses the raw (possibly dated) id, then the normalized one
-    let cost_opt = pricing
-        .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
-        .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr));
+    // Price lookup uses the raw (possibly dated) id, then the normalized one.
+    // `_norm` hands over the `model` binding above rather than normalizing a
+    // second time: `normalize_model` always allocates, and this runs once per
+    // event on the hottest path in the app.
+    let cost_opt = priced_cost_norm(pricing, &r.model, &model, r.in_tok, r.out_tok, r.cc, r.cr);
     let savings = pricing
         .cache_savings(&r.model, r.cr)
         .or_else(|| pricing.cache_savings(&model, r.cr))
@@ -451,7 +749,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         .skills
         .iter()
         .filter(|s| cfg.is_user_skill(s))
-        .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
+        .map(|s| short_skill_name(s).to_string())
         .collect();
     // Tool-usage breakdown covers built-in tools; mcp__ calls have their own
     // (server-grouped) view, so drop them here to avoid a duplicated, noisier list.
@@ -473,7 +771,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         priced: cost_opt.is_some(),
         project: project_of(&r.cwd),
         branch: r.branch.clone(),
-        account: String::new(), // filled in by account_events (knows the account)
+        account: String::new(), // filled in by materialize_events (knows the account)
         tools,
         sidechain: r.sidechain,
         tool_results: r.tool_results as u64,
@@ -496,6 +794,10 @@ struct Agg {
     tool_errors: u64,
     requests: u64,
     sessions: HashSet<String>,
+    /// Sessions contributed by archived rows, which carry a count rather than
+    /// the ids. Kept separate from `sessions` so the two are never conflated:
+    /// a synthetic id would be indistinguishable from a real one.
+    sessions_count: u64,
     mcp_calls: u64,
     skill_calls: u64,
     model_tok: HashMap<String, f64>,
@@ -572,6 +874,86 @@ impl Agg {
         }
     }
 
+    /// Fold one archived day into this aggregate.
+    ///
+    /// This is where the archive's two read-time contracts are honoured: MCP and
+    /// skill names were stored unfiltered, so the *current* whitelist applies
+    /// here; per-model tokens were stored raw, so the *current* price table
+    /// applies here. Both therefore stay retroactive for days the raw event
+    /// store can no longer reproduce.
+    ///
+    /// One deliberate divergence from `add`: a model-less record (a Claude
+    /// slash-command line, a Codex tool record) never reaches `r.models`, so its
+    /// tokens are invisible here — while `add` books them into `input`/`cache`/
+    /// `output` outside its model guard, and `rows_from_events` books them into
+    /// the row's `hourly` histogram. All-time `total_tokens` can therefore in
+    /// principle undershoot the sum of its own `hourly`. Empirically it is zero
+    /// today, because those records carry no tokens; noted so the gap isn't
+    /// rediscovered later as a frontend bug.
+    fn add_row(&mut self, r: &DayRow, cfg: &UserConfig, pricing: &Pricing) {
+        for (raw, b) in &r.models {
+            let model = normalize_model(raw);
+            let cost = priced_cost_norm(pricing, raw, &model, b.input, b.out, b.cc, b.cr);
+            let savings = pricing
+                .cache_savings(raw, b.cr)
+                .or_else(|| pricing.cache_savings(&model, b.cr))
+                .unwrap_or(0.0);
+
+            self.input += b.input;
+            self.cache += b.cc + b.cr;
+            self.output += b.out;
+            self.cost += cost.unwrap_or(0.0);
+            self.savings += savings;
+            self.requests += b.requests;
+
+            let tok = b.input + b.cc + b.cr + b.out;
+            *self.model_tok.entry(model.clone()).or_default() += tok;
+            *self.model_cost.entry(model.clone()).or_default() += cost.unwrap_or(0.0);
+            *self.model_priced.entry(model).or_default() |= cost.is_some();
+        }
+
+        self.sessions_count += r.sessions;
+        self.subagent_tok += r.subagent;
+        self.tool_results += r.tool_results;
+        self.tool_errors += r.tool_errors;
+
+        // mcp__ calls have their own server-grouped view; including them here
+        // would double-count them, exactly as compute_event avoids.
+        for (name, c) in &r.tools {
+            if !name.starts_with("mcp__") {
+                *self.tool_counts.entry(name.clone()).or_default() += c;
+            }
+        }
+        for (name, c) in &r.mcp {
+            if cfg.is_user_mcp(name) {
+                self.mcp_calls += c;
+                *self.mcp_counts.entry(name.clone()).or_default() += c;
+            }
+        }
+        for (name, c) in &r.skills {
+            if cfg.is_user_skill(name) {
+                self.skill_calls += c;
+                *self
+                    .skill_counts
+                    .entry(short_skill_name(name).to_string())
+                    .or_default() += c;
+            }
+        }
+
+        for (name, (tok_m, cost)) in &r.projects {
+            *self.project_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.project_cost.entry(name.clone()).or_default() += cost;
+        }
+        for (name, (tok_m, cost)) in &r.branches {
+            *self.branch_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.branch_cost.entry(name.clone()).or_default() += cost;
+        }
+        for (name, (tok_m, cost)) in &r.accounts {
+            *self.account_tok.entry(name.clone()).or_default() += tok_m * 1e6;
+            *self.account_cost.entry(name.clone()).or_default() += cost;
+        }
+    }
+
     fn models(&self) -> Vec<ModelStat> {
         let mut v: Vec<(String, f64, f64)> = self
             .model_tok
@@ -642,7 +1024,7 @@ impl Agg {
             mcp_calls: self.mcp_calls,
             skill_calls: self.skill_calls,
             requests: self.requests,
-            sessions: self.sessions.len() as u64,
+            sessions: self.sessions.len() as u64 + self.sessions_count,
             delta_tokens,
             delta_cost,
             servers: self.mcp_counts.len() as u64,
@@ -996,5 +1378,337 @@ mod tests {
         assert_eq!(vendor_of("codex-auto-review"), "OpenAI");
         // Unchanged for the models already handled.
         assert_eq!(vendor_of("claude-opus-5"), "Anthropic");
+    }
+
+    use crate::pricing::ModelPrice;
+    use crate::rollup::{DayRow, TokBits};
+
+
+
+    fn day_row() -> DayRow {
+        let mut r = DayRow::new("2026-01-05");
+        r.models.insert(
+            "claude-opus-5-20260101".to_string(),
+            TokBits { input: 1_000_000.0, cc: 0.0, cr: 0.0, out: 100_000.0, requests: 3 },
+        );
+        r.mcp.insert("mcp__github".to_string(), 4);
+        r.mcp.insert("mcp__not-installed".to_string(), 9);
+        r.skills.insert("gstack:review".to_string(), 2);
+        r.tools.insert("Read".to_string(), 5);
+        r.tools.insert("mcp__github".to_string(), 4);
+        r.sessions = 2;
+        r.projects.insert("proj-a".to_string(), (1.5, 2.25));
+        r.branches.insert("main".to_string(), (2.0, 3.0));
+        r.accounts.insert("acct-1".to_string(), (0.5, 0.75));
+        r.subagent = 42.0;
+        r.tool_results = 7;
+        r.tool_errors = 1;
+        r
+    }
+
+    fn cfg_with(mcp: &[&str], skills: &[&str]) -> UserConfig {
+        UserConfig {
+            mcp_servers: mcp.iter().map(|s| s.to_string()).collect(),
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_archived_row_is_filtered_by_the_current_whitelist_on_read() {
+        // The whole point of archiving names unfiltered: installing an MCP
+        // server must make past calls count, even for days the raw store can no
+        // longer reproduce.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&["mcp__github"], &["review"]), &Pricing::empty());
+
+        assert_eq!(agg.mcp_calls, 4); // the un-installed server contributes nothing
+        assert_eq!(agg.mcp_counts.get("mcp__github"), Some(&4));
+        assert_eq!(agg.mcp_counts.get("mcp__not-installed"), None);
+        assert_eq!(agg.skill_calls, 2);
+        assert_eq!(agg.skill_counts.get("review"), Some(&2));
+    }
+
+    #[test]
+    fn a_newly_installed_server_retroactively_counts_in_an_archived_row() {
+        let mut agg = Agg::default();
+        agg.add_row(
+            &day_row(),
+            &cfg_with(&["mcp__github", "mcp__not-installed"], &[]),
+            &Pricing::empty(),
+        );
+        assert_eq!(agg.mcp_calls, 13);
+    }
+
+    #[test]
+    fn sessions_sum_the_live_id_set_and_the_archived_counts() {
+        // `metrics.sessions` is the one figure fed from both halves of the
+        // all-time picture: live events carry session *ids* (deduped in a set),
+        // archived rows carry only a per-day *count*, because keeping the ids
+        // would mean archiving an unbounded set. The two are held apart so a
+        // synthetic id can never look real, and combined only here — untested
+        // until now, so a dropped term or a `.max()` would have gone unnoticed.
+        let mut agg = Agg::default();
+        agg.add(&ev("s1", "claude-opus-5"));
+        agg.add(&ev("s1", "claude-opus-5")); // same session: still one
+        agg.add(&ev("s2", "claude-opus-5"));
+        assert_eq!(agg.sessions.len(), 2);
+
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+        assert_eq!(agg.sessions_count, 2, "day_row() carries sessions = 2");
+
+        // 2 distinct live ids + 2 archived days' worth. `.max()` would say 2,
+        // and either term alone would say 2 — only the sum says 4.
+        assert_eq!(agg.metrics(0.0, 0.0).sessions, 4);
+    }
+
+    #[test]
+    fn an_archived_rows_tools_drop_mcp_entries() {
+        // mcp__ calls have their own server-grouped view; counting them again
+        // under tools would duplicate them, exactly as compute_event avoids.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.tool_counts.get("Read"), Some(&5));
+        assert_eq!(agg.tool_counts.get("mcp__github"), None);
+    }
+
+    #[test]
+    fn an_archived_row_groups_tokens_under_the_normalized_model_name() {
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.requests, 3);
+        assert_eq!(agg.sessions_count, 2);
+        assert_eq!(agg.input, 1_000_000.0);
+        assert_eq!(agg.output, 100_000.0);
+        // The dated release merges into its base model for display.
+        assert!(agg.model_tok.contains_key("claude-opus-5"));
+        assert!(!agg.model_tok.contains_key("claude-opus-5-20260101"));
+        // No price table → cost unknown, and the model is marked unpriced.
+        assert_eq!(agg.cost, 0.0);
+        assert_eq!(agg.model_priced.get("claude-opus-5"), Some(&false));
+    }
+
+    #[test]
+    fn an_archived_row_is_priced_by_its_raw_id_before_its_normalized_one() {
+        // Archived rows key `models` by the raw (possibly dated) id specifically
+        // so a price update or a dated release's own rate applies retroactively.
+        // Put different prices on the raw id and its normalized form: if
+        // `add_row` looked up the normalized id first, this row would be priced
+        // at 7.0 (1_000_000 * 5e-6 + 100_000 * 20e-6) instead of the 3.0 below.
+        let pricing = Pricing::with_exact(&[
+            (
+                "claude-opus-5-20260101",
+                ModelPrice { input: 2e-6, output: 10e-6, cache_create: 0.0, cache_read: 0.0 },
+            ),
+            (
+                "claude-opus-5",
+                ModelPrice { input: 5e-6, output: 20e-6, cache_create: 0.0, cache_read: 0.0 },
+            ),
+        ]);
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &pricing);
+
+        assert_eq!(agg.cost, 3.0);
+        assert_eq!(agg.model_priced.get("claude-opus-5"), Some(&true));
+    }
+
+    #[test]
+    fn an_archived_rows_project_branch_account_and_passthrough_fields_convert_correctly() {
+        // `DayRow` stores project/branch/account tokens in M tokens (to match
+        // how they're frozen at archive time); `Agg` accumulates raw tokens
+        // everywhere else. This pins the `* 1e6` conversion in `add_row`: a
+        // dropped or inverted conversion here would be a 1,000,000x error that
+        // every other test in this module is blind to.
+        let mut agg = Agg::default();
+        agg.add_row(&day_row(), &cfg_with(&[], &[]), &Pricing::empty());
+
+        assert_eq!(agg.project_tok.get("proj-a"), Some(&1_500_000.0));
+        assert_eq!(agg.branch_tok.get("main"), Some(&2_000_000.0));
+        assert_eq!(agg.account_tok.get("acct-1"), Some(&500_000.0));
+        // Costs are frozen USD already, not M tokens — they pass through unchanged.
+        assert_eq!(agg.project_cost.get("proj-a"), Some(&2.25));
+        assert_eq!(agg.branch_cost.get("main"), Some(&3.0));
+        assert_eq!(agg.account_cost.get("acct-1"), Some(&0.75));
+        // Plain counters/totals pass through unchanged too.
+        assert_eq!(agg.subagent_tok, 42.0);
+        assert_eq!(agg.tool_results, 7);
+        assert_eq!(agg.tool_errors, 1);
+    }
+
+    /// An archive of `(date, input, cc, cr, out)` rows, one model each.
+    fn archive_of(rows: &[(&str, f64, f64, f64, f64)]) -> Archive {
+        let mut archive = Archive::default();
+        for (date, input, cc, cr, out) in rows {
+            let mut r = DayRow::new(date);
+            r.models.insert(
+                "claude-opus-5".to_string(),
+                TokBits { input: *input, cc: *cc, cr: *cr, out: *out, requests: 1 },
+            );
+            archive.days.insert(date.to_string(), r);
+        }
+        archive
+    }
+
+    #[test]
+    fn all_time_extras_describe_the_archived_range() {
+        // Raw token counts, in the millions: `all_time_extras` reports M tokens
+        // rounded to 2 dp (the `r2` Global Constraint), so toy values would all
+        // round to 0.0 and the assertion below would prove nothing.
+        //
+        // The biggest day carries most of its tokens in `input`/`cc`/`cr` and the
+        // *fewest* in `out`, so an implementation that summed only `out` would
+        // both misreport its size (20.0, not 90.0) and crown the 9th instead.
+        let archive = archive_of(&[
+            ("2026-01-05", 0.0, 0.0, 0.0, 10e6),
+            ("2026-01-06", 40e6, 20e6, 10e6, 20e6), // 90M, the biggest day
+            ("2026-01-07", 0.0, 0.0, 0.0, 20e6),
+            // A row with no tokens at all — the archive holds one for a day that
+            // saw only slash-command records. It sits in the gap between the
+            // streak and the last day, so if the `tok <= 0.0` guard were dropped
+            // it would both count as active (5) and bridge the streak (05..09).
+            ("2026-01-08", 0.0, 0.0, 0.0, 0.0),
+            ("2026-01-09", 0.0, 0.0, 0.0, 30e6),
+        ]);
+
+        let x = all_time_extras(&archive);
+        assert_eq!(x.first, "2026-01-05");
+        assert_eq!(x.last, "2026-01-09");
+        assert_eq!(x.active_days, 4);
+        assert_eq!(x.longest_streak, 3); // 05, 06, 07
+        assert_eq!(x.biggest_day, Some(("2026-01-06".to_string(), 90.0)));
+    }
+
+    #[test]
+    fn merging_two_accounts_sums_the_days_they_share_and_keeps_the_ones_they_dont() {
+        let mut merged = Archive::default();
+        let mut a = archive_of(&[("2026-01-05", 1e6, 2e6, 3e6, 4e6)]);
+        let mut b = archive_of(&[
+            ("2026-01-05", 10e6, 20e6, 30e6, 40e6),
+            ("2026-01-06", 5e6, 0.0, 0.0, 0.0), // only this account worked the 6th
+        ]);
+        a.days.get_mut("2026-01-05").unwrap().hourly[3] = 1.5;
+        b.days.get_mut("2026-01-05").unwrap().hourly[3] = 2.5;
+        b.days.get_mut("2026-01-05").unwrap().hourly[9] = 7.0;
+
+        merge_days(&mut merged, a);
+        merge_days(&mut merged, b);
+
+        assert_eq!(merged.days.len(), 2);
+        let shared = &merged.days["2026-01-05"].models["claude-opus-5"];
+        assert_eq!(shared.input, 11e6);
+        assert_eq!(shared.cc, 22e6);
+        assert_eq!(shared.cr, 33e6);
+        assert_eq!(shared.out, 44e6);
+        assert_eq!(shared.requests, 2);
+        // Histograms add bucket-wise, and untouched buckets stay zero.
+        let h = &merged.days["2026-01-05"].hourly;
+        assert_eq!(h.len(), 24);
+        assert_eq!(h[3], 4.0);
+        assert_eq!(h[9], 7.0);
+        assert_eq!(h[0], 0.0);
+        // A day only one account has survives untouched.
+        assert_eq!(merged.days["2026-01-06"].models["claude-opus-5"].input, 5e6);
+    }
+
+    #[test]
+    fn merging_a_row_whose_hourly_vector_is_empty_does_not_panic() {
+        // `DayRow::hourly` is `#[serde(default)]`, so a row read back from disk
+        // can legitimately have no buckets at all. The merge survives it only
+        // because the destination always comes from `DayRow::new` (24 zeros) and
+        // the source is bounded by `take(24)`.
+        let mut merged = Archive::default();
+        let mut incoming = archive_of(&[("2026-01-05", 1e6, 0.0, 0.0, 2e6)]);
+        incoming.days.get_mut("2026-01-05").unwrap().hourly = Vec::new();
+
+        merge_days(&mut merged, incoming);
+
+        let day = &merged.days["2026-01-05"];
+        assert_eq!(day.hourly.len(), 24);
+        assert!(day.hourly.iter().all(|v| *v == 0.0));
+        assert_eq!(day.models["claude-opus-5"].input, 1e6);
+        assert_eq!(day.models["claude-opus-5"].out, 2e6);
+    }
+
+    #[test]
+    fn monthly_series_buckets_days_into_months_in_m_tokens() {
+        // Two days in January, one in February. Cache is creation + read.
+        let series = monthly_series(&archive_of(&[
+            ("2026-01-05", 1e6, 2e6, 3e6, 4e6),
+            ("2026-01-20", 1e6, 0.0, 0.0, 1e6),
+            ("2026-02-03", 6e6, 1e6, 1e6, 2e6),
+        ]));
+
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].input, 2.0);
+        assert_eq!(series[0].cache, 5.0);
+        assert_eq!(series[0].output, 5.0);
+        assert_eq!(series[1].input, 6.0);
+        assert_eq!(series[1].cache, 2.0);
+        assert_eq!(series[1].output, 2.0);
+        // The drill-down anchor is the first of the month, not a day that exists.
+        assert_eq!(series[0].date, "2026-01-01");
+        assert_eq!(series[1].date, "2026-02-01");
+        assert_eq!(series[0].full, "Jan 2026");
+        assert_eq!(series[1].full, "Feb 2026");
+        // Six or fewer months: every bar is labelled.
+        assert_eq!(series[0].label, "Jan");
+        assert_eq!(series[1].label, "Feb");
+    }
+
+    #[test]
+    fn a_long_monthly_range_labels_only_about_six_ticks() {
+        // 13 months → every 2nd bar labelled, so the axis stays readable instead
+        // of printing a tick per month.
+        let rows: Vec<(String, f64, f64, f64, f64)> = (0..13)
+            .map(|i| {
+                let (y, m) = (2025 + i / 12, i % 12 + 1);
+                (format!("{y}-{m:02}-05"), 1e6, 0.0, 0.0, 0.0)
+            })
+            .collect();
+        let refs: Vec<(&str, f64, f64, f64, f64)> =
+            rows.iter().map(|(d, a, b, c, e)| (d.as_str(), *a, *b, *c, *e)).collect();
+
+        let series = monthly_series(&archive_of(&refs));
+
+        assert_eq!(series.len(), 13);
+        let labelled: Vec<usize> = series
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.label.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(labelled, vec![0, 2, 4, 6, 8, 10, 12]);
+        // Every bar still carries its full label for the tooltip.
+        assert_eq!(series[1].full, "Feb 2025");
+        assert_eq!(series[12].full, "Jan 2026");
+    }
+
+    #[test]
+    fn a_malformed_archive_key_is_skipped_rather_than_crashing_the_build() {
+        // `Archive::load_from` validates the document version and nothing else,
+        // so a corrupted-but-parseable file can hand us any key at all. None of
+        // these may panic on a slice boundary or an out-of-range month index.
+        let mut archive = archive_of(&[("2026-01-05", 1e6, 0.0, 0.0, 0.0)]);
+        for bad in ["", "2026", "2026-00-01", "2026-13-01", "2026-xx-01", "20é6-01-01"] {
+            archive.days.insert(bad.to_string(), DayRow::new(bad));
+        }
+
+        let series = monthly_series(&archive);
+
+        // Only the one well-formed day produced a bar.
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].full, "Jan 2026");
+        assert_eq!(series[0].date, "2026-01-01");
+    }
+
+    #[test]
+    fn all_time_extras_of_an_empty_archive_are_empty_not_zeroed_dates() {
+        let x = all_time_extras(&Archive::default());
+        assert_eq!(x.first, "");
+        assert_eq!(x.last, "");
+        assert_eq!(x.active_days, 0);
+        assert_eq!(x.longest_streak, 0);
+        assert_eq!(x.biggest_day, None);
     }
 }

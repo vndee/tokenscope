@@ -19,6 +19,16 @@ export interface PeriodReport {
   hourly: number[];
   range: string; trend: TrendPoint[];
 }
+// All-time: an ordinary PeriodReport (series = monthly buckets) plus the facts
+// that only exist at this scale. The inner report's delta/trend fields are
+// deliberately empty — these replace them.
+export interface AllTimeReport {
+  report: PeriodReport;
+  first: string; last: string;       // ISO; "" when there is no usage at all
+  activeDays: number;
+  biggestDay: [string, number] | null; // (ISO date, M tokens)
+  longestStreak: number;
+}
 export interface HeatDay { date: string; tokens: number; level: number }
 export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
@@ -58,6 +68,29 @@ export async function fetchPeriod(account: string, period: string, reference: st
   return period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
 }
 
+// Fetch the all-time report for an account ("all" or an id). Read from the
+// durable rollup archive, so it covers history the 210-day event store has
+// already pruned.
+export async function fetchAllTime(account: string): Promise<AllTimeReport> {
+  const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  if (inTauri) return invoke<AllTimeReport>("get_all_time", { account });
+  // Dev fallback: the static snapshot has no archive, so stand in with the
+  // month report and derive the range from the heatmap.
+  const res = await fetch("/dev-dashboard.json");
+  if (!res.ok) throw new Error("no dev snapshot");
+  const dash: Dashboard = await res.json();
+  const active = dash.heatmap.filter((d) => d.tokens > 0);
+  const biggest = active.reduce<HeatDay | null>((b, d) => (b && b.tokens >= d.tokens ? b : d), null);
+  return {
+    report: dash.month,
+    first: active[0]?.date ?? "",
+    last: active[active.length - 1]?.date ?? "",
+    activeDays: active.length,
+    biggestDay: biggest ? [biggest.date, biggest.tokens] : null,
+    longestStreak: activeStreak(dash.heatmap),
+  };
+}
+
 // ── date navigation helpers (local time) ───────────────────────────
 const pad2 = (n: number) => String(n).padStart(2, "0");
 export const fmtISO = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -87,6 +120,10 @@ export function isCurrentPeriod(iso: string, period: string): boolean {
 
 // ── formatting helpers ──────────────────────────────────────────
 export const fmtTokens = (m: number) => {
+  // All-time totals are ~1000x a period's, so four-digit "6191.06M" figures are
+  // the norm on that page rather than an edge case — and a heavy user's Month
+  // view reaches them too.
+  if (m >= 1000) return (m / 1000).toFixed(2) + "B";
   if (m >= 1) return m.toFixed(2) + "M";
   const k = m * 1000;
   // one decimal for sub-1K totals (e.g. "0.4K"), but only when it rounds to a
