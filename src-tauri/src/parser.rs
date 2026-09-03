@@ -306,74 +306,78 @@ fn build_reports(
     }
 }
 
+/// One account after `account_sync`: everything a caller gets for the cost every
+/// caller has to pay. Materializing the `Vec<Event>` on top of this is a
+/// separate, much more expensive step (`materialize_events`) that only the
+/// period views need.
+struct AccountSync {
+    store: Store,
+    cfg: UserConfig,
+    archive: Archive,
+    quota: Option<crate::model::QuotaSnapshot>,
+    /// cwd -> git-repo-root project name. Shared between the archive fold and a
+    /// later `materialize_events` so the (filesystem-backed) walk-up runs once
+    /// per directory per build, not once per step and not once per event.
+    proj_memo: HashMap<String, String>,
+}
+
+/// `resolve_project`, memoized. `get` before `entry` because `entry` allocates
+/// the key even on a hit, and this runs once per event.
+fn resolve_memo(memo: &mut HashMap<String, String>, cwd: &str) -> String {
+    if let Some(v) = memo.get(cwd) {
+        return v.clone();
+    }
+    let v = resolve_project(cwd);
+    memo.insert(cwd.to_string(), v.clone());
+    v
+}
+
 /// Load one account's incremental store (ingest new log bytes, prune, persist),
-/// then compute its events with the current config + prices. Returns the events
-/// plus the account's installed MCP-server / Skill sets.
-fn account_events(
+/// load its config and its durable archive, and maintain the archive.
+///
+/// This is the part *every* caller needs. `need_archive` says the caller will
+/// actually read the archive back (`build_all_time`), which forces a fold so the
+/// All page is never a refresh behind; otherwise the fold runs only when
+/// durability requires it (see `Archive::needs_absorb`). That split is what
+/// keeps the 30s poll and the 400ms-debounced watcher off the fold entirely.
+fn account_sync(
     d: &crate::agents::AgentDescriptor,
     a: &crate::agents::AccountSpec,
     pricing: &Pricing,
     cutoff: i64,
-) -> (
-    Vec<Event>,
-    HashSet<String>,
-    HashSet<String>,
-    Option<crate::model::QuotaSnapshot>,
-    Archive,
-) {
+    need_archive: bool,
+) -> AccountSync {
     let mut store = Store::load(&a.id);
-    let mut dirty = store.ingest(&a.log_root, (d.parser)().as_ref());
-    if store.prune_before(cutoff) {
-        dirty = true;
-    }
-    if dirty {
+    let ingested = store.ingest(&a.log_root, (d.parser)().as_ref());
+    let pruned = store.prune_before(cutoff);
+    if ingested || pruned {
         store.save(&a.id);
     }
     let cfg = (d.load_config)(a);
-    // Resolve each event's project to its git-repo root, memoized per unique cwd
-    // so the (filesystem-backed) walk-up runs once per directory, not per event.
     let mut proj_memo: HashMap<String, String> = HashMap::new();
-    let mut resolve = |cwd: &str| -> String {
-        proj_memo
-            .entry(cwd.to_string())
-            .or_insert_with(|| resolve_project(cwd))
-            .clone()
-    };
 
     // Load unconditionally: callers get the archive back and it must always be
     // valid, whether or not this build had anything new to fold in.
     let mut archive = Archive::load(&a.id);
-    // Re-folding every retained event and rewriting the archive costs real time,
-    // and this runs on the 30s poll and on every watcher refresh. Skip it when
-    // `dirty` says the event set is unchanged: the same events yield the same
-    // rows. A price refresh or a whitelist change is NOT a reason to re-absorb —
-    // rows keep raw per-model tokens and unfiltered names precisely so both
-    // apply at read time in `add_row`. Only the frozen project/branch/account
-    // cost can drift, which the archive format already accepts as frozen.
-    if dirty || archive.days.is_empty() {
-        // Fold this build's live days into the durable archive before the events
-        // are mapped. `cutoff` is a timestamp, so its own day is only partly in
-        // the store; `absorb` is what keeps that from overwriting a complete row.
+    let today = Local::now().date_naive();
+    let today_iso = iso(today);
+    if need_archive || archive.needs_absorb(&today_iso, pruned) {
+        // Fold this build's live days into the durable archive. `cutoff` is a
+        // timestamp, so its own day is only partly in the store; `absorb` is
+        // what keeps that from overwriting a complete row.
         let cutoff_date = DateTime::from_timestamp_millis(cutoff)
             .unwrap_or_default()
             .with_timezone(&Local)
             .date_naive();
-        let rows =
-            crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
+        let mut resolve = |cwd: &str| resolve_memo(&mut proj_memo, cwd);
+        let rows = crate::rollup::rows_from_events(&store.events, &mut resolve, &a.label, pricing);
         archive.absorb(rows, cutoff_date);
+        archive.last_absorbed = today_iso;
+        // Only written when something actually changed: `absorb` just ran, and
+        // `last_absorbed` moved with it.
         archive.save(&a.id);
     }
 
-    let events = store
-        .events
-        .iter()
-        .map(|r| {
-            let mut e = compute_event(r, &cfg, pricing);
-            e.project = resolve(&r.cwd);
-            e.account = a.label.clone();
-            e
-        })
-        .collect();
     // Codex reports quota in its logs; Claude's arrives from the poller cache.
     let quota = match d.id {
         "claude" => crate::quota::cached(&a.id),
@@ -389,7 +393,39 @@ fn account_events(
                     })
             }),
     };
-    (events, cfg.mcp_servers, cfg.skills, quota, archive)
+    AccountSync {
+        store,
+        cfg,
+        archive,
+        quota,
+        proj_memo,
+    }
+}
+
+/// Map a synced account's raw events into computed `Event`s: current config +
+/// prices applied, project resolved to its git-repo root, account label stamped.
+///
+/// The expensive half of a refresh, and deliberately NOT part of `account_sync`:
+/// `build_all_time` reads only the archive, so making it materialize (and then
+/// drop) tens of megabytes of `Event` per account on every popover focus was
+/// pure waste.
+fn materialize_events(sync: &mut AccountSync, label: &str, pricing: &Pricing) -> Vec<Event> {
+    let AccountSync {
+        store,
+        cfg,
+        proj_memo,
+        ..
+    } = sync;
+    store
+        .events
+        .iter()
+        .map(|r| {
+            let mut e = compute_event(r, cfg, pricing);
+            e.project = resolve_memo(proj_memo, &r.cwd);
+            e.account = label.to_string();
+            e
+        })
+        .collect()
 }
 
 /// Build a per-account dashboard for every discovered Claude account, plus an
@@ -414,10 +450,19 @@ pub fn build_workspace() -> Workspace {
     let mut all_skills: HashSet<String> = HashSet::new();
 
     for (d, a) in crate::agents::discover_all() {
-        let (events, servers, skills, quota, _) = account_events(d, &a, &pricing, cutoff);
-        let dash = build_reports(&events, servers.len() as u64, skills.len() as u64, now);
-        all_servers.extend(servers);
-        all_skills.extend(skills);
+        // The archive is maintained but never read here, so this pays only for
+        // a fold that durability actually requires.
+        let mut sync = account_sync(d, &a, &pricing, cutoff, false);
+        let events = materialize_events(&mut sync, &a.label, &pricing);
+        let AccountSync { cfg, quota, .. } = sync;
+        let dash = build_reports(
+            &events,
+            cfg.mcp_servers.len() as u64,
+            cfg.skills.len() as u64,
+            now,
+        );
+        all_servers.extend(cfg.mcp_servers);
+        all_skills.extend(cfg.skills);
         all_events.extend(events);
         accounts.push(AccountData {
             id: a.id,
@@ -458,10 +503,10 @@ pub fn build_period(account_id: &str, period: &str, reference: DateTime<Local>) 
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        let (ev, srv, sk, _, _) = account_events(d, &a, &pricing, cutoff);
-        events.extend(ev);
-        servers.extend(srv);
-        skills.extend(sk);
+        let mut sync = account_sync(d, &a, &pricing, cutoff, false);
+        events.extend(materialize_events(&mut sync, &a.label, &pricing));
+        servers.extend(sync.cfg.mcp_servers);
+        skills.extend(sync.cfg.skills);
     }
 
     let mut rep = match parse_period(period) {
@@ -560,18 +605,20 @@ pub fn build_all_time(account_id: &str) -> AllTimeReport {
         if account_id != "all" && a.id != account_id {
             continue;
         }
-        // Runs ingest, and re-absorbs whenever anything changed, so the archive
-        // read below is current either way.
-        let (_ev, srv, sk, _q, archive) = account_events(d, &a, &pricing, cutoff);
-        let cfg = (d.load_config)(&a);
+        // `need_archive`: this is the one caller that reads the archive, so it
+        // always re-folds and the All page is never a refresh behind. It never
+        // materializes the events, which is the whole point of the split — the
+        // largest account alone is ~43 MB of `Event` that this would discard.
+        let sync = account_sync(d, &a, &pricing, cutoff, true);
+        let AccountSync { cfg, archive, .. } = sync;
         for row in archive.days.values() {
             agg.add_row(row, &cfg, &pricing);
         }
         // For the extras (first/last/streak/biggest) and the monthly bars the
         // accounts' days union: a day is active if any account worked that day.
         merge_days(&mut merged, archive);
-        servers.extend(srv);
-        skills.extend(sk);
+        servers.extend(cfg.mcp_servers);
+        skills.extend(cfg.skills);
     }
 
     let x = all_time_extras(&merged);
@@ -1361,6 +1408,7 @@ mod tests {
 
     use crate::pricing::ModelPrice;
     use crate::rollup::{DayRow, TokBits};
+
 
     fn day_row() -> DayRow {
         let mut r = DayRow::new("2026-01-05");

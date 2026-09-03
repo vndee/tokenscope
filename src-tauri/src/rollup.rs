@@ -98,17 +98,28 @@ pub struct Archive {
     /// structural: absorbing a live day overwrites its row instead of adding a
     /// second copy, so no day can ever be counted twice.
     pub days: BTreeMap<String, DayRow>,
+    /// Local calendar date (ISO) of the last `absorb`, or "" if never. Lets the
+    /// hot path skip a re-fold it does not need without risking a lost day —
+    /// see `needs_absorb`. Empty on an archive written before this field
+    /// existed, which reads as "behind today" and simply folds once.
+    #[serde(default)]
+    pub last_absorbed: String,
 }
 
 #[derive(Serialize)]
 struct DocRef<'a> {
     version: u32,
+    last_absorbed: &'a str,
     days: &'a BTreeMap<String, DayRow>,
 }
 
 #[derive(Deserialize)]
 struct Doc {
     version: u32,
+    /// Added after `ROLLUP_VERSION` 1 shipped. Deliberately NOT a version bump:
+    /// a bump discards every archived day, and this field defaults harmlessly.
+    #[serde(default)]
+    last_absorbed: String,
     days: BTreeMap<String, DayRow>,
 }
 
@@ -141,7 +152,10 @@ impl Archive {
             .ok()
             .and_then(|t| serde_json::from_str::<Doc>(&t).ok())
             .filter(|d| d.version == ROLLUP_VERSION)
-            .map(|d| Archive { days: d.days })
+            .map(|d| Archive {
+                days: d.days,
+                last_absorbed: d.last_absorbed,
+            })
             .unwrap_or_default()
     }
 
@@ -155,6 +169,7 @@ impl Archive {
     fn save_to(&self, dir: &std::path::Path, id: &str) {
         let doc = DocRef {
             version: ROLLUP_VERSION,
+            last_absorbed: &self.last_absorbed,
             days: &self.days,
         };
         if let Ok(t) = serde_json::to_string(&doc) {
@@ -181,6 +196,35 @@ impl Archive {
                 self.days.insert(date, row);
             }
         }
+    }
+
+    /// Whether durability *requires* re-folding the raw store into this archive
+    /// on the current pass, for a caller that does not itself need to read the
+    /// archive. `today` is the local calendar date, ISO; `pruned` is whether
+    /// `Store::prune_before` dropped anything this pass.
+    ///
+    /// Re-folding is the expensive half of a refresh (every retained event, on
+    /// every 30s poll *and* every 400ms-debounced watcher tick), and the fold is
+    /// idempotent — the same events yield the same rows — so the only question
+    /// is whether skipping it could ever lose a day.
+    ///
+    /// It cannot. A day's events sit in the raw store for `RETENTION_DAYS`, and
+    /// `absorb` rewrites every day strictly after the prune cutoff, which
+    /// advances one day at a time. So a day D is eligible for absorption on
+    /// every fold from the day it happens until the cutoff reaches it —
+    /// hundreds of chances — and this returns true at least once per local
+    /// calendar day (`last_absorbed` is behind `today` until the day's first
+    /// fold). D is therefore archived long before it becomes the boundary day,
+    /// and its row is then frozen exactly as `absorb` intends. `pruned` forces
+    /// the fold on the pass that actually moves the cutoff, and an empty `days`
+    /// forces it on a first run (or after a version reset), when there is no
+    /// archived history to protect at all.
+    ///
+    /// A price refresh or a whitelist change is deliberately NOT a trigger: rows
+    /// keep raw per-model tokens and unfiltered names precisely so both apply at
+    /// read time in `Agg::add_row`.
+    pub fn needs_absorb(&self, today: &str, pruned: bool) -> bool {
+        self.days.is_empty() || pruned || self.last_absorbed.as_str() < today
     }
 }
 
@@ -493,6 +537,79 @@ mod tests {
         assert_eq!(a.days["2026-01-05"].models["claude-opus-5"].out, 42.0);
         assert_eq!(a.days["2026-03-10"].models["claude-opus-5"].out, 5.0);
         assert_eq!(a.days.len(), 2);
+    }
+
+    #[test]
+    fn a_second_pass_on_the_same_day_with_nothing_new_does_not_re_absorb() {
+        // The hot path: the 30s poll and the 400ms-debounced watcher both land
+        // here, and re-folding every retained event on each is the single most
+        // expensive thing a refresh does.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+        a.last_absorbed = "2026-03-10".to_string();
+
+        assert!(!a.needs_absorb("2026-03-10", false));
+    }
+
+    #[test]
+    fn a_first_run_with_an_empty_archive_absorbs() {
+        // Nothing on file yet, so there is no history to protect and every day
+        // in the raw store needs archiving now.
+        let a = Archive::default();
+        assert!(a.needs_absorb("2026-03-10", false));
+    }
+
+    #[test]
+    fn a_date_rollover_absorbs_again() {
+        // Yesterday's fold cannot contain today's events. One fold per local
+        // calendar day is what makes the skip above safe.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+        a.last_absorbed = "2026-03-10".to_string();
+
+        assert!(a.needs_absorb("2026-03-11", false));
+    }
+
+    #[test]
+    fn a_prune_forces_a_re_absorb_on_the_pass_that_moved_the_cutoff() {
+        // The cutoff just advanced, so the day that fell out of the raw store is
+        // making its last appearance — archive it before it is gone.
+        let mut a = Archive::default();
+        a.absorb(live(&[("2026-03-10", 5.0)]), d("2026-01-01"));
+        a.last_absorbed = "2026-03-10".to_string();
+
+        assert!(a.needs_absorb("2026-03-10", true));
+    }
+
+    #[test]
+    fn an_archive_written_before_last_absorbed_existed_folds_once_and_settles() {
+        // `#[serde(default)]`, not a ROLLUP_VERSION bump: an existing archive
+        // keeps every day it holds and simply re-folds on its first pass.
+        let dir = std::env::temp_dir().join(format!("ts-roll-abs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("rollup-acct.json"),
+            serde_json::json!({
+                "version": ROLLUP_VERSION,
+                "days": { "2026-01-05": { "date": "2026-01-05" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut a = Archive::load_from(&dir, "acct");
+        assert_eq!(a.days.len(), 1, "history survives the added field");
+        assert_eq!(a.last_absorbed, "");
+        assert!(a.needs_absorb("2026-03-10", false));
+
+        a.last_absorbed = "2026-03-10".to_string();
+        a.save_to(&dir, "acct");
+        let back = Archive::load_from(&dir, "acct");
+        assert_eq!(back.last_absorbed, "2026-03-10");
+        assert!(!back.needs_absorb("2026-03-10", false));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
