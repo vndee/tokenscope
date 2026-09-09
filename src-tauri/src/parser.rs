@@ -285,6 +285,11 @@ struct AccountSync {
     cfg: UserConfig,
     archive: Archive,
     quota: Option<crate::model::QuotaSnapshot>,
+    /// Why the last quota check failed, for the agents that run one. Travels
+    /// beside `quota` rather than inside it: both, either or neither can be
+    /// present, and a stale figure next to a failing check is the state the
+    /// panel most needs to be able to say out loud.
+    quota_error: Option<crate::model::QuotaFailure>,
     /// cwd -> git-repo-root project name. Shared between the archive fold and a
     /// later `materialize_events` so the (filesystem-backed) walk-up runs once
     /// per directory per build, not once per step and not once per event.
@@ -363,11 +368,18 @@ fn account_sync(
                     })
             }),
     };
+    // Only Claude runs a check that can fail; Codex's figures ride along in logs
+    // that are being read anyway, so there is no separate attempt to report on.
+    let quota_error = match d.id {
+        "claude" => crate::quota::last_failure(&a.id),
+        _ => None,
+    };
     AccountSync {
         store,
         cfg,
         archive,
         quota,
+        quota_error,
         proj_memo,
     }
 }
@@ -424,7 +436,7 @@ pub fn build_workspace() -> Workspace {
         // a fold that durability actually requires.
         let mut sync = account_sync(d, &a, &pricing, cutoff, false);
         let events = materialize_events(&mut sync, &a.label, &pricing);
-        let AccountSync { cfg, quota, .. } = sync;
+        let AccountSync { cfg, quota, quota_error, .. } = sync;
         let dash = build_reports(
             &events,
             cfg.mcp_servers.len() as u64,
@@ -440,6 +452,7 @@ pub fn build_workspace() -> Workspace {
             email: a.email,
             agent: a.agent.to_string(),
             quota,
+            quota_error,
             dash,
         });
     }
