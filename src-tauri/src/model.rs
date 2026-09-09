@@ -160,6 +160,13 @@ pub struct AccountData {
     /// Plan quota for this account, when known. `None` renders as absence — the
     /// UI must never show it as zero.
     pub quota: Option<QuotaSnapshot>,
+    /// Why the most recent quota check failed, when it did. Independent of
+    /// `quota`: a stale figure beside a failing check is the state this exists
+    /// to make visible, and either can be present without the other. Always
+    /// `None` for Codex, which has no check to fail — its quota arrives inside
+    /// logs that are being read anyway.
+    #[serde(rename = "quotaError")]
+    pub quota_error: Option<QuotaFailure>,
     pub dash: Dashboard,
 }
 
@@ -187,6 +194,41 @@ pub struct QuotaWindow {
     /// Human reset text for display, e.g. "Aug 20 at 12:59am". Empty if absent.
     #[serde(rename = "resetsLabel", default)]
     pub resets_label: String,
+}
+
+/// Why the last plan-quota check for an account did not produce a figure.
+///
+/// Serialised as a stable kebab-case tag. The panel turns the tag into a
+/// sentence: user-facing prose lives with the rest of the panel's wording, not
+/// here. Adding a variant therefore means adding a sentence too — the frontend
+/// test over this set is what makes forgetting that a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QuotaFailKind {
+    /// No `claude` binary could be found to ask.
+    NoBinary,
+    /// The run was still going when the deadline passed and was killed.
+    TimedOut,
+    /// The CLI ran and exited non-zero.
+    ExitedNonZero,
+    /// The CLI ran fine but is not signed in for this account, which is why it
+    /// printed no usage. Concluded only from an actual `claude auth status`.
+    SignedOut,
+    /// The CLI ran fine and printed something with no usage figure in it, and
+    /// being signed out was ruled out or could not be checked.
+    Unreadable,
+}
+
+/// The last failed quota check for an account: what went wrong and when.
+///
+/// Kept beside the cached snapshot rather than inside it, because the two are
+/// independent — an account can have a good figure and a failing check at the
+/// same time, which is exactly the state worth showing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct QuotaFailure {
+    pub kind: QuotaFailKind,
+    /// Unix millis of the failed attempt.
+    pub at: i64,
 }
 
 /// An account's plan quota as of a point in time. `source_at` is when the data

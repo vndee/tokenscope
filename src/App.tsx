@@ -4,9 +4,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, Workspace, PeriodReport, AllTimeReport, HeatDay, ModelStat, Theme, QuotaSnapshot,
+  Dashboard, Workspace, PeriodReport, AllTimeReport, HeatDay, ModelStat, Theme, QuotaSnapshot, QuotaWindow, QuotaFailure,
   PresetId, PRESETS, PRESET_OVERFLOW, themeFor, rampFor,
-  fetchWorkspace, fetchPeriod, fetchAllTime, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale,
+  fetchWorkspace, fetchPeriod, fetchAllTime, todayISO, shiftPeriod, isCurrentPeriod, isQuotaStale, fmtCountdown, fmtAge, quotaFailMessage,
   fmtInt, fmtTokens, fmtMoney, pct, peakHours, fmtHourRange, fmtHeatDate, projection, activeStreak, weekdayRhythm,
 } from "./data";
 import {
@@ -163,6 +163,30 @@ const SectionRule = ({ t, m = "12px 0 10px" }: { t: Theme; m?: string }) => (
 const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
   <span style={{ font: `600 10px ${t.ui}`, color: t.dim, letterSpacing: ".05em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{children}</span>
 );
+// The reset half of one quota row. A reset we could resolve to a moment counts
+// down, because the question people bring to this line is how long they have,
+// not what o'clock it is — the absolute time stays a hover away rather than
+// taking the width. Once that moment has passed the countdown says so instead
+// of showing a number: the reading can be minutes old, so a just-elapsed reset
+// is ordinary, not an error.
+//
+// A window whose reset could not be resolved still shows what the source
+// printed, verbatim. The countdown is an addition; it is never a reason to
+// show less than before.
+function ResetNote({ t, w }: { t: Theme; w: QuotaWindow }) {
+  if (w.resetsAt == null) {
+    return w.resetsLabel
+      ? <span style={{ color: t.faint }}> · resets {w.resetsLabel}</span>
+      : null;
+  }
+  const left = fmtCountdown(w.resetsAt, Date.now());
+  return (
+    <span style={{ color: t.faint }} title={w.resetsLabel || undefined}>
+      {left ? ` · resets in ${left}` : " · resetting now"}
+    </span>
+  );
+}
+
 // Plan quota for the selected account. Hidden entirely when unknown — showing
 // an unknown quota as 0% would read as "plenty left", the most costly possible
 // misreading. A figure older than QUOTA_STALE_MS dims, because a stale quota
@@ -185,14 +209,14 @@ const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
 // out by hand. Deliberately placed below the block rather than beside Refresh:
 // it deletes files, and the control people press often should not sit a few
 // pixels from the one that does that.
-function QuotaBlock({ t, q, agent, busy, onRefresh, onPurge, purging }:
-  { t: Theme; q: QuotaSnapshot | null; agent: string | null; busy: boolean;
+function QuotaBlock({ t, q, err, agent, busy, onRefresh, onPurge, purging }:
+  { t: Theme; q: QuotaSnapshot | null; err: QuotaFailure | null; agent: string | null; busy: boolean;
     onRefresh?: () => void; onPurge?: () => void; purging?: boolean }) {
   const windows = q && q.windows.length > 0 ? q.windows : null;
   if (!windows && !onRefresh) return null;
   const stale = !!q && isQuotaStale(q.sourceAt);
-  const mins = q ? Math.max(0, Math.round((Date.now() - q.sourceAt) / 60000)) : 0;
-  const age = mins < 1 ? "just now" : mins < 60 ? `${mins}m ago` : `${Math.round(mins / 60)}h ago`;
+  const now = Date.now();
+  const age = q ? fmtAge(q.sourceAt, now) : "";
   // The staleness dimming covers the figures, not the control that fixes them.
   const dim = { opacity: stale ? 0.45 : 1 };
   return (
@@ -219,7 +243,7 @@ function QuotaBlock({ t, q, agent, busy, onRefresh, onPurge, purging }:
               <span>{w.label}</span>
               <span>
                 <span style={{ color: w.usedPercent >= 80 ? "#e0795f" : t.text, fontWeight: 600 }}>{w.usedPercent}%</span>
-                {w.resetsLabel ? <span style={{ color: t.faint }}> · resets {w.resetsLabel}</span> : null}
+                <ResetNote t={t} w={w} />
               </span>
             </div>
             <div style={{ height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
@@ -227,11 +251,26 @@ function QuotaBlock({ t, q, agent, busy, onRefresh, onPurge, purging }:
             </div>
           </div>
         )) : (
-          <div style={{ font: `500 10px ${t.mono}`, color: t.faint }}>
-            {busy ? "Asking the Claude CLI…" : "Not checked yet"}
+          <div style={{ font: `500 10px ${t.mono}`, color: err && !busy ? "#e0795f" : t.faint }}>
+            {busy
+              ? "Asking the Claude CLI…"
+              : err
+                // Never checked and the check is failing: "Not checked yet"
+                // would be a plain untruth, and the reason is all there is.
+                ? `Check failed — ${quotaFailMessage(err.kind)}.`
+                : "Not checked yet"}
           </div>
         )}
       </div>
+      {err && windows && !busy && (
+        // Deliberately outside `dim`: the figures fade as they age, but the
+        // sentence explaining why they stopped moving is the one thing here
+        // that must not. Shown only alongside a figure — with nothing to
+        // qualify, the empty state above says it instead.
+        <div style={{ font: `500 9px/1.45 ${t.mono}`, color: "#e0795f", marginTop: 5 }}>
+          ⚠ Last check failed {fmtAge(err.at, now)} — {quotaFailMessage(err.kind)}.
+        </div>
+      )}
       {agent === "claude" && windows && (
         <div style={{ font: `500 9px/1.45 ${t.mono}`, color: t.faint, marginTop: 5, ...dim }}>
           Claude calls these approximate: they count local sessions on this
@@ -512,7 +551,7 @@ function AllTimePage({ a, t, ramp, activeTab }: { a: AllTimeReport; t: Theme; ra
   );
 }
 
-function Panel({ report, heatmap, allTime, allTimeErr, allTimeBusy, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; allTimeBusy: boolean; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaAgent: string | null }) {
+function Panel({ report, heatmap, allTime, allTimeErr, allTimeBusy, onRetryAllTime, period, onPeriod, dark, themePref, onToggleTheme, openGen, active, tabs, activeTab, onSelectTab, onRename, preset, onPickPreset, isCurrent, onPrev, onNext, onToday, onDrillDay, onTrendPick, loading, quota, quotaErr, quotaAgent }: { report: PeriodReport; heatmap: HeatDay[]; allTime: AllTimeReport | null; allTimeErr: string | null; allTimeBusy: boolean; onRetryAllTime: () => void; period: "Day" | "Week" | "Month" | "All"; onPeriod: (p: string) => void; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean; tabs: { id: string; label: string; agent: string }[]; activeTab: string; onSelectTab: (id: string) => void; onRename: (id: string, label: string) => void; preset: PresetId; onPickPreset: (id: PresetId) => void; isCurrent: boolean; onPrev: () => void; onNext: () => void; onToday: () => void; onDrillDay: (iso: string) => void; onTrendPick: (iso: string) => void; loading: boolean; quota: QuotaSnapshot | null; quotaErr: QuotaFailure | null; quotaAgent: string | null }) {
   const t = themeFor(dark, preset);
   const ramp = rampFor(dark, preset);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
@@ -769,7 +808,7 @@ function Panel({ report, heatmap, allTime, allTimeErr, allTimeBusy, onRetryAllTi
             <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{trendLabel}</span>
           </div>
           <TrendChart data={P.trend} theme={t} onPick={onTrendPick} />
-          <QuotaBlock t={t} q={quota} agent={quotaAgent} busy={quotaBusy}
+          <QuotaBlock t={t} q={quota} err={quotaErr} agent={quotaAgent} busy={quotaBusy}
             onRefresh={canRefreshQuota ? refreshQuota : undefined}
             onPurge={canRefreshQuota ? purgeQuotaLogs : undefined} purging={purging} />
           <SectionRule t={t} m="14px 0 10px" />
@@ -1157,6 +1196,7 @@ export default function App() {
     ? ws.accounts[0]
     : effectiveTab === "all" ? null : ws.accounts.find((a) => a.id === effectiveTab) ?? null;
   const quota = quotaAccount?.quota ?? null;
+  const quotaErr = quotaAccount?.quotaError ?? null;
 
   // The report to show: the live current period from the workspace, or the
   // on-demand fetched past period. `dash` here reflects the selected account.
@@ -1227,6 +1267,7 @@ export default function App() {
       onTrendPick={trendPick}
       loading={loadingPeriod}
       quota={quota}
+      quotaErr={quotaErr}
       quotaAgent={quotaAccount?.agent ?? null}
     />
   );

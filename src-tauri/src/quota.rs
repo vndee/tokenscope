@@ -1,34 +1,113 @@
 // Claude plan quota. Claude Code persists no quota locally, but its supported
 // CLI prints it: `claude -p "/usage"`. We shell out per account rather than
 // touching the Keychain token or any undocumented endpoint.
-use crate::model::{QuotaSnapshot, QuotaWindow};
+use crate::model::{QuotaFailKind, QuotaFailure, QuotaSnapshot, QuotaWindow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+/// Month number for Claude's fixed English abbreviation ("Aug"). `None` for
+/// anything else, so a locale we have never seen yields no timestamp rather
+/// than a wrong month.
+fn month_number(abbrev: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS.iter().position(|m| *m == abbrev).map(|i| i as u32 + 1)
+}
+
+/// `3:49pm` / `1am` → hour and minute on a 24-hour clock. Claude omits ":00",
+/// so both shapes appear in live output. `None` unless the hour is 1–12 and the
+/// minute 0–59: 12am is midnight and 12pm is noon, the usual off-by-twelve.
+fn parse_clock(s: &str) -> Option<(u32, u32)> {
+    let (time, pm) = match (s.strip_suffix("am"), s.strip_suffix("pm")) {
+        (Some(t), _) => (t, false),
+        (_, Some(t)) => (t, true),
+        _ => return None,
+    };
+    let (h, m) = match time.split_once(':') {
+        Some((h, m)) => (h, m.parse::<u32>().ok()?),
+        None => (time, 0),
+    };
+    let h: u32 = h.parse().ok()?;
+    if !(1..=12).contains(&h) || m > 59 {
+        return None;
+    }
+    let hour = match (h, pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, false) => h,
+        (h, true) => h + 12,
+    };
+    Some((hour, m))
+}
+
+/// Resolve a reset label — `"Aug 20 at 12:59am"` — to unix seconds.
+///
+/// The CLI prints no year, which is why this field was left empty until now.
+/// The year is recovered rather than guessed: a reset is at most a week from
+/// the reading that reports it, and the candidate years sit twelve months
+/// apart, so the candidate nearest `now_ms` is the only one that can be
+/// intended. Trying the neighbouring years in both directions is what makes
+/// the turn of the year work from either side of it.
+///
+/// Resolved in local time, as the CLI prints it — the parenthetical zone
+/// `parse_window` drops always names this machine's own zone, and honouring it
+/// would mean carrying a timezone database to reach the same answer.
+///
+/// `None` whenever the shape is not understood, a candidate year cannot hold
+/// the date (Feb 29), or the local time does not exist (the hour a DST jump
+/// skips). An ambiguous local time — the hour a DST fall-back repeats — takes
+/// the earlier of the two, the one a countdown should not overstate.
+fn parse_reset_at(label: &str, now_ms: i64) -> Option<i64> {
+    use chrono::{Datelike, Local, LocalResult, TimeZone};
+
+    let (date, time) = label.trim().split_once(" at ")?;
+    let (mon, day) = date.trim().split_once(' ')?;
+    let month = month_number(mon)?;
+    let day: u32 = day.trim().parse().ok()?;
+    let (hour, minute) = parse_clock(time.trim())?;
+
+    let now = Local.timestamp_millis_opt(now_ms).single()?;
+    let year = now.year();
+    [year - 1, year, year + 1]
+        .into_iter()
+        .filter_map(|y| match Local.with_ymd_and_hms(y, month, day, hour, minute, 0) {
+            LocalResult::Single(dt) => Some(dt),
+            // A repeated local hour: the earlier reading is the sooner reset.
+            LocalResult::Ambiguous(earlier, _) => Some(earlier),
+            LocalResult::None => None,
+        })
+        .map(|dt| dt.timestamp())
+        .min_by_key(|secs| (secs - now.timestamp()).abs())
+}
 
 /// Parse one `Current <label>: <pct>% used[ · resets <when>]` line.
 ///
 /// Hand-rolled rather than regex: the crate has no regex dependency and this
 /// shape is small enough to split. Anything that does not match yields None,
 /// so an unrecognised line contributes no window instead of a guessed number.
-fn parse_window(line: &str) -> Option<QuotaWindow> {
+fn parse_window(line: &str, now_ms: i64) -> Option<QuotaWindow> {
     let rest = line.trim().strip_prefix("Current ")?;
     let (label, rest) = rest.split_once(": ")?;
     let (pct, rest) = rest.split_once("% used")?;
     let used_percent: f64 = pct.trim().parse().ok()?;
 
     // Optional " · resets Aug 20 at 12:59am (Asia/Saigon)" tail. The timezone
-    // parenthetical is dropped; the rest is shown verbatim. No year is printed,
-    // so converting to a unix timestamp would mean guessing one.
+    // parenthetical is dropped; the rest is kept verbatim for display and, when
+    // `parse_reset_at` can recover the year the CLI omits, also resolved to a
+    // timestamp so the panel can count down to it. The label survives either
+    // way: a reset we cannot resolve is still one we can show.
     let resets_label = rest
         .split_once("resets ")
         .map(|(_, when)| when.split(" (").next().unwrap_or(when).trim().to_string())
         .unwrap_or_default();
+    let resets_at = parse_reset_at(&resets_label, now_ms);
 
     Some(QuotaWindow {
         label: label.trim().to_string(),
         used_percent,
-        resets_at: None,
+        resets_at,
         resets_label,
     })
 }
@@ -36,7 +115,8 @@ fn parse_window(line: &str) -> Option<QuotaWindow> {
 /// Parse the whole `claude -p "/usage"` stdout. `now_ms` is both `fetched_at`
 /// and `source_at`: unlike Codex's log-derived figures, the CLI reports live.
 pub fn parse_usage(out: &str, now_ms: i64) -> Option<QuotaSnapshot> {
-    let windows: Vec<QuotaWindow> = out.lines().filter_map(parse_window).collect();
+    let windows: Vec<QuotaWindow> =
+        out.lines().filter_map(|l| parse_window(l, now_ms)).collect();
     if windows.is_empty() {
         return None;
     }
@@ -279,47 +359,170 @@ pub fn purge_quota_logs() -> usize {
     removed
 }
 
+/// Which failure to report for a run that produced output carrying no usage
+/// window. `logged_in` is what an auth probe said, or `None` if it could not
+/// say.
+///
+/// Only an actual answer of "signed out" earns that blame. A probe that itself
+/// failed proves nothing, and reporting it as being signed out would send
+/// someone to re-authenticate an account that was never the problem.
+fn classify_unparsed(logged_in: Option<bool>) -> QuotaFailKind {
+    match logged_in {
+        Some(false) => QuotaFailKind::SignedOut,
+        _ => QuotaFailKind::Unreadable,
+    }
+}
+
 /// Run `claude -p "/usage"` for one account and parse the result.
 ///
 /// `config_dir` is the account's data directory, passed as `CLAUDE_CONFIG_DIR`
-/// so each account reports its own figures. Returns None on any failure —
-/// missing binary, timeout, non-zero exit, or unparseable output — so a bad run
-/// never replaces a good cached reading with a wrong one.
+/// so each account reports its own figures — except for the default account,
+/// see `scopes_config_dir`. Every failure comes back as a `QuotaFailKind`
+/// rather than a bare absence: a bad run must never replace a good cached
+/// reading, but it must also not pass for silence.
+///
+/// Output that parsed to nothing costs one extra process: `claude auth status`,
+/// asked only here, on the failure path. It is what separates the single most
+/// likely cause — this account is signed out — from every other reason the
+/// output might not have carried a figure. Without it the panel can only say
+/// that something went wrong, which is what it already said by going quiet.
 ///
 /// The run's own session log is deleted immediately afterwards, per account and
 /// whatever the outcome: a run that timed out or exited non-zero can still have
 /// written one, and deferring the sweep to the end of the batch would leave
 /// this account's log behind if a later account wedged or the app were killed.
-pub fn fetch_claude(config_dir: &Path) -> Option<QuotaSnapshot> {
+pub fn fetch_claude(config_dir: &Path) -> Result<QuotaSnapshot, QuotaFailKind> {
     let out = run_usage(config_dir);
     cleanup_probe_logs(config_dir);
-    parse_usage(&out?, crate::now_ms())
+    let out = out?;
+    match parse_usage(&out, crate::now_ms()) {
+        Some(snap) => Ok(snap),
+        None => Err(classify_unparsed(auth_logged_in(config_dir))),
+    }
 }
 
-/// Spawn `claude -p "/usage"` for one account and return its stdout.
+/// Ask `claude auth status` whether this account is signed in. `None` when the
+/// question could not be answered at all — a missing binary, a wedged run, or
+/// output that is not the JSON we know.
 ///
-/// Runs with its current directory set to the app's scratch directory so the
-/// session log Claude Code writes lands somewhere `cleanup_probe_logs` can
-/// identify without guessing.
-fn run_usage(config_dir: &Path) -> Option<String> {
-    let bin = claude_binary()?;
+/// Scoped exactly as the usage run is, and for the same reason: passing
+/// `CLAUDE_CONFIG_DIR` for the default account makes Claude Code look for
+/// credentials under a scope that does not hold them, and this probe would then
+/// report every default account as signed out — turning the one bug this
+/// feature exists to expose into the answer it always gives.
+fn auth_logged_in(config_dir: &Path) -> Option<bool> {
+    // `run.ok` is deliberately ignored: this command exits 1 when signed out
+    // and puts the answer on stdout anyway. See `ClaudeRun`.
+    let run = run_claude(config_dir, &["auth", "status"]).ok()?;
+    parse_auth_logged_in(&run.stdout)
+}
+
+/// Read `loggedIn` out of `claude auth status` output. `None` unless the output
+/// is JSON carrying that key as a real boolean — a string "true" is not an
+/// answer, and neither is a JSON object that simply lacks the field.
+fn parse_auth_logged_in(out: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()?
+        .get("loggedIn")?
+        .as_bool()
+}
+
+/// Claude Code's default data directory — where it looks when
+/// `CLAUDE_CONFIG_DIR` is unset. `None` when the home directory is unavailable.
+fn default_config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude"))
+}
+
+/// Do two paths name the same directory?
+///
+/// Compares canonicalised forms, so a symlink, a trailing slash or a `..`
+/// segment cannot make the default account look like a scoped one. A path that
+/// cannot be canonicalised — it may not exist — falls back to its literal form
+/// rather than erroring: at worst that keeps the env var, the prior behaviour.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(a) == real(b)
+}
+
+/// Should a poll for `config_dir` carry `CLAUDE_CONFIG_DIR`?
+///
+/// True for every account except the default one. Claude Code scopes its
+/// credential lookup to the directory the variable names, and the default
+/// account's credentials are not stored under such a scope — they are stored
+/// where an unscoped run finds them. Passing the variable for that account
+/// therefore points the lookup at an entry that does not exist and the run
+/// comes back logged out, whereupon `/usage` prints an API-style cost summary
+/// carrying no percentages at all. `parse_usage` then yields nothing, and
+/// because a failed fetch never overwrites the cache, the panel silently keeps
+/// showing whatever it last had.
+///
+/// A second account must still set it: it is the only handle on which account
+/// to report, and it works there, because that account's credentials *are*
+/// stored under its own scope.
+///
+/// `default_dir` is `None` when the home directory is unknown; with no default
+/// to compare against, keep scoping the run explicitly.
+fn scopes_config_dir(config_dir: &Path, default_dir: Option<&Path>) -> bool {
+    !matches!(default_dir, Some(d) if same_dir(d, config_dir))
+}
+
+/// `claude -p "/usage"` for one account: its stdout, or why there is none.
+/// Here a non-zero exit really is a failure — unlike `auth status`, this
+/// command has nothing to say through its status code.
+fn run_usage(config_dir: &Path) -> Result<String, QuotaFailKind> {
+    let run = run_claude(config_dir, &["-p", "/usage"])?;
+    if !run.ok {
+        return Err(QuotaFailKind::ExitedNonZero);
+    }
+    Ok(run.stdout)
+}
+
+/// One completed `claude` run: what it printed, and whether it exited cleanly.
+///
+/// The exit status is reported, not judged. `claude auth status` exits non-zero
+/// *in order to say* the account is signed out, and prints the answer on stdout
+/// while doing it — so treating a non-zero exit as "no answer" would throw away
+/// the one reading this whole feature exists to surface.
+struct ClaudeRun {
+    ok: bool,
+    stdout: String,
+}
+
+/// ~4.5s is typical for a `/usage` run; this is a generous ceiling before we
+/// give up and kill the child, so a wedged one can never pin the poller thread.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run the `claude` binary for one account and return its stdout.
+///
+/// Every command this module runs goes through here, so they share one account
+/// scoping rule and one deadline. Runs with its current directory set to the
+/// app's scratch directory, so any session log Claude Code writes lands
+/// somewhere `cleanup_probe_logs` can identify without guessing — true of the
+/// `/usage` poll, and cheap insurance for anything else.
+fn run_claude(config_dir: &Path, args: &[&str]) -> Result<ClaudeRun, QuotaFailKind> {
+    let bin = claude_binary().ok_or(QuotaFailKind::NoBinary)?;
     let mut cmd = std::process::Command::new(bin);
     if let Some(probe) = probe_dir() {
         cmd.current_dir(probe);
     }
+    // Scope the run to this account, except for the default one — see
+    // `scopes_config_dir`. The removal is not merely the absence of the set:
+    // the app inherits its environment from whatever launched it, so a
+    // variable already present there would otherwise leak into the child.
+    if scopes_config_dir(config_dir, default_config_dir().as_deref()) {
+        cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    } else {
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+    }
     let mut child = cmd
-        .env("CLAUDE_CONFIG_DIR", config_dir)
-        .arg("-p")
-        .arg("/usage")
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
         .spawn()
-        .ok()?;
+        .map_err(|_| QuotaFailKind::NoBinary)?;
 
-    // ~4.5s is typical; 30s is a generous ceiling before we give up and kill it
-    // so a wedged child can never pin the poller thread forever.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + RUN_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -327,7 +530,7 @@ fn run_usage(config_dir: &Path) -> Option<String> {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    return Err(QuotaFailKind::TimedOut);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -335,15 +538,15 @@ fn run_usage(config_dir: &Path) -> Option<String> {
                 // try_wait itself failed; don't leave the child running.
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(QuotaFailKind::ExitedNonZero);
             }
         }
     }
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(out.stdout.as_slice()).into_owned())
+    let out = child.wait_with_output().map_err(|_| QuotaFailKind::ExitedNonZero)?;
+    Ok(ClaudeRun {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(out.stdout.as_slice()).into_owned(),
+    })
 }
 
 static CACHE: OnceLock<Mutex<HashMap<String, QuotaSnapshot>>> = OnceLock::new();
@@ -362,14 +565,42 @@ pub fn cached(account_id: &str) -> Option<QuotaSnapshot> {
     cache().lock().ok()?.get(account_id).cloned()
 }
 
-/// The cache-update decision for one fetch attempt: write only on success.
-/// A failed fetch (`None`) leaves whatever was cached before untouched — a
-/// stale-but-real reading is recoverable, a wrong one is not, because the
-/// user acts on it. An account with nothing cached yet stays absent rather
-/// than gaining a placeholder.
-fn apply_fetch(account_id: &str, result: Option<QuotaSnapshot>) {
-    if let Some(snap) = result {
-        store_cached(account_id, snap);
+static FAILURES: OnceLock<Mutex<HashMap<String, QuotaFailure>>> = OnceLock::new();
+
+fn failures() -> &'static Mutex<HashMap<String, QuotaFailure>> {
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Why this account's most recent quota check failed, if it did. `None` once a
+/// check has succeeded again.
+pub fn last_failure(account_id: &str) -> Option<QuotaFailure> {
+    failures().lock().ok()?.get(account_id).copied()
+}
+
+/// The cache-update decision for one fetch attempt.
+///
+/// A good reading is written and ends any standing failure. A failed one leaves
+/// the cached figure exactly where it was — a stale-but-real reading is
+/// recoverable, a wrong one is not, because the user acts on it — and records
+/// why, which is the part that used to be missing. An account with nothing
+/// cached yet still gains no placeholder figure; it gains only the reason.
+///
+/// The two are kept apart on purpose. A stale figure beside a failing check is
+/// a real state and the one worth showing: before this, it was indistinguishable
+/// from a figure that simply had not changed.
+fn apply_fetch(account_id: &str, result: Result<QuotaSnapshot, QuotaFailKind>, now_ms: i64) {
+    match result {
+        Ok(snap) => {
+            store_cached(account_id, snap);
+            if let Ok(mut g) = failures().lock() {
+                g.remove(account_id);
+            }
+        }
+        Err(kind) => {
+            if let Ok(mut g) = failures().lock() {
+                g.insert(account_id.to_string(), QuotaFailure { kind, at: now_ms });
+            }
+        }
     }
 }
 
@@ -386,7 +617,7 @@ pub fn refresh_claude_accounts() {
         }
         // log_root is <data dir>/projects; CLAUDE_CONFIG_DIR wants the data dir.
         let Some(dir) = a.log_root.parent() else { continue };
-        apply_fetch(&a.id, fetch_claude(dir));
+        apply_fetch(&a.id, fetch_claude(dir), crate::now_ms());
     }
 }
 
@@ -405,8 +636,10 @@ mod tests {
         assert_eq!(q.windows[0].label, "session");
         assert_eq!(q.windows[0].used_percent, 15.0);
         assert_eq!(q.windows[0].resets_label, "Aug 13 at 2:09pm");
-        // Claude prints no year, so we never invent a machine timestamp.
-        assert_eq!(q.windows[0].resets_at, None);
+        // The year the CLI omits is now recovered, so the label also resolves
+        // to a timestamp the panel can count down to; the moments it lands on
+        // are pinned in `the_real_output_carries_a_resolved_reset_for_every_window`.
+        assert!(q.windows[0].resets_at.is_some());
 
         assert_eq!(q.windows[1].label, "week (all models)");
         assert_eq!(q.windows[1].used_percent, 2.0);
@@ -449,6 +682,202 @@ mod tests {
         let q = parse_usage("Using API credits.\n\nCurrent session: 3% used\n", 0).unwrap();
         assert_eq!(q.plan, "");
         assert_eq!(q.windows.len(), 1);
+    }
+
+    /// Verbatim stdout from `claude -p "/usage"` on 2026-09-09 in a run whose
+    /// credentials did not resolve: the API-style cost summary, no percentages
+    /// anywhere. This is the shape the default account started returning once
+    /// `CLAUDE_CONFIG_DIR` was passed to it, and the reason the failure was
+    /// silent — it parses to nothing rather than to a wrong number.
+    const LOGGED_OUT: &str = "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 2s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write\n";
+
+    #[test]
+    fn a_logged_out_run_yields_no_snapshot_rather_than_a_zero() {
+        assert!(
+            parse_usage(LOGGED_OUT, 0).is_none(),
+            "a cost summary carries no quota; reporting 0% used would read as plenty left"
+        );
+    }
+
+    /// A pair of sibling directories standing in for `~/.claude` and a second
+    /// account beside it, both real on disk so `same_dir` can canonicalise them.
+    fn account_pair(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("tokenscope-quota-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let default = root.join(".claude");
+        let second = root.join(".claude-work");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        (root, default, second)
+    }
+
+    #[test]
+    fn the_default_account_polls_without_the_scoping_env_var() {
+        // The regression this pins: passing CLAUDE_CONFIG_DIR for the default
+        // account points Claude Code's credential lookup at a directory-scoped
+        // entry that does not exist, and the run comes back logged out.
+        let (root, default, _second) = account_pair("scope-default");
+        assert!(
+            !scopes_config_dir(&default, Some(&default)),
+            "the default account must inherit Claude Code's own resolution"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_account_still_carries_the_scoping_env_var() {
+        // It is the only handle on which account to report, and it works there:
+        // a non-default account's credentials are stored under that same scope.
+        let (root, default, second) = account_pair("scope-second");
+        assert!(scopes_config_dir(&second, Some(&default)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_canonical_spelling_of_the_default_still_counts_as_the_default() {
+        let (root, default, _second) = account_pair("scope-detour");
+        let detour = default.join("..").join(".claude");
+        assert!(
+            !scopes_config_dir(&detour, Some(&default)),
+            "a `..` detour names the same directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_the_default_still_counts_as_the_default() {
+        let (root, default, _second) = account_pair("scope-symlink");
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&default, &link).unwrap();
+        assert!(!scopes_config_dir(&link, Some(&default)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_home_leaves_the_env_var_in_place() {
+        // Without a home directory there is no default to compare against, so
+        // the poll keeps the behaviour it had before: scope the run explicitly.
+        assert!(scopes_config_dir(Path::new("/anywhere/.claude"), None));
+    }
+
+    #[test]
+    fn paths_that_do_not_exist_compare_literally() {
+        // canonicalize() fails on a missing path; falling back to the literal
+        // form must not collapse two different accounts into one.
+        let a = Path::new("/nowhere/tokenscope/.claude");
+        let b = Path::new("/nowhere/tokenscope/.claude-work");
+        assert!(!scopes_config_dir(a, Some(a)), "identical literals match");
+        assert!(scopes_config_dir(b, Some(a)), "different literals do not");
+    }
+
+    /// Local-time millis, so every reset test reads in the same zone the CLI
+    /// prints in and the parser resolves in — the assertions hold in any zone.
+    fn local_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        use chrono::{Local, TimeZone};
+        Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
+    }
+
+    /// The unix seconds a reset label should resolve to.
+    fn local_secs(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        local_ms(y, mo, d, h, mi) / 1000
+    }
+
+    #[test]
+    fn a_reset_label_resolves_to_the_moment_it_names() {
+        let now = local_ms(2026, 9, 9, 15, 0);
+        assert_eq!(
+            parse_reset_at("Sep 9 at 3:49pm", now),
+            Some(local_secs(2026, 9, 9, 15, 49))
+        );
+    }
+
+    #[test]
+    fn a_label_with_no_minutes_resolves_to_the_top_of_the_hour() {
+        // Claude omits ":00" — "Sep 10 at 1am", not "Sep 10 at 1:00am".
+        let now = local_ms(2026, 9, 9, 15, 0);
+        assert_eq!(
+            parse_reset_at("Sep 10 at 1am", now),
+            Some(local_secs(2026, 9, 10, 1, 0))
+        );
+    }
+
+    #[test]
+    fn noon_and_midnight_are_not_confused_with_each_other() {
+        // 12am is hour 0 and 12pm is hour 12; the usual off-by-twelve.
+        let now = local_ms(2026, 9, 9, 6, 0);
+        assert_eq!(
+            parse_reset_at("Sep 9 at 12:30am", now),
+            Some(local_secs(2026, 9, 9, 0, 30))
+        );
+        assert_eq!(
+            parse_reset_at("Sep 9 at 12:30pm", now),
+            Some(local_secs(2026, 9, 9, 12, 30))
+        );
+    }
+
+    #[test]
+    fn a_reset_just_after_new_year_takes_the_coming_year() {
+        // The label carries no year. On Dec 31 a "Jan 1" reset is days away,
+        // not a year in the past.
+        let now = local_ms(2026, 12, 31, 23, 0);
+        assert_eq!(
+            parse_reset_at("Jan 1 at 12:59am", now),
+            Some(local_secs(2027, 1, 1, 0, 59))
+        );
+    }
+
+    #[test]
+    fn a_reset_just_before_new_year_keeps_the_departing_year() {
+        // The mirror case: a reading taken minutes into the new year can still
+        // name a moment in the old one.
+        let now = local_ms(2027, 1, 1, 0, 30);
+        assert_eq!(
+            parse_reset_at("Dec 31 at 11:59pm", now),
+            Some(local_secs(2026, 12, 31, 23, 59))
+        );
+    }
+
+    #[test]
+    fn a_leap_day_resolves_to_the_only_candidate_year_that_has_one() {
+        // Feb 29 exists in 2028 but not in 2027 or 2029; the candidate years
+        // that cannot hold the date must be skipped, not guessed at.
+        let now = local_ms(2028, 2, 28, 12, 0);
+        assert_eq!(
+            parse_reset_at("Feb 29 at 3am", now),
+            Some(local_secs(2028, 2, 29, 3, 0))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_reset_label_yields_no_timestamp() {
+        let now = local_ms(2026, 9, 9, 15, 0);
+        for label in ["", "tomorrow", "Sep 9", "Xyz 9 at 1am", "Sep 99 at 1am", "Sep 9 at 25am"] {
+            assert!(
+                parse_reset_at(label, now).is_none(),
+                "{label:?} must not resolve to a guessed moment"
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_output_carries_a_resolved_reset_for_every_window() {
+        let now = local_ms(2026, 8, 13, 13, 0);
+        let q = parse_usage(REAL, now).unwrap();
+        assert_eq!(q.windows[0].resets_at, Some(local_secs(2026, 8, 13, 14, 9)));
+        assert_eq!(q.windows[1].resets_at, Some(local_secs(2026, 8, 20, 0, 59)));
+        // The third window prints no reset at all, so there is nothing to resolve.
+        assert_eq!(q.windows[2].resets_label, "");
+        assert_eq!(q.windows[2].resets_at, None);
+    }
+
+    #[test]
+    fn a_window_whose_reset_cannot_be_parsed_still_shows_its_label() {
+        // The countdown is an addition, never a reason to lose what the CLI
+        // said. An unreadable tail must leave the verbatim text in place.
+        let q = parse_usage("Current session: 5% used · resets whenever\n", 0).unwrap();
+        assert_eq!(q.windows[0].resets_label, "whenever");
+        assert_eq!(q.windows[0].resets_at, None);
     }
 
     #[test]
@@ -498,7 +927,7 @@ mod tests {
     fn apply_fetch_keeps_a_good_cached_reading_on_failure() {
         let q = parse_usage(REAL, 7).unwrap();
         store_cached("acct-apply-keep", q);
-        apply_fetch("acct-apply-keep", None);
+        apply_fetch("acct-apply-keep", Err(QuotaFailKind::TimedOut), 8);
         let got = cached("acct-apply-keep").expect("the prior snapshot must remain");
         assert_eq!(got.fetched_at, 7);
     }
@@ -508,15 +937,100 @@ mod tests {
         let old = parse_usage(REAL, 7).unwrap();
         store_cached("acct-apply-replace", old);
         let newer = parse_usage(REAL, 9).unwrap();
-        apply_fetch("acct-apply-replace", Some(newer));
+        apply_fetch("acct-apply-replace", Ok(newer), 9);
         let got = cached("acct-apply-replace").unwrap();
         assert_eq!(got.fetched_at, 9);
     }
 
     #[test]
     fn apply_fetch_leaves_a_never_cached_account_absent_on_failure() {
-        apply_fetch("acct-apply-never", None);
+        apply_fetch("acct-apply-never", Err(QuotaFailKind::NoBinary), 1);
         assert!(cached("acct-apply-never").is_none());
+    }
+
+    /// `claude auth status` output, shape-accurate but with the identifying
+    /// fields replaced — a test fixture is no place for a real address or org id.
+    const AUTH_IN: &str = r#"{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/Users/someone/.claude/projects",
+  "email": "someone@example.com",
+  "orgId": "00000000-0000-0000-0000-000000000000",
+  "orgName": "Example",
+  "subscriptionType": "max"
+}"#;
+
+    /// The same command for an account whose credentials did not resolve. Note
+    /// what it does *not* carry: no email, no subscription, no auth method.
+    const AUTH_OUT: &str = r#"{
+  "loggedIn": false,
+  "authMethod": "none",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/Users/someone/.claude/projects"
+}"#;
+
+    #[test]
+    fn auth_status_tells_a_signed_in_account_from_a_signed_out_one() {
+        assert_eq!(parse_auth_logged_in(AUTH_IN), Some(true));
+        assert_eq!(parse_auth_logged_in(AUTH_OUT), Some(false));
+    }
+
+    #[test]
+    fn auth_output_we_cannot_read_says_nothing_either_way() {
+        // None means "could not ask", which must never be read as "signed out".
+        assert_eq!(parse_auth_logged_in(""), None);
+        assert_eq!(parse_auth_logged_in("command not found"), None);
+        assert_eq!(parse_auth_logged_in("{}"), None);
+        assert_eq!(parse_auth_logged_in(r#"{"loggedIn":"yes"}"#), None);
+    }
+
+    #[test]
+    fn a_signed_out_cli_is_only_blamed_when_we_actually_checked() {
+        // Output with no window is what a signed-out CLI produces, but it is
+        // not the only thing that produces it — so the blame needs the answer.
+        assert_eq!(classify_unparsed(Some(false)), QuotaFailKind::SignedOut);
+        assert_eq!(classify_unparsed(Some(true)), QuotaFailKind::Unreadable);
+        assert_eq!(
+            classify_unparsed(None),
+            QuotaFailKind::Unreadable,
+            "an auth probe that itself failed is not evidence of being signed out"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_records_why_and_still_keeps_the_last_good_reading() {
+        let q = parse_usage(REAL, 7).unwrap();
+        store_cached("acct-fail-keep", q);
+        apply_fetch("acct-fail-keep", Err(QuotaFailKind::SignedOut), 99);
+        assert_eq!(
+            cached("acct-fail-keep").expect("the good reading survives").fetched_at,
+            7
+        );
+        let f = last_failure("acct-fail-keep").expect("the reason must be recorded");
+        assert_eq!(f.kind, QuotaFailKind::SignedOut);
+        assert_eq!(f.at, 99);
+    }
+
+    #[test]
+    fn a_successful_fetch_ends_an_earlier_failure() {
+        apply_fetch("acct-fail-clear", Err(QuotaFailKind::TimedOut), 1);
+        assert!(last_failure("acct-fail-clear").is_some());
+        apply_fetch("acct-fail-clear", Ok(parse_usage(REAL, 5).unwrap()), 5);
+        assert!(
+            last_failure("acct-fail-clear").is_none(),
+            "a reading that worked is the end of the story, not a second line beside it"
+        );
+        assert_eq!(cached("acct-fail-clear").unwrap().fetched_at, 5);
+    }
+
+    #[test]
+    fn an_account_that_never_succeeded_carries_a_reason_and_no_figure() {
+        apply_fetch("acct-fail-never", Err(QuotaFailKind::NoBinary), 3);
+        assert!(cached("acct-fail-never").is_none(), "nothing may stand in for a figure");
+        assert_eq!(last_failure("acct-fail-never").unwrap().kind, QuotaFailKind::NoBinary);
     }
 
     /// A verbatim-shaped `/usage` poll log: two queue-operation lines, two
@@ -753,6 +1267,24 @@ mod tests {
         assert!(!old_poll.exists());
         assert!(real.exists(), "a session with real work must survive");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A config directory that exists but was never logged into — the exact
+    /// state the panel spent hours unable to describe. Verifies against the
+    /// real CLI that the auth probe reaches the right conclusion, which no
+    /// unit test can do: the classification is pure and covered, but whether
+    /// `claude auth status` still answers in the shape we parse is a fact
+    /// about the installed binary.
+    #[test]
+    #[ignore = "spawns the real claude binary"]
+    fn live_fetch_blames_a_signed_out_config_dir() {
+        let dir = std::env::temp_dir().join("tokenscope-live-signed-out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = fetch_claude(&dir);
+        println!("signed-out probe -> {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.err(), Some(QuotaFailKind::SignedOut));
     }
 
     #[test]

@@ -36,12 +36,81 @@ export interface Dashboard {
 }
 export interface QuotaWindow { label: string; usedPercent: number; resetsAt: number | null; resetsLabel: string }
 export interface QuotaSnapshot { plan: string; windows: QuotaWindow[]; fetchedAt: number; sourceAt: number }
+// Why the last plan-quota check failed. The tags come from the Rust enum of the
+// same name; the sentences live here, with the rest of the panel's wording.
+export type QuotaFailKind = "no-binary" | "timed-out" | "exited-non-zero" | "signed-out" | "unreadable";
+export interface QuotaFailure { kind: QuotaFailKind; at: number }
+
+const QUOTA_FAIL_MESSAGE: Record<QuotaFailKind, string> = {
+  // The one a person can act on, so it says what to fix rather than what broke.
+  "signed-out": "the Claude CLI is signed out for this account",
+  "no-binary": "the Claude CLI could not be found",
+  "timed-out": "the Claude CLI did not answer in time",
+  "exited-non-zero": "the Claude CLI exited with an error",
+  "unreadable": "the Claude CLI printed no usage figure",
+};
+// Every tag, for a test that would fail if one lost its sentence.
+export const QUOTA_FAIL_KINDS = Object.keys(QUOTA_FAIL_MESSAGE) as QuotaFailKind[];
+
+// The sentence for a failure tag. Takes a plain string, not the union: the Rust
+// enum is the source of truth and can gain a variant before this file hears
+// about it, and a tag we do not recognise still has to say *something* — going
+// blank would put us back to a failure nobody can see.
+export function quotaFailMessage(kind: string): string {
+  return QUOTA_FAIL_MESSAGE[kind as QuotaFailKind] ?? "the last check did not succeed";
+}
+
+// How long ago a moment was, in the panel's voice: "just now", "12m ago",
+// "2h ago". Both the quota reading and the failed check are dated this way, so
+// the two lines of the block agree on how time is spoken.
+//
+// Clamped at zero: these timestamps come from the backend, and a moment a few
+// seconds ahead of the frontend's clock must read as "just now", never as a
+// negative age.
+export function fmtAge(atMs: number, nowMs: number): string {
+  const mins = Math.max(0, Math.round((nowMs - atMs) / 60000));
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.round(mins / 60)}h ago`;
+}
 // A quota figure older than this is shown dimmed and never drives the tray warning.
 export const QUOTA_STALE_MS = 30 * 60 * 1000;
 export const isQuotaStale = (sourceAt: number) => Date.now() - sourceAt > QUOTA_STALE_MS;
+// Time left until a reset, worded the way the panel says it: "2h 14m", "4d 6h",
+// "30m", "<1m". `resetsAt` is unix *seconds* (both agents report it that way),
+// `nowMs` is millis.
+//
+// null once the moment has passed. An elapsed countdown is not a small number,
+// it is a different thing to say, so the caller words that case rather than
+// this returning "0m" — which would read as "about to reset" forever.
+//
+// Coarse on purpose: the panel re-renders on the 30s dashboard push, so a
+// seconds-precise figure would be stale more often than not. Minutes are the
+// finest unit that stays honest at that cadence, and "<1m" is the floor so a
+// reset seconds away never rounds down to "0m".
+//
+// Unlike the percentage beside it, this does not go stale as the reading ages:
+// the reset moment is absolute, so a figure fetched twenty minutes ago still
+// counts down correctly. It only stops meaning anything once it has passed —
+// which is exactly when this returns null.
+export function fmtCountdown(resetsAt: number, nowMs: number): string | null {
+  const secs = resetsAt - Math.floor(nowMs / 1000);
+  if (secs <= 0) return null;
+  if (secs < 60) return "<1m";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) {
+    const m = mins % 60;
+    return m ? `${hours}h ${m}m` : `${hours}h`;
+  }
+  const days = Math.floor(hours / 24);
+  const h = hours % 24;
+  return h ? `${days}d ${h}h` : `${days}d`;
+}
 
 // One tracked account (= one agent CLI config dir) and its dashboard.
-export interface AccountData { id: string; label: string; email: string; agent: string; quota: QuotaSnapshot | null; dash: Dashboard }
+export interface AccountData { id: string; label: string; email: string; agent: string; quota: QuotaSnapshot | null; quotaError: QuotaFailure | null; dash: Dashboard }
 // Every account plus an aggregate "All"; todayTokens is the combined tray total.
 export interface Workspace { accounts: AccountData[]; all: Dashboard; todayTokens: number }
 
@@ -53,7 +122,7 @@ export async function fetchWorkspace(): Promise<Workspace> {
   const res = await fetch("/dev-dashboard.json");
   if (!res.ok) throw new Error("not running in Tauri and no dev snapshot found");
   const dash: Dashboard = await res.json();
-  return { accounts: [{ id: "dev", label: "Dev", email: "", agent: "claude", quota: null, dash }], all: dash, todayTokens: dash.todayTokens };
+  return { accounts: [{ id: "dev", label: "Dev", email: "", agent: "claude", quota: null, quotaError: null, dash }], all: dash, todayTokens: dash.todayTokens };
 }
 
 // Fetch one period report for a specific account ("all" or an id) + reference
